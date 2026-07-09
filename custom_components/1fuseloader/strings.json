@@ -6,7 +6,7 @@
         "description": "Configure Easee/BMW L1 fuse guard. Start with Dry Run enabled.",
         "data": {
           "name": "Name",
-          "device_id": "Easee device ID",
+          "device_id": "Easee device ID from Home Assistant",
           "status_entity": "Easee status entity",
           "l1_entity": "Grid L1 current entity",
           "l2_entity": "Grid L2 current entity",
@@ -15,6 +15,9 @@
           "controlled_phase": "Controlled phase"
         }
       }
+    },
+    "error": {
+      "device_id_required": "Easee device ID is required. Find it in Developer Tools → Services/YAML or from the Easee device page in Home Assistant."
     }
   },
   "options": {
