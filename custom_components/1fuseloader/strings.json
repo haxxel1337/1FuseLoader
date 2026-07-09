@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "1FuseLoader",
+        "description": "Configure Easee/BMW L1 fuse guard. Start with Dry Run enabled.",
+        "data": {
+          "name": "Name",
+          "device_id": "Easee device ID",
+          "status_entity": "Easee status entity",
+          "l1_entity": "Grid L1 current entity",
+          "l2_entity": "Grid L2 current entity",
+          "l3_entity": "Grid L3 current entity",
+          "charger_current_entity": "Easee charger current entity",
+          "controlled_phase": "Controlled phase"
+        }
+      }
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "1FuseLoader options",
+        "description": "Tune thresholds. These are also exposed as Number/Switch entities for quick adjustments.",
+        "data": {
+          "main_fuse_amps": "Main fuse amps",
+          "buffer_amps": "Buffer amps",
+          "min_charge_amps": "Minimum charge amps",
+          "max_charge_amps": "Maximum charge amps",
+          "safe_l1_amps": "Safe L1 amps",
+          "soft_limit_amps": "Soft guard limit amps",
+          "soft_for_seconds": "Soft guard delay seconds",
+          "soft_current_amps": "Soft current amps",
+          "pause_limit_amps": "Pause limit amps",
+          "pause_for_seconds": "Pause delay seconds",
+          "resume_below_amps": "Resume below amps",
+          "resume_for_seconds": "Resume delay seconds",
+          "normal_ttl_seconds": "Normal TTL seconds",
+          "soft_ttl_seconds": "Soft TTL seconds",
+          "resend_limit_every_seconds": "Resend limit every seconds",
+          "min_seconds_between_actions": "Minimum seconds between actions",
+          "unused_phase_current": "Unused phase current",
+          "active_control": "Active control",
+          "dry_run": "Dry run",
+          "enable_dynamic_limit": "Enable dynamic limit",
+          "enable_soft_guard": "Enable soft guard",
+          "enable_pause_resume": "Enable pause/resume",
+          "force_min_when_available_too_low": "Force minimum when available is too low but L1 is safe"
+        }
+      }
+    }
+  }
+}

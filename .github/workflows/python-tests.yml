@@ -1,0 +1,23 @@
+name: Python tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test-logic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Compile Python files
+        run: python -m compileall custom_components/1fuseloader test_1fuseloader_logic.py
+
+      - name: Run standalone logic tests
+        run: python test_1fuseloader_logic.py

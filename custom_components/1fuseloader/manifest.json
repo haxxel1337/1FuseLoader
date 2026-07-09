@@ -1,0 +1,19 @@
+{
+  "domain": "1fuseloader",
+  "name": "1FuseLoader",
+  "version": "0.3.1",
+  "codeowners": [
+    "@axel-holmstedt"
+  ],
+  "config_flow": true,
+  "single_config_entry": true,
+  "integration_type": "helper",
+  "dependencies": [],
+  "after_dependencies": [
+    "easee"
+  ],
+  "documentation": "https://github.com/axel-holmstedt/1FuseLoader",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/axel-holmstedt/1FuseLoader/issues",
+  "requirements": []
+}
