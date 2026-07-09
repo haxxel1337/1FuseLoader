@@ -50,14 +50,20 @@ class OneFuseLoaderConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(self, user_input: dict[str, Any] | None = None):
         errors: dict[str, str] = {}
         if user_input is not None:
-            await self.async_set_unique_id(user_input[CONF_DEVICE_ID])
-            self._abort_if_unique_id_configured()
-            title = user_input.get(CONF_NAME, DEFAULT_NAME)
-            data = dict(user_input)
-            data.pop(CONF_NAME, None)
-            return self.async_create_entry(title=title, data=data, options=dict(DEFAULT_OPTIONS))
+            user_input = dict(user_input)
+            user_input[CONF_DEVICE_ID] = str(user_input.get(CONF_DEVICE_ID, "")).strip()
 
-        return self.async_show_form(step_id="user", data_schema=_config_schema(), errors=errors)
+            if not user_input[CONF_DEVICE_ID]:
+                errors[CONF_DEVICE_ID] = "device_id_required"
+            else:
+                await self.async_set_unique_id(user_input[CONF_DEVICE_ID])
+                self._abort_if_unique_id_configured()
+                title = str(user_input.get(CONF_NAME, DEFAULT_NAME)).strip() or DEFAULT_NAME
+                data = dict(user_input)
+                data.pop(CONF_NAME, None)
+                return self.async_create_entry(title=title, data=data, options=dict(DEFAULT_OPTIONS))
+
+        return self.async_show_form(step_id="user", data_schema=_config_schema(user_input), errors=errors)
 
     @staticmethod
     @callback
