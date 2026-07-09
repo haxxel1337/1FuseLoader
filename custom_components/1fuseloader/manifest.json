@@ -1,7 +1,7 @@
 {
   "domain": "1fuseloader",
   "name": "1FuseLoader",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "codeowners": [
     "@haxxel1337"
   ],
