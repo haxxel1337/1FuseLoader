@@ -14,7 +14,8 @@ CONF_CHARGER_CURRENT_ENTITY = "charger_current_entity"
 CONF_CONTROLLED_PHASE = "controlled_phase"
 
 DEFAULT_NAME = "1FuseLoader Parking"
-DEFAULT_DEVICE_ID = "869a98f610e55f771eae44129ab0dce5"
+# Home Assistant Easee device_id is installation-specific. Never hard-code it in a public repo.
+DEFAULT_DEVICE_ID = ""
 DEFAULT_STATUS_ENTITY = "sensor.parking_status"
 DEFAULT_L1_ENTITY = "sensor.l1ampfusecurrentlyuse"
 DEFAULT_L2_ENTITY = "sensor.l2ampfusecurrentlyuse"
