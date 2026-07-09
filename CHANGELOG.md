@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.4
+
+- Lowered HACS installation minimum Home Assistant version to `2026.6.0`.
+- Updated manifest version to `0.3.4` for a clean HACS release.
+
 ## 0.3.2
 
 - Removed installation-specific Easee `device_id` from defaults and README.
