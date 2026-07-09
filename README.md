@@ -37,12 +37,15 @@ test_1fuseloader_logic.py
 
 ## Default entities
 
+These defaults match the original installation and can be changed in the setup UI:
+
 - `sensor.parking_status`
 - `sensor.l1ampfusecurrentlyuse`
 - `sensor.l2ampfusecurrentlyuse`
 - `sensor.l3ampfusecurrentlyuse`
 - `sensor.parking_current`
-- Easee device id: `869a98f610e55f771eae44129ab0dce5`
+
+The Easee `device_id` is **not** hard-coded because it is specific to each Home Assistant installation. Enter your own Easee device ID during setup.
 
 ## Logic
 
@@ -64,7 +67,7 @@ Old guard behavior is included:
 
 ## First safe test
 
-1. Install the integration folder in `/config/custom_components/1fuseloader`.
+1. Install the integration folder in `/config/custom_components/1fuseloader` or install it through HACS as a custom repository.
 2. Restart Home Assistant.
 3. Add integration: **1FuseLoader**.
 4. Leave **Dry Run = ON** and **Active Control = OFF**.
@@ -75,4 +78,5 @@ Old guard behavior is included:
 
 ```powershell
 python .\test_1fuseloader_logic.py
+python -m compileall .\custom_components\1fuseloader .\test_1fuseloader_logic.py
 ```
