@@ -3,7 +3,7 @@
   "name": "1FuseLoader",
   "version": "0.3.1",
   "codeowners": [
-    "@axel-holmstedt"
+    "@haxxel1337"
   ],
   "config_flow": true,
   "single_config_entry": true,
@@ -12,8 +12,8 @@
   "after_dependencies": [
     "easee"
   ],
-  "documentation": "https://github.com/axel-holmstedt/1FuseLoader",
+  "documentation": "https://github.com/haxxel1337/1FuseLoader",
   "iot_class": "local_polling",
-  "issue_tracker": "https://github.com/axel-holmstedt/1FuseLoader/issues",
+  "issue_tracker": "https://github.com/haxxel1337/1FuseLoader/issues",
   "requirements": []
 }
