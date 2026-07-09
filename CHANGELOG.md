@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2
+
+- Removed installation-specific Easee `device_id` from defaults and README.
+- Added config-flow validation so the Easee device ID must be entered during setup.
+- Updated manifest version to `0.3.2`.
+- Confirmed GitHub metadata uses `haxxel1337/1FuseLoader`.
+
 ## 0.3.1
 
 - Added GitHub/HACS-ready repository files.
