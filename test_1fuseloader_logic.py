@@ -67,6 +67,9 @@ def main():
     run_case("pause start", r, 200, "charging", l1=29, charger_current=6)
     d = run_case("pause reached", r, 321, "charging", l1=29, charger_current=6)
     assert_eq(d.command, "pause", "pause command")
+    # Model the charger's feedback promptly; an unobserved pause submission
+    # must not acquire ownership of a much later manual pause.
+    run_case("pause observed", r, 326, "awaiting_start", l1=24, charger_current=0)
 
     # Only our accepted pause resumes, with sufficient headroom and a fresh cap.
     run_case("resume start", r, 400, "awaiting_start", l1=10, charger_current=0)
