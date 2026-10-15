@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.4.0b4
+
+- Add a disabled-by-default experimental timed-overload profile: request minimum
+  EV current, permit a separately bounded response window, then hold minimum
+  current within a sustained L1 ceiling and cumulative exposure budget.
+- Bound the available settings to at most +4 A, 1800 s cumulative exposure,
+  38 A transition peak and 10 s response time; require explicit opt-in and
+  cross-validate the settings through all Home Assistant UI entry points.
+- Persist experimental exposure and unresolved response state across restart
+  and configuration changes; brief dips and switch toggles do not replenish
+  the budget. Surface budget, transition and failure diagnostics.
+- Account for whole-minute Easee leases before permitting another positive
+  overload command; charging can end before the nominal budget expires.
+- Document HACS prerelease installation, the separate overload opt-in and the
+  need to verify the installation and charger offline fallback before using it.
+  These operational settings do not certify a fuse or a physical stop deadline.
+
+## 0.4.0b3
+
+- Handle the opposite grid/EV report order during an acknowledged reduction
+  within a bounded alignment window and conservative nominal-current check.
+- Keep completed/disconnected sessions from receiving an unnecessary zero
+  command solely because their final current reports arrive out of order.
+
+## 0.4.0b2
+
+- Preserve minimum charging through moderate house-load peaks by using the
+  normal buffer only within the fuse budget and a separate retained reserve.
+- React to source changes immediately, coalesce updates during in-flight
+  commands, and raise current gradually after stable headroom.
+- Add restart hysteresis and a bounded wait for grid reports after observed EV
+  reductions; TTL renewals do not reset ramp/restart observation timers.
+- Add optional read-only BMW CarData diagnostics with per-field source times;
+  stale/session-inapplicable values do not enter the current-control loop.
+- Keep deliberate overload disabled pending the actual main-fuse specification
+  and supervised charging tests. No HA restart or active takeover is implied.
+
+## 0.4.0b1
+
+- Correct Easee TTL units and renew identical limits through a narrowly versioned
+  adapter for Easee 0.9.74 / pyeasee 0.8.17, without changing those integrations.
+- Record submitted commands only after HTTP acceptance; serialize controller
+  operations and expose blocked/error/proposed command diagnostics.
+- Reject missing or stale telemetry, reset continuity timers across gaps, and
+  request 0 A when control is active and required telemetry is untrustworthy.
+- Respect manual pauses and require sufficient headroom plus a fresh accepted
+  current cap before resuming a pause owned by this runtime.
+- Remove forced minimum current above headroom; soft limiting can only lower it.
+- Validate settings across all UI entry points, restrict control to L1, and add
+  current-unit checks, safe reconfiguration, and complete EN/SV flow text.
+- Add regression suites and real Home Assistant 2026.10.1 / Python 3.14 CI checks.
+  This is a pilot build; physical charging acceptance remains a rollout step.
+
 ## 0.3.4
 
 - Lowered HACS installation minimum Home Assistant version to `2026.6.0`.

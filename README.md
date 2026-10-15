@@ -8,7 +8,8 @@ This is a **soft load balancer** for an Easee charger where a BMW is effectively
 
 ## Target
 
-- Home Assistant Core: **2026.7+**
+- Home Assistant Core: **2026.10.1** (minimum and CI target)
+- Compatibility adapter: **Easee 0.9.74 / pyeasee 0.8.17**; unsupported versions block writes
 - HACS/custom repository layout
 - UI setup through config flow
 - Runtime tuning through options flow and Number/Switch entities
@@ -58,25 +59,229 @@ if available_l1 < min_charge_amps: available_l1 = 0
 else floor and cap at max_charge_amps
 ```
 
-Old guard behavior is included:
+The original guard thresholds are included:
 
 - Force L1 dynamic circuit limit
 - Soft guard: high L1 for short duration → set low current
 - Pause guard: high L1 for longer duration → pause charging
 - Resume guard: low L1 for stable duration → resume charging
 
+Normal current follows the buffered headroom. An already charging car can keep
+the minimum 6 A by using some of the normal buffer, provided the estimated
+house load plus 6 A still fits below the main fuse rating with a separate
+minimum reserve (default 0.5 A). This replaces the old unconditional minimum
+fallback; with experimental timed overload disabled, it does not intentionally
+permit an overload. L1 is the only supported
+controlled phase, and L2/L3 limits stay at 0 A.
+
+For the default 25 A fuse and 2 A normal buffer:
+
+| Estimated house load on L1 | EV target after a load increase | Estimated total |
+| --- | --- | --- |
+| 16 A | 7 A | 23 A |
+| 18 A | 6 A, using part of the buffer | 24 A |
+| 18.5 A | 6 A, retaining 0.5 A reserve | 24.5 A |
+| 20 A | 0 A; 6 A would exceed the budget | 20 A |
+
+Decreases run as soon as a source state change is received, with a coalesced
+latest-snapshot worker and a 5-second watchdog. Increases wait for 30 seconds
+of stable headroom and then rise at most 1 A per 15 seconds. Recovery after a
+zero cap requires 60 seconds of stable buffered headroom and starts at 6 A.
+Takeover of an already charging session starts at its measured current rather
+than jumping to the maximum. A submitted reduction must be observed before a
+rise is allowed; renewing its TTL does not reset ramp timers.
+
+When observed EV reduction arrives before a new grid report, the regulator can
+briefly retain the already accepted lower cap while waiting for alignment
+(default 10 seconds, configurable). Any new grid report is evaluated immediately;
+invalid/stale telemetry still requests zero. This is a report-alignment window,
+not permission to overload a fuse. Verify real meter cadence and vehicle response
+before takeover. Experimental timed overload is a separate, disabled-by-default
+option described below; the report-alignment window alone does not enable it.
+
+The opposite report order can also briefly pair a newer low grid current with
+an older high EV current. During an acknowledged reduction, the regulator may
+retain its accepted positive cap for the same bounded alignment window only
+when report timestamps identify the old EV sample and **grid current plus the
+entire cap** still fits the nominal budget and minimum reserve. This deliberately
+does not subtract the inconsistent EV reading to create headroom. A timeout,
+missing timestamps, inconsistent fresh EV data or an exceeded budget requests
+zero; the window never permits an increase or resume. A completed/disconnected
+session does not receive a zero command merely because its final current
+reports arrive out of order.
+
+These checks do not synchronize physical measurements. Numerically consistent
+grid/EV values can still refer to different moments. While a submitted reduction
+is unobserved, the normal estimator retains at least the preceding house-load
+estimate and inhibits increases. A coincident house-load increase and EV-current
+decrease can nevertheless escape that estimate briefly. This remains best-effort
+cloud control, not a guarantee against transient overload; verify report cadence
+and response in dry run and a supervised charging test before takeover.
+
+The legacy `pause_limit_amps` / `pause_for_seconds` settings are an additional
+sustained-overload Pause fallback, for example when a submitted limit does not
+produce the expected physical response. They do **not** grant an overload grace
+period: the normal headroom calculation still requests zero immediately when
+even minimum charging does not fit. Increasing the default 120-second pause
+delay therefore does not implement timed minimum-current overload operation.
+
+### Experimental timed overload
+
+Version **0.4.0b4** adds an explicit **Experimental Timed Overload** opt-in.
+It is off for both new and existing entries. Before enabling it, verify the
+actual fuse, installation limits, current-report cadence and charger fallback.
+The operational limits below are not a fuse time/current curve or certification
+that a particular installation may run overloaded. Leave physical protection
+in place.
+
+The default experimental profile for a configured 25 A main fuse is:
+
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| Sustained overload margin | 4 A | Continue at the configured minimum EV current only if projected L1 fits at most 29 A |
+| Cumulative overload budget | 1800 s | Count all observed time above 25 A, including the response window; brief dips do not replenish it |
+| Transition peak limit | 38 A | Bound the short response phase while requesting minimum EV current |
+| Response window | 10 s | Wait for a fresh grid report and observed EV reduction, then require total L1 at most 29 A |
+
+For example, house load of 22 A plus EV current of 16 A produces a 38 A
+report. The regulator may request 6 A and briefly wait for fresh feedback;
+the resulting 28 A total can then use the remaining overload budget. Repeated
+reports or TTL renewals do not extend the original response deadline. A peak
+above the transition limit, an infeasible projected minimum current, a response
+timeout, untrustworthy telemetry or exhausted budget requests zero rather than
+starting another grace window. It never increases EV current or starts an
+idle car merely to use the experimental overload allowance.
+
+Exposure is cumulative rather than a thermal cooling estimate. The controller
+persists its budget and unresolved exposure across unload/restart and setting
+changes; a short dip below the fuse rating, toggling the switch or restarting HA
+does not grant another 30 minutes. There is no user budget-reset button in this
+release. Unknown elapsed exposure is handled conservatively. Diagnostic sensors
+show used/remaining time, the response window and any latched failure.
+
+Easee accepts dynamic current leases in whole minutes. The controller therefore
+ends an overload allowance early when less than 90 seconds remain for a further
+positive lease and its response reserve. The 1800-second value is a maximum
+software allowance, not a promise of exactly 30 minutes of charging, an exact
+physical stop deadline or a guarantee that a cloud command will reach the car.
+The ordinary soft/pause thresholds do not override a valid experimental hold;
+the experimental limits and failure handling still apply.
+
+Before active takeover, verify that the charger's offline fallback cannot
+increase EV current after communication loss. A retained 10 A offline limit
+can defeat a 6 A request when a dynamic lease expires. Do not enable this
+experimental profile until fallback behavior and installation limits have
+been checked. Settings are capped at a 4 A margin, 1800 s budget, 38 A peak
+and 10 s response window; lowering them does not erase prior exposure.
+
+Missing, invalid, restored or stale grid data resets the guard timers and
+requests 0 A when control is enabled. Grid freshness uses `State.last_reported`.
+Easee status/current are event driven, so their unchanged state timestamps are
+not used as heartbeats; the adapter checks the charger's online state, SignalR
+connection and latest received stream pulse instead. The default age limit is
+120 seconds for the configurable grid age and the adapter's fixed stream-pulse
+age. An idle, disconnected charger can legitimately be quiet for longer; this
+conservatively inhibits increases until new telemetry arrives. Observe the
+actual cadence while charging before takeover.
+
+The integration only resumes a pause that it requested during the current
+runtime. It does not infer ownership from a charger's paused status after an
+HA restart. User settings and experimental overload exposure persist; pause
+ownership and ordinary ramp/guard observation timers do not.
+
+## BMW X5 xDrive45e and CarData
+
+BMW's original August 2019 technical data specifies 3.7 kW AC at 230 V / 16 A,
+24 kWh gross battery energy and about 6.8 hours for 0–100% at maximum AC power.
+The project's default 6–16 A single-phase range matches that vehicle's maximum
+and Easee's normal minimum current allocation. A 6 A limit offers about 1.38 kW
+at 230 V; the measured draw may be lower if the vehicle requests less. Stability
+at exactly 6 A and stop/restart behavior remain supervised vehicle tests.
+
+An optional CarData device adds advisory BMW charging state, genuine reported
+SoC, AC current and phase-count sensors with source timestamps/freshness.
+Plug state, voltage, end reason and last result are related diagnostic context.
+Entity matching uses the selected device and descriptor keys, so renaming an
+entity does not break it. Predicted SoC and learned battery capacity are not
+used as genuine vehicle measurements. A phase count retained after disconnect
+is explicitly marked as unrelated to an active charging session.
+
+The installed CarData interface is read only. Its cloud values have variable
+cadence, so they never replace the meter/Easee feedback or decide a protective
+current increase, pause or resume. This integration makes no new BMW API polls.
+
+Sources: [BMW 2019 technical data](https://www.press.bmwgroup.com/global/article/attachment/T0300315EN/440691),
+[Easee current control](https://developer.easee.com/docs/current-limits-and-control),
+[BMW CarData documentation](https://bmw-cardata.bmwgroup.com/customer/public/api-documentation).
+
+## Easee compatibility
+
+The service wrapper in Easee 0.9.74 skips an identical circuit limit, even when
+its TTL needs renewal. It also logs some API failures without raising them.
+Calling those services repeatedly is therefore insufficient for this regulator.
+
+The version-gated adapter uses the existing Easee integration's authenticated
+charger/circuit objects and their public pyeasee methods. It sends identical
+limit renewals, converts internal TTL seconds to rounded-up whole **minutes**,
+and requires a successful HTTP response before recording a submitted command.
+It does not create, store or read a separate API token, or modify Easee files.
+An unknown version or missing expected object blocks control with a diagnostic
+reason. Dry Run remains available for observation.
+
+`Command Result` and `Last Command` distinguish a proposed action from an API
+accepted submission. API acceptance is not confirmation of physical charger
+current. Failed submissions remain eligible for retry; decisions and writes
+are serialized, and disabling control cancels queued decisions.
+
+This remains a cloud dependent soft regulator. If HA, the network or Easee is
+unreachable, a 0 A request may not reach the charger. A finite dynamic limit can
+expire and restore the charger's configured default. Keep the physical fuse
+protection and verify the charger's fallback configuration before takeover.
+
 ## First safe test
 
-1. Install the integration folder in `/config/custom_components/1fuseloader` or install it through HACS as a custom repository.
-2. Restart Home Assistant.
+1. Back up affected files and record the enabled state of the old charging automations.
+2. Install the integration folder in `/config/custom_components/1fuseloader` or install it through HACS as a custom repository, then restart Home Assistant with the operator's approval.
 3. Add integration: **1FuseLoader**.
 4. Leave **Dry Run = ON** and **Active Control = OFF**.
 5. Keep old Easee automations ON only during dry-run comparison.
-6. When sensors look correct: disable old automations, set **Active Control = ON**, **Dry Run = OFF**.
+6. Observe an actual charging session: compare grid L1, charger current, estimated house load, target current and source health. Exercise missing data, overload, pause/resume and API failure behavior in the test environment first.
+7. After review, disable only the replaced load balancing/guard automations, then set **Active Control = ON**, **Dry Run = OFF**. Verify the physical/current feedback and TTL renewals during supervised charging.
+
+The first six steps keep **Experimental Timed Overload = OFF**. Normal live
+control and experimental overload are separate opt-ins; enabling Active Control
+does not enable overload operation.
+
+Do not run the old controller and the new controller with writes enabled at
+the same time. Keep unrelated alerts and charge schedules as appropriate.
+Rollback starts by disabling **Active Control**, then restoring the old
+automation enabled states. Check the current dynamic limits and TTL before
+leaving the charger unattended; disabling an integration does not itself clear
+limits already accepted by Easee. Change settings through HA's UI, never by
+manually editing `.storage`.
+
+## HACS prerelease installation
+
+Add `https://github.com/haxxel1337/1FuseLoader` as a custom **Integration**
+repository in HACS. For the experimental **v0.4.0b4** release, open the
+repository's download/redownload dialog, enable beta/prerelease versions and
+select that exact version. Confirm HACS reports the installed version, then
+restart Home Assistant with the operator's approval. Existing UI configuration
+is retained. New overload settings remain off until explicitly enabled.
+
+For an upgrade from a manually copied pilot, back up the component folder first
+and let HACS replace the managed files. Confirm the loaded integration version
+after the restart and inspect diagnostics before enabling writes. HACS owning
+the files does not itself transfer control from the old automations.
 
 ## Local test
 
 ```powershell
-python .\test_1fuseloader_logic.py
-python -m compileall .\custom_components\1fuseloader .\test_1fuseloader_logic.py
+Get-ChildItem test_1fuseloader_*.py | ForEach-Object { python $_.FullName; if ($LASTEXITCODE) { throw "Tests failed" } }
+python -m compileall -q .\custom_components\1fuseloader
 ```
+
+The standalone suites use simulated inputs and adapters. CI additionally
+installs Home Assistant 2026.10.1 on Python 3.14 to test actual imports,
+selectors, entity construction and config/options flows. Passing these tests
+does not establish physical charging acceptance.
