@@ -3,7 +3,21 @@
     "step": {
       "user": {
         "title": "1FuseLoader",
-        "description": "Configure Easee/BMW L1 fuse guard. Start with Dry Run enabled.",
+        "description": "Select the Easee charger and current sensors in amperes. Only L1 single-phase control is supported. New entries start with Dry Run on and Active Control off.",
+        "data": {
+          "name": "Name",
+          "device_id": "Easee device ID from Home Assistant",
+          "status_entity": "Easee status entity",
+          "l1_entity": "Grid L1 current entity",
+          "l2_entity": "Grid L2 current entity",
+          "l3_entity": "Grid L3 current entity",
+          "charger_current_entity": "Easee charger current entity",
+          "controlled_phase": "Controlled phase"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure 1FuseLoader",
+        "description": "Update the current sensor references for the same Easee charger. The charger identity must stay the same. Only L1 is supported.",
         "data": {
           "name": "Name",
           "device_id": "Easee device ID from Home Assistant",
@@ -17,14 +31,25 @@
       }
     },
     "error": {
-      "device_id_required": "Easee device ID is required. Find it in Developer Tools → Services/YAML or from the Easee device page in Home Assistant."
+      "device_id_required": "Easee device ID is required. Find it in Developer Tools → Services/YAML or from the Easee device page in Home Assistant.",
+      "device_not_easee": "Select a device owned by the Easee integration.",
+      "entity_not_found": "Select an existing sensor entity.",
+      "current_unit_required": "The current sensor must use amperes (A).",
+      "unsupported_phase": "Only L1 single-phase control is supported.",
+      "duplicate_current_entity": "Use a separate sensor for each grid phase and for the charger current.",
+      "charger_sensor_mismatch": "Select a sensor provided by the selected Easee charger."
+    },
+    "abort": {
+      "already_configured": "This Easee charger is already configured.",
+      "unique_id_mismatch": "Select the same Easee charger as the existing entry.",
+      "reconfigure_successful": "The integration was reconfigured."
     }
   },
   "options": {
     "step": {
       "init": {
         "title": "1FuseLoader options",
-        "description": "Tune thresholds. These are also exposed as Number/Switch entities for quick adjustments.",
+        "description": "Tune thresholds. Current settings are checked together before saving. Unused phases stay at 0 A. TTL values are seconds; Easee receives rounded-up whole minutes. {error}",
         "data": {
           "main_fuse_amps": "Main fuse amps",
           "buffer_amps": "Buffer amps",
@@ -48,9 +73,14 @@
           "enable_dynamic_limit": "Enable dynamic limit",
           "enable_soft_guard": "Enable soft guard",
           "enable_pause_resume": "Enable pause/resume",
-          "force_min_when_available_too_low": "Force minimum when available is too low but L1 is safe"
+          "force_min_when_available_too_low": "Legacy forced-minimum policy (disabled)",
+          "max_sensor_age_seconds": "Maximum current sensor age (seconds)"
         }
       }
+    },
+    "error": {
+      "invalid_settings": "The settings are not valid. Check the ranges and relationships shown above."
     }
-  }
+  },
+  "title": "1FuseLoader"
 }

@@ -1,0 +1,90 @@
+"""Smoke tests against real HA; CI requires Home Assistant 2026.10.1.
+
+The standalone safety suites use fakes. This file deliberately imports the real
+Home Assistant classes to catch API/import/selector regressions before rollout.
+It never connects to a charger or a running Home Assistant installation.
+"""
+from __future__ import annotations
+
+import importlib
+import importlib.util
+import os
+import tempfile
+import unittest
+from types import MappingProxyType, SimpleNamespace
+
+HAS_HA = importlib.util.find_spec("homeassistant") is not None
+if os.environ.get("ONEFUSE_REQUIRE_HOMEASSISTANT") and not HAS_HA:
+    raise RuntimeError("CI must install Home Assistant before running this suite")
+
+
+@unittest.skipUnless(HAS_HA, "Real Home Assistant is installed in the CI job")
+class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from homeassistant.core import HomeAssistant
+        from homeassistant.config_entries import ConfigEntry
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.hass = HomeAssistant(self.temp.name)
+        self.component = importlib.import_module("custom_components.1fuseloader")
+        self.const = importlib.import_module("custom_components.1fuseloader.const")
+        self.flow_module = importlib.import_module("custom_components.1fuseloader.config_flow")
+        self.entry = ConfigEntry(
+            version=1, minor_version=1, domain="1fuseloader", title="Test charger",
+            data={
+                "device_id": "test-device", "controlled_phase": "L1",
+                "status_entity": "sensor.test_status", "l1_entity": "sensor.test_l1",
+                "l2_entity": "sensor.test_l2", "l3_entity": "sensor.test_l3",
+                "charger_current_entity": "sensor.test_current",
+            },
+            options=dict(self.const.DEFAULT_OPTIONS), source="user", unique_id="test-device",
+            discovery_keys=MappingProxyType({}), subentries_data=None,
+        )
+
+    async def asyncTearDown(self):
+        await self.hass.async_block_till_done()
+        self.temp.cleanup()
+
+    async def test_all_platforms_import_and_entities_construct(self):
+        controller = self.component.OneFuseLoaderController(self.hass, self.entry)
+        for platform, klass, descriptions in (
+            ("sensor", "OneFuseSensor", "SENSOR_DESCRIPTIONS"),
+            ("number", "OneFuseNumber", "NUMBER_DESCRIPTIONS"),
+            ("switch", "OneFuseSwitch", "SWITCH_DESCRIPTIONS"),
+            ("button", "OneFuseButton", "BUTTON_DESCRIPTIONS"),
+        ):
+            module = importlib.import_module(f"custom_components.1fuseloader.{platform}")
+            for description in getattr(module, descriptions):
+                entity = getattr(module, klass)(controller, self.entry, description)
+                self.assertIsNotNone(entity.unique_id)
+                self.assertIsNotNone(entity.device_info)
+
+    async def test_setup_form_uses_current_ha_selectors(self):
+        flow = self.flow_module.OneFuseLoaderConfigFlow()
+        flow.hass = self.hass
+        flow.context = {"source": "user"}
+        result = await flow.async_step_user()
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(result["step_id"], "user")
+        self.assertIsNotNone(result["data_schema"])
+
+    async def test_options_form_uses_current_config_entry_property(self):
+        self.hass.config_entries = SimpleNamespace(async_get_known_entry=lambda _: self.entry)
+        flow = self.flow_module.OneFuseLoaderOptionsFlow()
+        flow.hass = self.hass
+        flow.handler = self.entry.entry_id
+        result = await flow.async_step_init()
+        self.assertEqual(result["type"], "form")
+        result = await flow.async_step_init({"min_charge_amps": 16, "max_charge_amps": 6})
+        self.assertEqual(result["type"], "form")
+        self.assertEqual(result["errors"].get("base"), "invalid_settings")
+
+    async def test_defaults_are_observation_only(self):
+        settings = self.component._settings_from_entry(self.entry)
+        self.assertFalse(settings.active_control)
+        self.assertTrue(settings.dry_run)
+        self.assertFalse(settings.force_min_when_available_too_low)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

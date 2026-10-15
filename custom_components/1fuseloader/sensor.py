@@ -69,6 +69,11 @@ SENSOR_DESCRIPTIONS = [
         name="Last Command",
         icon="mdi:console",
     ),
+    SensorEntityDescription(
+        key="service_result",
+        name="Command Result",
+        icon="mdi:list-status",
+    ),
 ]
 
 
@@ -79,6 +84,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
 class OneFuseSensor(SensorEntity):
     _attr_has_entity_name = True
+    _attr_should_poll = False
 
     def __init__(self, controller, entry: ConfigEntry, description: SensorEntityDescription) -> None:
         self.controller = controller
@@ -123,7 +129,9 @@ class OneFuseSensor(SensorEntity):
         if key == "reason":
             return d.reason
         if key == "last_command":
-            return d.command or "none"
+            return self.controller.regulator.last_command or "none"
+        if key == "service_result":
+            return self.controller.last_service_result
         return None
 
     @property
@@ -131,4 +139,10 @@ class OneFuseSensor(SensorEntity):
         d = self.controller.last_decision
         if d is None:
             return None
-        return asdict(d)
+        return {
+            **asdict(d),
+            "proposed_command": d.command,
+            "command_result": self.controller.last_service_result,
+            "command_error": self.controller.last_service_error,
+            "control_block_reason": self.controller.control_block_reason,
+        }

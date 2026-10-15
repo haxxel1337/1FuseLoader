@@ -22,7 +22,6 @@ SWITCH_DESCRIPTIONS = [
     OneFuseSwitchDescription(key="enable_dynamic_limit", option_key="enable_dynamic_limit", name="Enable Dynamic Limit", icon="mdi:ev-station"),
     OneFuseSwitchDescription(key="enable_soft_guard", option_key="enable_soft_guard", name="Enable Soft Guard", icon="mdi:shield-half-full"),
     OneFuseSwitchDescription(key="enable_pause_resume", option_key="enable_pause_resume", name="Enable Pause Resume", icon="mdi:pause-play"),
-    OneFuseSwitchDescription(key="force_min_when_available_too_low", option_key="force_min_when_available_too_low", name="Force Min When Available Too Low", icon="mdi:battery-heart"),
 ]
 
 
@@ -33,6 +32,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
 class OneFuseSwitch(SwitchEntity):
     _attr_has_entity_name = True
+    _attr_should_poll = False
 
     def __init__(self, controller, entry: ConfigEntry, description: OneFuseSwitchDescription) -> None:
         self.controller = controller

@@ -1,3 +1,86 @@
 {
+  "config": {
+    "step": {
+      "user": {
+        "title": "1FuseLoader",
+        "description": "Välj Easee-laddaren och strömsensorer i ampere. Endast enfasstyrning på L1 stöds. Nya installationer startar med provkörning på och aktiv styrning av.",
+        "data": {
+          "name": "Namn",
+          "device_id": "Easee-enhet i Home Assistant",
+          "status_entity": "Easees statussensor",
+          "l1_entity": "Nätström L1",
+          "l2_entity": "Nätström L2",
+          "l3_entity": "Nätström L3",
+          "charger_current_entity": "Laddarens strömsensor",
+          "controlled_phase": "Styrd fas"
+        }
+      },
+      "reconfigure": {
+        "title": "Konfigurera om 1FuseLoader",
+        "description": "Uppdatera sensorerna för samma Easee-laddare. Laddarens identitet måste vara oförändrad. Endast L1 stöds.",
+        "data": {
+          "name": "Namn",
+          "device_id": "Easee-enhet i Home Assistant",
+          "status_entity": "Easees statussensor",
+          "l1_entity": "Nätström L1",
+          "l2_entity": "Nätström L2",
+          "l3_entity": "Nätström L3",
+          "charger_current_entity": "Laddarens strömsensor",
+          "controlled_phase": "Styrd fas"
+        }
+      }
+    },
+    "error": {
+      "device_id_required": "Välj en Easee-enhet.",
+      "device_not_easee": "Välj en enhet som tillhör Easee-integrationen.",
+      "entity_not_found": "Välj en befintlig sensor.",
+      "current_unit_required": "Strömsensorn måste använda ampere (A).",
+      "unsupported_phase": "Endast enfasstyrning på L1 stöds.",
+      "duplicate_current_entity": "Använd en separat sensor för varje nätfas och för laddarens ström.",
+      "charger_sensor_mismatch": "Välj en sensor som tillhör den valda Easee-laddaren."
+    },
+    "abort": {
+      "already_configured": "Denna Easee-laddare är redan konfigurerad.",
+      "unique_id_mismatch": "Välj samma Easee-laddare som i den befintliga installationen.",
+      "reconfigure_successful": "Integrationen har konfigurerats om."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Inställningar för 1FuseLoader",
+        "description": "Justera gränser. Alla värden valideras tillsammans före sparning. Oanvända faser är låsta till 0 A. TTL anges i sekunder; Easee får avrundat uppåt till hela minuter. {error}",
+        "data": {
+          "main_fuse_amps": "Huvudsäkring (A)",
+          "buffer_amps": "Marginal (A)",
+          "min_charge_amps": "Minsta laddström (A)",
+          "max_charge_amps": "Högsta laddström (A)",
+          "safe_l1_amps": "Säker gräns för L1 (A)",
+          "soft_limit_amps": "Gräns för mjukbegränsning (A)",
+          "soft_for_seconds": "Fördröjning för mjukbegränsning (s)",
+          "soft_current_amps": "Ström vid mjukbegränsning (A)",
+          "pause_limit_amps": "Pausgräns (A)",
+          "pause_for_seconds": "Fördröjning före paus (s)",
+          "resume_below_amps": "Återuppta under (A)",
+          "resume_for_seconds": "Fördröjning före återupptagning (s)",
+          "normal_ttl_seconds": "Normal TTL (s)",
+          "soft_ttl_seconds": "TTL vid mjukbegränsning (s)",
+          "resend_limit_every_seconds": "Intervall för förnyad gräns (s)",
+          "min_seconds_between_actions": "Minsta tid mellan åtgärder (s)",
+          "unused_phase_current": "Ström på oanvänd fas (A)",
+          "max_sensor_age_seconds": "Högsta tillåtna sensorålder (s)",
+          "active_control": "Aktiv styrning",
+          "dry_run": "Provkörning utan styrning",
+          "enable_dynamic_limit": "Aktivera dynamisk gräns",
+          "enable_soft_guard": "Aktivera mjukbegränsning",
+          "enable_pause_resume": "Aktivera paus och återupptagning",
+          "force_min_when_available_too_low": "Äldre minströmspolicy (avstängd)"
+        }
+      }
+    },
+    "error": {
+      "invalid_settings": "Inställningarna är ogiltiga. Kontrollera gränserna och sambanden ovan."
+    }
+  },
   "title": "1FuseLoader"
 }
