@@ -149,6 +149,17 @@ class HomeAssistantFlowTests(unittest.IsolatedAsyncioTestCase):
         schema = self.flow_module._config_schema({"name": "Existing title"}, include_name=False)
         self.assertNotIn("name", {marker.schema for marker in schema.schema})
 
+    async def test_current_selectors_use_the_supported_nested_unit_filter(self):
+        schema = self.flow_module._config_schema()
+        fields = {marker.schema: field for marker, field in schema.schema.items()}
+        for key in ("l1_entity", "l2_entity", "l3_entity", "charger_current_entity"):
+            with self.subTest(key=key):
+                self.assertNotIn("unit_of_measurement", fields[key].config)
+                filters = fields[key].config["filter"]
+                self.assertEqual(filters[0]["domain"], ["sensor"])
+                self.assertEqual(filters[0]["unit_of_measurement"], ["A"])
+        self.assertEqual(fields["charger_current_entity"].config["filter"][0]["integration"], "easee")
+
     async def test_charger_telemetry_must_belong_to_the_selected_easee_device(self):
         flow = self.flow_module.OneFuseLoaderConfigFlow()
         flow.hass = SimpleNamespace(states=SimpleNamespace(get=lambda _: SimpleNamespace(attributes={"unit_of_measurement": "A"})))

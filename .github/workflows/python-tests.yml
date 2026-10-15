@@ -31,6 +31,10 @@ jobs:
           ONEFUSE_REQUIRE_HOMEASSISTANT: "1"
           ONEFUSE_REQUIRE_PYEASEE_CONTRACT: "1"
         run: |
+          result=0
           for test_script in test_1fuseloader_*.py; do
-            python "$test_script"
+            if ! python "$test_script"; then
+              result=1
+            fi
           done
+          exit "$result"

@@ -31,15 +31,25 @@ from .const import (
 )
 
 
+def _sensor_selector(*, current: bool = False, integration: str | None = None):
+    """Place new filtering features under filter, as required by HA 2026.10."""
+    entity_filter = selector.EntityFilterSelectorConfig(domain="sensor")
+    if current:
+        entity_filter["unit_of_measurement"] = ["A"]
+    if integration:
+        entity_filter["integration"] = integration
+    return selector.EntitySelector(selector.EntitySelectorConfig(filter=entity_filter))
+
+
 def _config_schema(defaults: dict[str, Any] | None = None, *, include_name: bool = True) -> vol.Schema:
     d = defaults or {}
     fields = {
             vol.Required(CONF_DEVICE_ID, default=d.get(CONF_DEVICE_ID, DEFAULT_DEVICE_ID)): selector.DeviceSelector(selector.DeviceSelectorConfig(integration="easee")),
-            vol.Required(CONF_STATUS_ENTITY, default=d.get(CONF_STATUS_ENTITY, DEFAULT_STATUS_ENTITY)): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", integration="easee")),
-            vol.Required(CONF_L1_ENTITY, default=d.get(CONF_L1_ENTITY, DEFAULT_L1_ENTITY)): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", unit_of_measurement="A")),
-            vol.Required(CONF_L2_ENTITY, default=d.get(CONF_L2_ENTITY, DEFAULT_L2_ENTITY)): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", unit_of_measurement="A")),
-            vol.Required(CONF_L3_ENTITY, default=d.get(CONF_L3_ENTITY, DEFAULT_L3_ENTITY)): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", unit_of_measurement="A")),
-            vol.Required(CONF_CHARGER_CURRENT_ENTITY, default=d.get(CONF_CHARGER_CURRENT_ENTITY, DEFAULT_CHARGER_CURRENT_ENTITY)): selector.EntitySelector(selector.EntitySelectorConfig(domain="sensor", integration="easee", unit_of_measurement="A")),
+            vol.Required(CONF_STATUS_ENTITY, default=d.get(CONF_STATUS_ENTITY, DEFAULT_STATUS_ENTITY)): _sensor_selector(integration="easee"),
+            vol.Required(CONF_L1_ENTITY, default=d.get(CONF_L1_ENTITY, DEFAULT_L1_ENTITY)): _sensor_selector(current=True),
+            vol.Required(CONF_L2_ENTITY, default=d.get(CONF_L2_ENTITY, DEFAULT_L2_ENTITY)): _sensor_selector(current=True),
+            vol.Required(CONF_L3_ENTITY, default=d.get(CONF_L3_ENTITY, DEFAULT_L3_ENTITY)): _sensor_selector(current=True),
+            vol.Required(CONF_CHARGER_CURRENT_ENTITY, default=d.get(CONF_CHARGER_CURRENT_ENTITY, DEFAULT_CHARGER_CURRENT_ENTITY)): _sensor_selector(current=True, integration="easee"),
             vol.Required(CONF_CONTROLLED_PHASE, default=d.get(CONF_CONTROLLED_PHASE, DEFAULT_CONTROLLED_PHASE)): vol.In(["L1"]),
         }
     if include_name:
