@@ -326,8 +326,6 @@ class OneFuseRegulator:
             error = "Charger current is missing, invalid or negative."
         elif status not in ALLOWED_ACTIVE_STATUSES | IDLE_STATUSES:
             error = f"Charger status '{status}' is unavailable, unsupported or a fault."
-        elif current > grid + 1:
-            error = "Charger and grid currents are inconsistent; cannot estimate house load safely."
         if error:
             self.reset_timers()
             self._restart_required = True
@@ -346,6 +344,39 @@ class OneFuseRegulator:
 
         assert grid is not None
         assert current is not None
+        if current > grid + 1:
+            # The grid can report the reduction before the EV source does.
+            # Hold only our accepted lower cap, with enough headroom even if
+            # the actual EV draw is already zero. An inconsistent subtraction
+            # must never create permission for an increase or a resume.
+            cap = self._awaiting_reduction_target
+            reserve = min(s.buffer_amps, max(0.0, s.minimum_reserve_amps))
+            grid_updated = (self._last_input_grid_ts is not None
+                            and self._reduction_grid_ts is not None
+                            and self._last_input_grid_ts > self._reduction_grid_ts)
+            ev_not_updated = (self._last_input_charger_ts is not None
+                              and self._reduction_charger_ts is not None
+                              and self._last_input_charger_ts <= self._reduction_charger_ts)
+            if (cap is not None and cap > 0 and self.last_target is not None
+                    and self.last_target[0] == cap and grid_updated and ev_not_updated
+                    and grid + cap <= s.main_fuse_amps - reserve):
+                if self._settle_started is None:
+                    self._settle_started = now
+                settle_seconds = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+                if now - self._settle_started < settle_seconds:
+                    # This is a new valid grid report. Keep its continuous
+                    # observations current even though mixed EV data must not
+                    # trigger a pause, resume, or increase from this snapshot.
+                    self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+                    self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+                    self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+                    self._increase_since = None
+                    return decision("settling", "Waiting briefly for the EV report after observed grid reduction.",
+                                    "set_limit", cap, self.last_target[3])
+            self.reset_timers()
+            self._restart_required = True
+            return decision("unavailable", "Charger and grid currents are inconsistent; cannot estimate house load safely. "
+                            "Requesting 0 A; cloud control is best effort.", "set_limit", emergency=True)
         if self._awaiting_reduction_target is not None:
             if current <= self._awaiting_reduction_target + 0.5:
                 # An EV event can arrive before the corresponding grid event.

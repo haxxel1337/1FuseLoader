@@ -36,6 +36,13 @@ class ContinuityTests(unittest.TestCase):
             regulator.acknowledge(decision, now)
         return decision
 
+    def pending_reduction(self, *, house=17, accept=True, **options):
+        regulator = self.regulator(**options)
+        self.sample(regulator, 0, house=5, grid_report_ts=100, charger_report_ts=100)
+        self.sample(regulator, 1, house=house, accept=accept,
+                    grid_report_ts=101, charger_report_ts=100)
+        return regulator
+
     def test_appliance_boost_sheds_to_seven_instead_of_stopping(self):
         regulator = self.regulator()
         self.assertEqual(self.sample(regulator, 0, house=5).current_p1, 16)
@@ -222,6 +229,118 @@ class ContinuityTests(unittest.TestCase):
         self.sample(regulator, 0, house=5)
         self.sample(regulator, 1, house=18)
         self.assertEqual(self.sample(regulator, 2, grid=34, ev=6).current_p1, 0)
+
+    def test_grid_first_reduction_holds_accepted_cap_until_ev_report_arrives(self):
+        regulator = self.pending_reduction()
+        mixed = self.sample(regulator, 2, grid=11, ev=16,
+                            grid_report_ts=102, charger_report_ts=100)
+        self.assertEqual((mixed.mode, mixed.command, mixed.current_p1), ("settling", "set_limit", 6))
+        self.assertEqual(mixed.ttl_seconds, 60)
+        self.assertFalse(mixed.should_call_service)
+        coherent = self.sample(regulator, 3, house=5, ev=6,
+                               grid_report_ts=102, charger_report_ts=103)
+        self.assertEqual(coherent.current_p1, 6)
+        self.assertNotEqual(coherent.mode, "unavailable")
+        self.assertEqual(self.sample(regulator, 33, house=5, ev=6,
+                                     grid_report_ts=133, charger_report_ts=103).current_p1, 7)
+
+    def test_grid_first_hold_requires_conservative_grid_plus_cap_budget(self):
+        for grid, expected in ((14.5, 10), (14.6, 0)):
+            with self.subTest(grid=grid):
+                regulator = self.pending_reduction(house=13)
+                decision = self.sample(regulator, 2, grid=grid, ev=16,
+                                       grid_report_ts=102, charger_report_ts=100)
+                self.assertEqual(decision.current_p1, expected)
+                self.assertEqual(decision.mode, "settling" if expected else "unavailable")
+
+    def test_grid_first_hold_requires_an_accepted_positive_reduction(self):
+        for setup in ({"accept": False}, {"house": 20}):
+            with self.subTest(setup=setup):
+                regulator = self.pending_reduction(**setup)
+                decision = self.sample(regulator, 2, grid=11, ev=16,
+                                       grid_report_ts=102, charger_report_ts=100)
+                self.assertEqual((decision.mode, decision.current_p1), ("unavailable", 0))
+
+    def test_grid_first_hold_requires_new_grid_and_known_old_ev_timestamps(self):
+        for metadata in ({"grid_report_ts": None, "charger_report_ts": 100},
+                         {"grid_report_ts": 102, "charger_report_ts": None},
+                         {}, {"grid_report_ts": 101, "charger_report_ts": 100},
+                         {"grid_report_ts": 102, "charger_report_ts": 102}):
+            with self.subTest(metadata=metadata):
+                regulator = self.pending_reduction()
+                decision = self.sample(regulator, 2, grid=11, ev=16, **metadata)
+                self.assertEqual((decision.mode, decision.current_p1), ("unavailable", 0))
+
+    def test_grid_first_hold_expires_without_reset_by_grid_updates_or_ttl_refresh(self):
+        regulator = self.pending_reduction(resend_limit_every_seconds=5)
+        self.sample(regulator, 2, grid=11, ev=16, grid_report_ts=102, charger_report_ts=100)
+        renewed = self.sample(regulator, 6, grid=10, ev=16,
+                              grid_report_ts=106, charger_report_ts=100)
+        self.assertTrue(renewed.should_call_service)
+        self.assertEqual(renewed.current_p1, 6)
+        self.assertEqual(self.sample(regulator, 11, grid=9, ev=16,
+                                     grid_report_ts=111, charger_report_ts=100).current_p1, 6)
+        expired = self.sample(regulator, 12, grid=8, ev=16,
+                              grid_report_ts=112, charger_report_ts=100)
+        self.assertEqual((expired.mode, expired.current_p1), ("unavailable", 0))
+
+    def test_grid_first_hold_ends_when_new_grid_exceeds_its_budget(self):
+        regulator = self.pending_reduction(house=13)
+        self.sample(regulator, 2, grid=14.5, ev=16,
+                    grid_report_ts=102, charger_report_ts=100)
+        unsafe = self.sample(regulator, 3, grid=14.6, ev=16,
+                             grid_report_ts=103, charger_report_ts=100)
+        self.assertEqual((unsafe.mode, unsafe.current_p1), ("unavailable", 0))
+
+    def test_grid_first_hold_never_overrides_stale_invalid_or_fault_telemetry(self):
+        for metadata in ({"data_valid": False, "data_error": "stale"},
+                         {"status": "offline"}, {"grid": "unavailable"}):
+            with self.subTest(metadata=metadata):
+                regulator = self.pending_reduction()
+                sample = {"grid": 11, "ev": 16, "grid_report_ts": 102, "charger_report_ts": 100}
+                sample.update(metadata)
+                fault = self.sample(regulator, 2, **sample)
+                self.assertEqual((fault.mode, fault.current_p1), ("unavailable", 0))
+
+    def test_grid_first_hold_never_issues_resume(self):
+        regulator = self.pending_reduction(resume_for_seconds=0)
+        regulator.paused_by_us = True
+        held = self.sample(regulator, 2, grid=11, ev=16, status="awaiting_start",
+                           grid_report_ts=102, charger_report_ts=100)
+        self.assertEqual((held.command, held.current_p1), ("set_limit", 6))
+        self.assertTrue(regulator.paused_by_us)
+
+    def test_grid_first_hold_updates_continuous_grid_guard_observations(self):
+        regulator = self.regulator()
+        self.sample(regulator, 0, house=13, ev=16, grid_report_ts=100, charger_report_ts=100)
+        self.assertEqual(regulator.above_pause_since, 0)
+        low = self.sample(regulator, 119, grid=14, ev=16,
+                          grid_report_ts=200, charger_report_ts=100)
+        self.assertEqual((low.mode, low.current_p1), ("settling", 10))
+        self.assertIsNone(regulator.above_soft_since)
+        self.assertIsNone(regulator.above_pause_since)
+        self.assertEqual(regulator.below_resume_since, 119)
+        high_again = self.sample(regulator, 120, house=13, ev=16,
+                                 grid_report_ts=201, charger_report_ts=201)
+        self.assertNotEqual(high_again.command, "pause")
+        self.assertEqual(regulator.above_pause_since, 120)
+        self.assertIsNone(regulator.below_resume_since)
+        sustained = self.sample(regulator, 240, house=13, ev=16,
+                                grid_report_ts=202, charger_report_ts=202)
+        self.assertEqual(sustained.command, "pause")
+
+    def test_idle_feedback_precedes_consistency_but_not_invalid_or_stale_data(self):
+        for status, valid in (("completed", True), ("disconnected", True), ("completed", False)):
+            with self.subTest(status=status, valid=valid):
+                regulator = self.pending_reduction()
+                idle = self.sample(regulator, 2, grid=2.7, ev=10.672, status=status,
+                                   data_valid=valid,
+                                   grid_report_ts=102, charger_report_ts=100)
+                if valid:
+                    self.assertEqual((idle.mode, idle.command), ("idle", None))
+                    self.assertFalse(idle.should_call_service)
+                else:
+                    self.assertEqual((idle.mode, idle.current_p1), ("unavailable", 0))
 
     def test_manual_pause_is_not_resumed_and_not_ramped_up(self):
         regulator = self.regulator()

@@ -98,6 +98,32 @@ not permission to overload a fuse. Verify real meter cadence and vehicle respons
 before takeover. Deliberate overload ride-through is not enabled: that requires
 the actual fuse type/curve and an installation-specific policy.
 
+The opposite report order can also briefly pair a newer low grid current with
+an older high EV current. During an acknowledged reduction, the regulator may
+retain its accepted positive cap for the same bounded alignment window only
+when report timestamps identify the old EV sample and **grid current plus the
+entire cap** still fits the nominal budget and minimum reserve. This deliberately
+does not subtract the inconsistent EV reading to create headroom. A timeout,
+missing timestamps, inconsistent fresh EV data or an exceeded budget requests
+zero; the window never permits an increase or resume. A completed/disconnected
+session does not receive a zero command merely because its final current
+reports arrive out of order.
+
+These checks do not synchronize physical measurements. Numerically consistent
+grid/EV values can still refer to different moments. While a submitted reduction
+is unobserved, the normal estimator retains at least the preceding house-load
+estimate and inhibits increases. A coincident house-load increase and EV-current
+decrease can nevertheless escape that estimate briefly. This remains best-effort
+cloud control, not a guarantee against transient overload; verify report cadence
+and response in dry run and a supervised charging test before takeover.
+
+The legacy `pause_limit_amps` / `pause_for_seconds` settings are an additional
+sustained-overload Pause fallback, for example when a submitted limit does not
+produce the expected physical response. They do **not** grant an overload grace
+period: the normal headroom calculation still requests zero immediately when
+even minimum charging does not fit. Increasing the default 120-second pause
+delay therefore does not implement timed minimum-current overload operation.
+
 Missing, invalid, restored or stale grid data resets the guard timers and
 requests 0 A when control is enabled. Grid freshness uses `State.last_reported`.
 Easee status/current are event driven, so their unchanged state timestamps are
