@@ -11,7 +11,9 @@ import importlib.util
 import os
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from types import MappingProxyType, SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 HAS_HA = importlib.util.find_spec("homeassistant") is not None
 if os.environ.get("ONEFUSE_REQUIRE_HOMEASSISTANT") and not HAS_HA:
@@ -84,6 +86,44 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(settings.active_control)
         self.assertTrue(settings.dry_run)
         self.assertFalse(settings.force_min_when_available_too_low)
+
+    async def test_start_timer_and_stop_use_the_ha_event_loop_without_writes(self):
+        from homeassistant.core import HassJob, HassJobType
+
+        adapter = SimpleNamespace(
+            control_block_reason=None, telemetry_block_reason=None,
+            async_initialize=AsyncMock(), async_execute=AsyncMock(),
+        )
+        for entity_id, value, attributes in (
+            ("sensor.test_status", "charging", {}),
+            ("sensor.test_l1", "18", {"unit_of_measurement": "A"}),
+            ("sensor.test_current", "16", {"unit_of_measurement": "A"}),
+        ):
+            self.hass.states.async_set(entity_id, value, attributes)
+        controller = self.component.OneFuseLoaderController(self.hass, self.entry, adapter)
+        scheduled = {}
+        real_track = self.component.async_track_time_interval
+
+        def capture_timer(hass, action, interval):
+            scheduled["action"] = action
+            return real_track(hass, action, interval)
+
+        with patch.object(self.component, "async_track_time_interval", side_effect=capture_timer):
+            await controller.async_start()
+        try:
+            # A plain synchronous lambda would be classified as an executor job
+            # and call loop-only APIs from a worker thread when the timer fires.
+            job = HassJob(scheduled["action"])
+            self.assertEqual(job.job_type, HassJobType.Coroutinefunction)
+            task = self.hass.async_run_hass_job(job, datetime.now(timezone.utc))
+            if task is not None:
+                await task
+            self.assertEqual(controller.last_decision.current_p1, 16)
+            self.assertFalse(controller.last_decision.should_call_service)
+            adapter.async_execute.assert_not_awaited()
+        finally:
+            await controller.async_stop()
+        self.assertIsNone(controller.unsub_timer)
 
 
 if __name__ == "__main__":

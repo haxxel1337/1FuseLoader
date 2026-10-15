@@ -131,9 +131,15 @@ class OneFuseLoaderController:
                 _LOGGER.warning("1FuseLoader adapter initialization failed (%s)", type(err).__name__)
             await self._async_tick_locked()
             interval = int((self.entry.options or DEFAULT_OPTIONS).get("poll_interval_seconds", 5))
+
+            async def interval_tick(_now: datetime) -> None:
+                # HA classifies the registered callable before dispatch. A
+                # plain lambda would run in its executor, outside this loop.
+                await self.async_tick()
+
             self.unsub_timer = async_track_time_interval(
                 self.hass,
-                lambda now: self.hass.async_create_task(self.async_tick()),
+                interval_tick,
                 timedelta(seconds=max(5, interval)),
             )
 
