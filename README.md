@@ -66,10 +66,37 @@ The original guard thresholds are included:
 - Pause guard: high L1 for longer duration → pause charging
 - Resume guard: low L1 for stable duration → resume charging
 
-Current never exceeds the calculated headroom. In particular, the old forced
-6 A fallback is removed: if less than the minimum charging current is available,
-the target is 0 A. The SOFT guard can only lower the target. L1 is the only
-supported controlled phase, and L2/L3 limits stay at 0 A.
+Normal current follows the buffered headroom. An already charging car can keep
+the minimum 6 A by using some of the normal buffer, provided the estimated
+house load plus 6 A still fits below the main fuse rating with a separate
+minimum reserve (default 0.5 A). This replaces the old unconditional minimum
+fallback; it never intentionally permits an overload. L1 is the only supported
+controlled phase, and L2/L3 limits stay at 0 A.
+
+For the default 25 A fuse and 2 A normal buffer:
+
+| Estimated house load on L1 | EV target after a load increase | Estimated total |
+| --- | --- | --- |
+| 16 A | 7 A | 23 A |
+| 18 A | 6 A, using part of the buffer | 24 A |
+| 18.5 A | 6 A, retaining 0.5 A reserve | 24.5 A |
+| 20 A | 0 A; 6 A would exceed the budget | 20 A |
+
+Decreases run as soon as a source state change is received, with a coalesced
+latest-snapshot worker and a 5-second watchdog. Increases wait for 30 seconds
+of stable headroom and then rise at most 1 A per 15 seconds. Recovery after a
+zero cap requires 60 seconds of stable buffered headroom and starts at 6 A.
+Takeover of an already charging session starts at its measured current rather
+than jumping to the maximum. A submitted reduction must be observed before a
+rise is allowed; renewing its TTL does not reset ramp timers.
+
+When observed EV reduction arrives before a new grid report, the regulator can
+briefly retain the already accepted lower cap while waiting for alignment
+(default 10 seconds, configurable). Any new grid report is evaluated immediately;
+invalid/stale telemetry still requests zero. This is a report-alignment window,
+not permission to overload a fuse. Verify real meter cadence and vehicle response
+before takeover. Deliberate overload ride-through is not enabled: that requires
+the actual fuse type/curve and an installation-specific policy.
 
 Missing, invalid, restored or stale grid data resets the guard timers and
 requests 0 A when control is enabled. Grid freshness uses `State.last_reported`.
@@ -84,6 +111,31 @@ actual cadence while charging before takeover.
 The integration only resumes a pause that it requested during the current
 runtime. It does not infer ownership from a charger's paused status after an
 HA restart. User settings persist, but pause ownership and timers do not.
+
+## BMW X5 xDrive45e and CarData
+
+BMW's original August 2019 technical data specifies 3.7 kW AC at 230 V / 16 A,
+24 kWh gross battery energy and about 6.8 hours for 0–100% at maximum AC power.
+The project's default 6–16 A single-phase range matches that vehicle's maximum
+and Easee's normal minimum current allocation. A 6 A limit offers about 1.38 kW
+at 230 V; the measured draw may be lower if the vehicle requests less. Stability
+at exactly 6 A and stop/restart behavior remain supervised vehicle tests.
+
+An optional CarData device adds advisory BMW charging state, genuine reported
+SoC, AC current and phase-count sensors with source timestamps/freshness.
+Plug state, voltage, end reason and last result are related diagnostic context.
+Entity matching uses the selected device and descriptor keys, so renaming an
+entity does not break it. Predicted SoC and learned battery capacity are not
+used as genuine vehicle measurements. A phase count retained after disconnect
+is explicitly marked as unrelated to an active charging session.
+
+The installed CarData interface is read only. Its cloud values have variable
+cadence, so they never replace the meter/Easee feedback or decide a protective
+current increase, pause or resume. This integration makes no new BMW API polls.
+
+Sources: [BMW 2019 technical data](https://www.press.bmwgroup.com/global/article/attachment/T0300315EN/440691),
+[Easee current control](https://developer.easee.com/docs/current-limits-and-control),
+[BMW CarData documentation](https://bmw-cardata.bmwgroup.com/customer/public/api-documentation).
 
 ## Easee compatibility
 

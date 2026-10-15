@@ -9,15 +9,16 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
-    CONF_CHARGER_CURRENT_ENTITY, CONF_DEVICE_ID, CONF_L1_ENTITY, CONF_L2_ENTITY,
+    CONF_CHARGER_CURRENT_ENTITY, CONF_DEVICE_ID, CONF_BMW_DEVICE_ID, CONF_L1_ENTITY, CONF_L2_ENTITY,
     CONF_L3_ENTITY, CONF_STATUS_ENTITY, CONF_CONTROLLED_PHASE, DEFAULT_OPTIONS,
     DOMAIN, PLATFORMS, validate_options,
 )
 from .easee_adapter import EaseeCommandAdapter
+from .bmw_context import BMWContext
 from .logic import OneFuseRegulator, RegulatorInput, RegulatorSettings
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,10 +48,15 @@ class OneFuseLoaderController:
         self.last_service_error: str | None = None
         self.control_block_reason: str | None = "Easee adapter has not been initialized."
         self.unsub_timer = None
+        self.unsub_states = None
         self.listeners: list[Any] = []
         self._lock = asyncio.Lock()
         self._stopped = False
         self._generation = 0
+        self._pending_refresh = False
+        self._refresh_task: asyncio.Task | None = None
+        self._bmw_context = BMWContext(hass, entry.data.get(CONF_BMW_DEVICE_ID))
+        self.bmw_context: dict[str, Any] = {}
         self._adapter = command_adapter
         if command_adapter is not None:
             self.control_block_reason = command_adapter.control_block_reason
@@ -118,6 +124,13 @@ class OneFuseLoaderController:
         async with self._lock:
             self._stopped = False
             self._reload_settings_locked()
+            source_entities = [self.entry.data.get(key) for key in (
+                CONF_L1_ENTITY, CONF_L2_ENTITY, CONF_L3_ENTITY,
+                CONF_STATUS_ENTITY, CONF_CHARGER_CURRENT_ENTITY,
+            ) if self.entry.data.get(key)]
+            self.unsub_states = async_track_state_change_event(
+                self.hass, source_entities, self._handle_source_change,
+            )
             # Preserve the user's active/dry-run preferences across HA restarts.
             # Pause ownership is deliberately memory-only, so a restart cannot
             # resume a car which a person may have paused in the meantime.
@@ -143,16 +156,44 @@ class OneFuseLoaderController:
                 timedelta(seconds=max(5, interval)),
             )
 
+    @callback
+    def _handle_source_change(self, _event: Any) -> None:
+        """One coalesced refresh follows the newest local/Easee telemetry."""
+        if self._stopped:
+            return
+        self._pending_refresh = True
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = self.hass.async_create_task(self._async_process_refreshes())
+
+    async def _async_process_refreshes(self) -> None:
+        try:
+            while self._pending_refresh and not self._stopped:
+                self._pending_refresh = False
+                generation = self._generation
+                async with self._lock:
+                    if self._stopped or generation != self._generation:
+                        continue
+                    await self._async_tick_locked()
+        finally:
+            self._refresh_task = None
+
     async def async_stop(self) -> None:
         # Mark stopped before waiting for a currently running request. Poll ticks
         # coalesce instead of queuing; none can submit after this method returns.
         self._stopped = True
         self._generation += 1
+        self._pending_refresh = False
+        if self.unsub_states:
+            self.unsub_states()
+            self.unsub_states = None
         if self.unsub_timer:
             self.unsub_timer()
             self.unsub_timer = None
         async with self._lock:
             pass
+        pending = self._refresh_task
+        if pending is not None and pending is not asyncio.current_task():
+            await pending
 
     def _read_input(self) -> RegulatorInput:
         data = self.entry.data
@@ -197,7 +238,14 @@ class OneFuseLoaderController:
             charger_current=current_state.state if current_state is not None else None,
             data_valid=not errors,
             data_error=" ".join(errors) or None,
+            grid_report_ts=self._report_timestamp(grid_state),
+            charger_report_ts=self._report_timestamp(current_state),
         )
+
+    @staticmethod
+    def _report_timestamp(state: Any) -> float | None:
+        reported = getattr(state, "last_reported", None)
+        return reported.timestamp() if isinstance(reported, datetime) and reported.tzinfo else None
 
     async def async_tick(self) -> None:
         # Drop redundant timer ticks while an action or reconfiguration is in
@@ -211,6 +259,12 @@ class OneFuseLoaderController:
             await self._async_tick_locked()
 
     async def _async_tick_locked(self) -> None:
+        # BMW is optional advisory context. Failure cannot stop or delay the
+        # local meter/Easee regulator and never causes a BMW API request.
+        try:
+            self.bmw_context = self._bmw_context.snapshot()
+        except Exception:
+            self.bmw_context = {}
         inp = self._read_input()
         decision = self.regulator.evaluate(inp)
         self.last_decision = decision

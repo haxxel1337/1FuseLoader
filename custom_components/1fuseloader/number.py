@@ -21,9 +21,9 @@ class OneFuseNumberDescription(NumberEntityDescription):
 NUMBER_DESCRIPTIONS = [
     OneFuseNumberDescription(key="main_fuse_amps", option_key="main_fuse_amps", name="Main Fuse", native_min_value=10, native_max_value=63, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:fuse"),
     OneFuseNumberDescription(key="buffer_amps", option_key="buffer_amps", name="Buffer", native_min_value=0, native_max_value=10, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:shield-half-full"),
+    OneFuseNumberDescription(key="minimum_reserve_amps", option_key="minimum_reserve_amps", name="Reserve While Keeping Minimum Charge", native_min_value=0, native_max_value=5, native_step=0.1, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:shield-outline"),
     OneFuseNumberDescription(key="min_charge_amps", option_key="min_charge_amps", name="Min Charge", native_min_value=6, native_max_value=16, native_step=1, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:battery-arrow-down"),
     OneFuseNumberDescription(key="max_charge_amps", option_key="max_charge_amps", name="Max Charge", native_min_value=6, native_max_value=32, native_step=1, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:battery-arrow-up"),
-    OneFuseNumberDescription(key="safe_l1_amps", option_key="safe_l1_amps", name="Safe L1", native_min_value=5, native_max_value=63, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:shield-check"),
     OneFuseNumberDescription(key="soft_limit_amps", option_key="soft_limit_amps", name="Soft Guard Limit", native_min_value=10, native_max_value=80, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:speedometer-slow"),
     OneFuseNumberDescription(key="soft_for_seconds", option_key="soft_for_seconds", name="Soft Guard Delay", native_min_value=0, native_max_value=300, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-sand"),
     OneFuseNumberDescription(key="soft_current_amps", option_key="soft_current_amps", name="Soft Current", native_min_value=0, native_max_value=16, native_step=1, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:ev-plug-type2"),
@@ -36,6 +36,10 @@ NUMBER_DESCRIPTIONS = [
     OneFuseNumberDescription(key="resend_limit_every_seconds", option_key="resend_limit_every_seconds", name="Resend Limit Every", native_min_value=5, native_max_value=300, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:repeat"),
     OneFuseNumberDescription(key="min_seconds_between_actions", option_key="min_seconds_between_actions", name="Min Seconds Between Actions", native_min_value=1, native_max_value=60, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-lock"),
     OneFuseNumberDescription(key="max_sensor_age_seconds", option_key="max_sensor_age_seconds", name="Maximum Sensor Age", native_min_value=15, native_max_value=3600, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-alert-outline"),
+    OneFuseNumberDescription(key="increase_stable_seconds", option_key="increase_stable_seconds", name="Stable Load Before Increasing", native_min_value=5, native_max_value=300, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-sand"),
+    OneFuseNumberDescription(key="increase_interval_seconds", option_key="increase_interval_seconds", name="Seconds Between 1 A Increases", native_min_value=5, native_max_value=120, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:stairs-up"),
+    OneFuseNumberDescription(key="restart_stable_seconds", option_key="restart_stable_seconds", name="Stable Headroom Before Restart", native_min_value=15, native_max_value=600, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:play-pause"),
+    OneFuseNumberDescription(key="measurement_settle_seconds", option_key="measurement_settle_seconds", name="Wait for Grid Report After EV Reduction", native_min_value=1, native_max_value=30, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:sync-clock"),
 ]
 
 
@@ -72,8 +76,7 @@ class OneFuseNumber(NumberEntity):
 
     @property
     def native_value(self) -> float | int | None:
-        opts = dict(DEFAULT_OPTIONS)
-        opts.update(self.entry.options or {})
+        opts = validate_options(self.entry.options or {})
         return opts.get(self.entity_description.option_key)
 
     async def async_set_native_value(self, value: float) -> None:

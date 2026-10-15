@@ -36,6 +36,11 @@ class RegulatorSettings:
     buffer_amps: float = 2.0
     min_charge_amps: int = 6
     max_charge_amps: int = 16
+    minimum_reserve_amps: float = 0.5
+    increase_stable_seconds: int = 30
+    increase_interval_seconds: int = 15
+    restart_stable_seconds: int = 60
+    measurement_settle_seconds: int = 10
     safe_l1_amps: float = 23.0
     soft_limit_amps: float = 28.0
     soft_for_seconds: int = 20
@@ -70,6 +75,9 @@ class RegulatorInput:
     charger_current: object = 0
     data_valid: bool = True
     data_error: Optional[str] = None
+    # HA report receipt timestamps, not guaranteed device acquisition times.
+    grid_report_ts: Optional[float] = None
+    charger_report_ts: Optional[float] = None
 
 
 @dataclass(slots=True)
@@ -113,6 +121,9 @@ class OneFuseRegulator:
         self.above_soft_since: Optional[float] = None
         self.above_pause_since: Optional[float] = None
         self.below_resume_since: Optional[float] = None
+        self._increase_since: Optional[float] = None
+        self._restart_ready_since: Optional[float] = None
+        self._previous_desired: Optional[int] = None
 
     def reset(self) -> None:
         self.reset_timers()
@@ -123,6 +134,16 @@ class OneFuseRegulator:
         self.last_set_limit_ts: Optional[float] = None
         self.last_target: Optional[tuple[int, int, int, int]] = None
         self.last_command: Optional[str] = None
+        self._last_increase_ts: Optional[float] = None
+        self._last_limit_change_ts: Optional[float] = None
+        self._restart_required = False
+        self._awaiting_reduction_target: Optional[int] = None
+        self._house_before_reduction: Optional[float] = None
+        self._last_input_grid_ts: Optional[float] = None
+        self._last_input_charger_ts: Optional[float] = None
+        self._reduction_grid_ts: Optional[float] = None
+        self._reduction_charger_ts: Optional[float] = None
+        self._settle_started: Optional[float] = None
 
     def acknowledge(self, decision: RegulatorDecision, now_ts: float) -> None:
         """Commit bookkeeping after API submission succeeds, never before it."""
@@ -131,12 +152,37 @@ class OneFuseRegulator:
         self.last_action_ts = now_ts
         self.last_command = decision.command
         if decision.command == "set_limit":
+            old_target = self.last_target[0] if self.last_target is not None else None
+            target = decision.current_p1
+            changed = old_target != target
+            if changed:
+                self._last_limit_change_ts = now_ts
+            if changed and (target < decision.charger_current or
+                            (old_target is not None and target < old_target)):
+                # A submitted cap is not a measured current. Retain the last
+                # house estimate, and inhibit rises until the EV responds.
+                self._awaiting_reduction_target = target
+                self._house_before_reduction = decision.house_load_l1
+                self._reduction_grid_ts = self._last_input_grid_ts
+                self._reduction_charger_ts = self._last_input_charger_ts
+                self._settle_started = None
+                self._increase_since = None
+            if changed and (old_target is None or target > old_target):
+                self._last_increase_ts = now_ts
+            if target == 0:
+                self._restart_required = True
+            elif self._restart_required:
+                self._restart_required = False
+                self._restart_ready_since = None
             self.last_set_limit_ts = now_ts
             self.last_target = (
                 decision.current_p1, decision.current_p2, decision.current_p3, decision.ttl_seconds
             )
         elif decision.command == "pause":
             self.paused_by_us = True
+            self._restart_required = True
+            self._restart_ready_since = None
+            self._increase_since = None
             self._pause_observed = False
             self._pause_submission_ts = now_ts
         elif decision.command == "resume":
@@ -153,6 +199,70 @@ class OneFuseRegulator:
         if available < self.settings.min_charge_amps:
             return 0, house
         return int(floor(min(available, self.settings.max_charge_amps))), house
+
+    def _limit_with_continuity(self, now: float, desired: int, available: int,
+                               house: float, current: float, status: str,
+                               allow_minimum: bool = True) -> int:
+        """Lower promptly, retain minimum within budget, and raise slowly.
+
+        The reserve may spend part of the normal operating buffer, but never
+        intentionally permits total estimated current above the fuse rating.
+        """
+        s = self.settings
+        physically_charging = status == "charging" and current > 0
+        reserve = min(s.buffer_amps, max(0.0, s.minimum_reserve_amps))
+        if (allow_minimum and desired < s.min_charge_amps and physically_charging
+                and house + s.min_charge_amps <= s.main_fuse_amps - reserve):
+            desired = s.min_charge_amps
+
+        if desired < s.min_charge_amps:
+            self._restart_required = True
+            self._restart_ready_since = None
+            self._increase_since = None
+            self._previous_desired = 0
+            return 0
+
+        # A stopped/starting car must first have full buffered capacity for a
+        # continuous observation period. Borrowing buffer is for continuity.
+        if self.last_target is None and not physically_charging:
+            self._restart_required = True
+        if self._restart_required:
+            self._increase_since = None
+            self._previous_desired = desired
+            ready = self._timer_reached(
+                now, "_restart_ready_since", available >= s.min_charge_amps
+                and self._awaiting_reduction_target is None,
+                s.restart_stable_seconds,
+            )
+            return s.min_charge_amps if ready else 0
+
+        if self.last_target is None:
+            # On takeover, do not interpret unused headroom as permission for
+            # an immediate jump to the maximum current.
+            base = max(s.min_charge_amps, int(floor(current)))
+            self._increase_since = None
+            self._previous_desired = desired
+            return min(desired, base)
+
+        base = self.last_target[0]
+        if desired <= base:
+            self._increase_since = None
+            self._previous_desired = desired
+            return desired
+
+        load_rose = self._previous_desired is not None and desired < self._previous_desired
+        self._previous_desired = desired
+        if (not physically_charging or self._awaiting_reduction_target is not None
+                or load_rose):
+            self._increase_since = None
+            return max(s.min_charge_amps, base)
+
+        stable = self._timer_reached(now, "_increase_since", True, s.increase_stable_seconds)
+        interval_elapsed = (self._last_increase_ts is None or
+                            now - self._last_increase_ts >= s.increase_interval_seconds)
+        if stable and interval_elapsed:
+            return min(desired, base + 1)
+        return max(s.min_charge_amps, base)
 
     def _timer_reached(self, now: float, attr: str, condition: bool, seconds: int) -> bool:
         if not condition:
@@ -179,6 +289,8 @@ class OneFuseRegulator:
         status = (inp.status or "").strip().lower()
         grid = _valid_number(inp.grid_l1)
         current = _valid_number(inp.charger_current)
+        self._last_input_grid_ts = _valid_number(inp.grid_report_ts)
+        self._last_input_charger_ts = _valid_number(inp.charger_report_ts)
         available, house = self.calculate_available_l1(grid, current or 0.0)
 
         def decision(mode: str, reason: str, command: str | None = None,
@@ -188,7 +300,10 @@ class OneFuseRegulator:
             if command == "set_limit":
                 reduction = self.last_target is not None and target < self.last_target[0]
                 should_call = should_call and self._should_send_limit(now, target, ttl_value)
-                should_call = should_call and (emergency or reduction or self._action_allowed(now))
+                # Renewing a lease must not postpone an otherwise due rise.
+                change_allowed = (self._last_limit_change_ts is None or
+                                  now - self._last_limit_change_ts >= s.min_seconds_between_actions)
+                should_call = should_call and (emergency or reduction or change_allowed)
             else:
                 should_call = should_call and self._action_allowed(now)
             return RegulatorDecision(
@@ -215,6 +330,7 @@ class OneFuseRegulator:
             error = "Charger and grid currents are inconsistent; cannot estimate house load safely."
         if error:
             self.reset_timers()
+            self._restart_required = True
             return decision("unavailable", f"{error} Requesting 0 A; cloud control is best effort.",
                             "set_limit", emergency=True)
 
@@ -223,9 +339,46 @@ class OneFuseRegulator:
             self._pause_observed = False
             self._pause_submission_ts = None
             self.reset_timers()
+            self._restart_required = True
+            self._awaiting_reduction_target = None
+            self._house_before_reduction = None
             return decision("idle", f"Status '{status}' does not require charge control.")
 
         assert grid is not None
+        assert current is not None
+        if self._awaiting_reduction_target is not None:
+            if current <= self._awaiting_reduction_target + 0.5:
+                # An EV event can arrive before the corresponding grid event.
+                # For a strictly bounded interval keep the already accepted
+                # lower cap; subtracting the new EV current from the old grid
+                # current would manufacture a sudden household load increase.
+                grid_not_updated = (self._last_input_grid_ts is not None
+                                    and self._reduction_grid_ts is not None
+                                    and self._last_input_grid_ts <= self._reduction_grid_ts)
+                ev_updated = (self._last_input_charger_ts is not None
+                              and self._reduction_charger_ts is not None
+                              and self._last_input_charger_ts > self._reduction_charger_ts)
+                if grid_not_updated and ev_updated:
+                    if self._settle_started is None:
+                        self._settle_started = now
+                    settle_seconds = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+                    if now - self._settle_started < settle_seconds:
+                        self._increase_since = None
+                        cap = self._awaiting_reduction_target
+                        ttl = self.last_target[3] if self.last_target else s.normal_ttl_seconds
+                        return decision("settling", "Waiting briefly for the grid report after observed EV reduction.",
+                                        "set_limit", cap, ttl)
+                self._awaiting_reduction_target = None
+                self._house_before_reduction = None
+                self._settle_started = None
+            else:
+                # With asynchronous sources the subtraction can temporarily
+                # understate household load. Never recover headroom from the
+                # accepted command alone while its reduction is unobserved.
+                house = max(house, self._house_before_reduction or 0.0)
+                raw_available = s.main_fuse_amps - house - s.buffer_amps
+                available = (int(floor(min(raw_available, s.max_charge_amps)))
+                             if raw_available >= s.min_charge_amps else 0)
         soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
         pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
         resume = self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
@@ -261,6 +414,22 @@ class OneFuseRegulator:
             ttl = s.soft_ttl_seconds
             mode = "soft_limit"
             reason = f"Soft guard caps the available headroom at {target} A."
+
+        original_target = target
+        target = self._limit_with_continuity(
+            now, target, available, house, current, status,
+            allow_minimum=not (s.enable_soft_guard and soft and s.soft_current_amps < s.min_charge_amps),
+        )
+        if target > original_target:
+            mode = "minimum_continuity"
+            reason = (f"Retaining {target} A within the fuse budget and minimum reserve; "
+                      "using part of the normal buffer.")
+        elif target == 0 and original_target >= s.min_charge_amps:
+            mode = "restart_wait"
+            reason = "Waiting for continuously stable buffered headroom before restarting at minimum current."
+        elif 0 < target < original_target:
+            mode = "ramp_up"
+            reason = f"Limiting recovery to {target} A while load stabilizes and current rises gradually."
 
         if s.enable_pause_resume and self.paused_by_us and status in ALLOWED_RESUME_STATUSES and resume:
             if target < s.min_charge_amps:

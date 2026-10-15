@@ -40,7 +40,8 @@ def main():
     # Old template equivalent:
     # main 25 - house_load(16 - 8 = 8) - buffer 2 = 15A
     d = run_case("normal available", r, 0, "charging", l1=16, charger_current=8)
-    assert_eq(d.current_p1, 15, "normal available current")
+    assert_eq(d.available_l1, 15, "normal available current")
+    assert_eq(d.current_p1, 8, "takeover holds measured current before gradual increases")
     assert_eq(d.command, "set_limit", "normal command")
 
     # Same target immediately afterwards should not spam service calls.

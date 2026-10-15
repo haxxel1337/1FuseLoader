@@ -5,12 +5,12 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription, SensorDeviceClass, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfElectricCurrent
+from homeassistant.const import PERCENTAGE, UnitOfElectricCurrent
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN, NAME
+from .const import CONF_BMW_DEVICE_ID, DOMAIN, NAME
 
 
 SENSOR_DESCRIPTIONS = [
@@ -76,10 +76,20 @@ SENSOR_DESCRIPTIONS = [
     ),
 ]
 
+BMW_SENSOR_DESCRIPTIONS = [
+    SensorEntityDescription(key="bmw_charging_state", name="BMW Charging State", icon="mdi:ev-station"),
+    SensorEntityDescription(key="bmw_state_of_charge", name="BMW State of Charge", native_unit_of_measurement=PERCENTAGE, device_class=SensorDeviceClass.BATTERY),
+    SensorEntityDescription(key="bmw_ac_current", name="BMW Reported AC Current", native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, device_class=SensorDeviceClass.CURRENT),
+    SensorEntityDescription(key="bmw_phase_count", name="BMW Reported Charging Phases", icon="mdi:sine-wave"),
+]
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
     controller = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([OneFuseSensor(controller, entry, desc) for desc in SENSOR_DESCRIPTIONS])
+    descriptions = list(SENSOR_DESCRIPTIONS)
+    if entry.data.get(CONF_BMW_DEVICE_ID):
+        descriptions.extend(BMW_SENSOR_DESCRIPTIONS)
+    async_add_entities([OneFuseSensor(controller, entry, desc) for desc in descriptions])
 
 
 class OneFuseSensor(SensorEntity):
@@ -110,8 +120,11 @@ class OneFuseSensor(SensorEntity):
 
     @property
     def native_value(self) -> Any:
-        d = self.controller.last_decision
         key = self.entity_description.key
+        if key.startswith("bmw_"):
+            field = self.controller.bmw_context.get(key.removeprefix("bmw_"), {})
+            return field.get("value") if field.get("available") else None
+        d = self.controller.last_decision
         if d is None:
             return None
         if key == "mode":
@@ -136,6 +149,17 @@ class OneFuseSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.entity_description.key.startswith("bmw_"):
+            field = self.controller.bmw_context.get(self.entity_description.key.removeprefix("bmw_"), {})
+            # The source timestamp establishes age without recording a changing
+            # age_seconds attribute on every 5-second watchdog tick.
+            attributes = {**{key: value for key, value in field.items() if key not in {"value", "age_seconds"}}, "role": "advisory_only"}
+            if self.entity_description.key == "bmw_charging_state":
+                attributes["related_context"] = {
+                    key: {name: value for name, value in self.controller.bmw_context.get(key, {}).items() if name != "age_seconds"}
+                    for key in ("plug_state", "ac_voltage", "end_reason", "last_result")
+                }
+            return attributes
         d = self.controller.last_decision
         if d is None:
             return None

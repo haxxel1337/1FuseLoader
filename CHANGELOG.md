@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0b2
+
+- Preserve minimum charging through moderate house-load peaks by using the
+  normal buffer only within the fuse budget and a separate retained reserve.
+- React to source changes immediately, coalesce updates during in-flight
+  commands, and raise current gradually after stable headroom.
+- Add restart hysteresis and a bounded wait for grid reports after observed EV
+  reductions; TTL renewals do not reset ramp/restart observation timers.
+- Add optional read-only BMW CarData diagnostics with per-field source times;
+  stale/session-inapplicable values do not enter the current-control loop.
+- Keep deliberate overload disabled pending the actual main-fuse specification
+  and supervised charging tests. No HA restart or active takeover is implied.
+
 ## 0.4.0b1
 
 - Correct Easee TTL units and renew identical limits through a narrowly versioned

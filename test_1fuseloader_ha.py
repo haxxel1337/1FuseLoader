@@ -56,7 +56,10 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
             ("button", "OneFuseButton", "BUTTON_DESCRIPTIONS"),
         ):
             module = importlib.import_module(f"custom_components.1fuseloader.{platform}")
-            for description in getattr(module, descriptions):
+            entity_descriptions = list(getattr(module, descriptions))
+            if platform == "sensor":
+                entity_descriptions.extend(module.BMW_SENSOR_DESCRIPTIONS)
+            for description in entity_descriptions:
                 entity = getattr(module, klass)(controller, self.entry, description)
                 self.assertIsNotNone(entity.unique_id)
                 self.assertIsNotNone(entity.device_info)
@@ -120,10 +123,19 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
                 await task
             self.assertEqual(controller.last_decision.current_p1, 16)
             self.assertFalse(controller.last_decision.should_call_service)
+            # The new report is processed through HA's event bus immediately,
+            # without waiting for the 5-second watchdog timer.
+            self.hass.states.async_set("sensor.test_l1", "31", {"unit_of_measurement": "A"})
+            await self.hass.async_block_till_done()
+            self.assertEqual(controller.last_decision.current_p1, 8)
             adapter.async_execute.assert_not_awaited()
         finally:
             await controller.async_stop()
         self.assertIsNone(controller.unsub_timer)
+        self.assertIsNone(controller.unsub_states)
+        self.hass.states.async_set("sensor.test_l1", "18", {"unit_of_measurement": "A"})
+        await self.hass.async_block_till_done()
+        self.assertEqual(controller.last_decision.current_p1, 8)
 
 
 if __name__ == "__main__":

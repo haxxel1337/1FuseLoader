@@ -9,6 +9,7 @@ PLATFORMS = ["sensor", "number", "switch", "button"]
 
 CONF_NAME = "name"
 CONF_DEVICE_ID = "device_id"
+CONF_BMW_DEVICE_ID = "bmw_device_id"
 CONF_STATUS_ENTITY = "status_entity"
 CONF_L1_ENTITY = "l1_entity"
 CONF_L2_ENTITY = "l2_entity"
@@ -50,6 +51,11 @@ OPT_ENABLE_PAUSE_RESUME = "enable_pause_resume"
 OPT_FORCE_MIN_WHEN_AVAILABLE_TOO_LOW = "force_min_when_available_too_low"
 OPT_UNUSED_PHASE_CURRENT = "unused_phase_current"
 OPT_MAX_SENSOR_AGE_SECONDS = "max_sensor_age_seconds"
+OPT_MINIMUM_RESERVE_AMPS = "minimum_reserve_amps"
+OPT_INCREASE_STABLE_SECONDS = "increase_stable_seconds"
+OPT_INCREASE_INTERVAL_SECONDS = "increase_interval_seconds"
+OPT_RESTART_STABLE_SECONDS = "restart_stable_seconds"
+OPT_MEASUREMENT_SETTLE_SECONDS = "measurement_settle_seconds"
 
 DEFAULT_OPTIONS = {
     OPT_MAIN_FUSE_AMPS: 25.0,
@@ -76,6 +82,11 @@ DEFAULT_OPTIONS = {
     OPT_FORCE_MIN_WHEN_AVAILABLE_TOO_LOW: False,
     OPT_UNUSED_PHASE_CURRENT: 0,
     OPT_MAX_SENSOR_AGE_SECONDS: 120,
+    OPT_MINIMUM_RESERVE_AMPS: 0.5,
+    OPT_INCREASE_STABLE_SECONDS: 30,
+    OPT_INCREASE_INTERVAL_SECONDS: 15,
+    OPT_RESTART_STABLE_SECONDS: 60,
+    OPT_MEASUREMENT_SETTLE_SECONDS: 10,
 }
 
 OPTION_KEYS = set(DEFAULT_OPTIONS)
@@ -101,6 +112,11 @@ OPTION_NUMBER_RANGES = {
     OPT_MIN_SECONDS_BETWEEN_ACTIONS: (1, 60, 1),
     OPT_UNUSED_PHASE_CURRENT: (0, 0, 1),
     OPT_MAX_SENSOR_AGE_SECONDS: (15, 3600, 5),
+    OPT_MINIMUM_RESERVE_AMPS: (0, 5, 0.1),
+    OPT_INCREASE_STABLE_SECONDS: (5, 300, 5),
+    OPT_INCREASE_INTERVAL_SECONDS: (5, 120, 5),
+    OPT_RESTART_STABLE_SECONDS: (15, 600, 5),
+    OPT_MEASUREMENT_SETTLE_SECONDS: (1, 30, 1),
 }
 
 
@@ -135,6 +151,11 @@ def validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"Unknown settings: {', '.join(sorted(unknown))}")
     merged = {**DEFAULT_OPTIONS, **options}
+    if OPT_MINIMUM_RESERVE_AMPS not in options:
+        # Existing installations can have a smaller normal buffer. Adding the
+        # new reserve must not make their previously valid settings unloadable.
+        buffer_value = validate_option_value(OPT_BUFFER_AMPS, merged[OPT_BUFFER_AMPS])
+        merged[OPT_MINIMUM_RESERVE_AMPS] = min(merged[OPT_MINIMUM_RESERVE_AMPS], buffer_value)
     result = {key: validate_option_value(key, value) for key, value in merged.items()}
     # Legacy entries may still carry True; the unsafe forced-current policy has
     # been removed and must not be re-enabled by restoring older options.
@@ -143,8 +164,11 @@ def validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("Minimum charge current must not exceed maximum charge current")
     if result[OPT_SOFT_CURRENT_AMPS] > result[OPT_MAX_CHARGE_AMPS]:
         raise ValueError("Soft current must not exceed maximum charge current")
-    if result[OPT_SAFE_L1_AMPS] > result[OPT_MAIN_FUSE_AMPS]:
-        raise ValueError("Safe L1 current must not exceed the main fuse rating")
+    if result[OPT_MINIMUM_RESERVE_AMPS] > result[OPT_BUFFER_AMPS]:
+        raise ValueError("Minimum reserve must not exceed the normal buffer")
+    # Kept only for legacy storage compatibility; the old threshold no longer
+    # drives control and must not prevent editing the real fuse rating.
+    result[OPT_SAFE_L1_AMPS] = min(result[OPT_SAFE_L1_AMPS], result[OPT_MAIN_FUSE_AMPS])
     if result[OPT_RESUME_BELOW_AMPS] >= min(result[OPT_SOFT_LIMIT_AMPS], result[OPT_PAUSE_LIMIT_AMPS]):
         raise ValueError("Resume threshold must be below both overload thresholds")
     minimum_ttl = min(result[OPT_NORMAL_TTL_SECONDS], result[OPT_SOFT_TTL_SECONDS])

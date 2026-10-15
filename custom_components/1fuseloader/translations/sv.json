@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "1FuseLoader",
-        "description": "Välj Easee-laddaren och strömsensorer i ampere. Endast enfasstyrning på L1 stöds. Nya installationer startar med provkörning på och aktiv styrning av.",
+        "description": "Välj Easee-laddaren och strömsensorer i ampere. Endast enfasstyrning på L1 stöds. Nya installationer startar med provkörning på och aktiv styrning av. BMW CarData är valfritt och används endast som information; molnvärden påverkar inte laddstyrningen.",
         "data": {
           "name": "Namn",
           "device_id": "Easee-enhet i Home Assistant",
@@ -12,12 +12,13 @@
           "l2_entity": "Nätström L2",
           "l3_entity": "Nätström L3",
           "charger_current_entity": "Laddarens strömsensor",
-          "controlled_phase": "Styrd fas"
+          "controlled_phase": "Styrd fas",
+          "bmw_device_id": "BMW CarData-enhet (valfri, endast information)"
         }
       },
       "reconfigure": {
         "title": "Konfigurera om 1FuseLoader",
-        "description": "Uppdatera sensorerna för samma Easee-laddare. Laddarens identitet måste vara oförändrad. Endast L1 stöds.",
+        "description": "Uppdatera sensorerna för samma Easee-laddare. Laddarens identitet måste vara oförändrad. Endast L1 stöds. BMW CarData är valfritt och används endast som information; molnvärden påverkar inte laddstyrningen.",
         "data": {
           "name": "Namn",
           "device_id": "Easee-enhet i Home Assistant",
@@ -26,7 +27,8 @@
           "l2_entity": "Nätström L2",
           "l3_entity": "Nätström L3",
           "charger_current_entity": "Laddarens strömsensor",
-          "controlled_phase": "Styrd fas"
+          "controlled_phase": "Styrd fas",
+          "bmw_device_id": "BMW CarData-enhet (valfri, endast information)"
         }
       }
     },
@@ -37,7 +39,8 @@
       "current_unit_required": "Strömsensorn måste använda ampere (A).",
       "unsupported_phase": "Endast enfasstyrning på L1 stöds.",
       "duplicate_current_entity": "Använd en separat sensor för varje nätfas och för laddarens ström.",
-      "charger_sensor_mismatch": "Välj en sensor som tillhör den valda Easee-laddaren."
+      "charger_sensor_mismatch": "Välj en sensor som tillhör den valda Easee-laddaren.",
+      "device_not_cardata": "Välj en enhet som tillhör BMW CarData-integrationen."
     },
     "abort": {
       "already_configured": "Denna Easee-laddare är redan konfigurerad.",
@@ -49,7 +52,7 @@
     "step": {
       "init": {
         "title": "Inställningar för 1FuseLoader",
-        "description": "Justera gränser. Alla värden valideras tillsammans före sparning. Oanvända faser är låsta till 0 A. TTL anges i sekunder; Easee får avrundat uppåt till hela minuter. {error}",
+        "description": "Justera gränser. Alla värden valideras tillsammans före sparning. Oanvända faser är låsta till 0 A. TTL anges i sekunder; Easee får avrundat uppåt till hela minuter. {error} Strömmen sänks direkt och höjs stegvis efter stabil marginal. Minströmsmarginalen gäller vid den valda lägsta laddströmmen; den planerade marginalen används vid högre laddström.",
         "data": {
           "main_fuse_amps": "Huvudsäkring (A)",
           "buffer_amps": "Marginal (A)",
@@ -74,7 +77,12 @@
           "enable_dynamic_limit": "Aktivera dynamisk gräns",
           "enable_soft_guard": "Aktivera mjukbegränsning",
           "enable_pause_resume": "Aktivera paus och återupptagning",
-          "force_min_when_available_too_low": "Äldre minströmspolicy (avstängd)"
+          "force_min_when_available_too_low": "Äldre minströmspolicy (avstängd)",
+          "minimum_reserve_amps": "Marginal vid minsta laddström (A)",
+          "increase_stable_seconds": "Stabil marginal före höjning (s)",
+          "increase_interval_seconds": "Intervall mellan höjningar (s)",
+          "restart_stable_seconds": "Stabil marginal före omstart (s)",
+          "measurement_settle_seconds": "Väntan på nätmätning efter sänkt bilström (s)"
         }
       }
     },

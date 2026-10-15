@@ -51,7 +51,6 @@ class SettingsTests(unittest.TestCase):
         cases = [
             {"min_charge_amps": 16, "max_charge_amps": 6},
             {"max_charge_amps": 6, "soft_current_amps": 10},
-            {"main_fuse_amps": 16, "safe_l1_amps": 23},
             {"resume_below_amps": 28, "pause_limit_amps": 28},
             {"resume_below_amps": 29, "soft_limit_amps": 28},
             {"resend_limit_every_seconds": 35, "normal_ttl_seconds": 60},
@@ -69,6 +68,14 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             const.validate_options(options)
         self.assertEqual(options, original)
+
+    def test_continuity_reserve_fits_normal_buffer_and_legacy_zero_migrates(self):
+        self.assertEqual(const.validate_options({"buffer_amps": 0})["minimum_reserve_amps"], 0)
+        with self.assertRaises(ValueError):
+            const.validate_options({"buffer_amps": 1, "minimum_reserve_amps": 2})
+        # The hidden, unused old threshold must not make a real fuse value
+        # impossible to configure in the options flow.
+        self.assertEqual(const.validate_options({"main_fuse_amps": 16})["safe_l1_amps"], 16)
 
     def test_valid_values_are_normalized_without_losing_decimal_margin(self):
         options = const.validate_options({"buffer_amps": "2.5", "max_charge_amps": "16"})

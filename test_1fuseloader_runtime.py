@@ -42,6 +42,8 @@ stubs["homeassistant.core"].HomeAssistant = object
 stubs["homeassistant.core"].callback = lambda function: function
 stubs["homeassistant.helpers.typing"].ConfigType = dict
 stubs["homeassistant.helpers.event"].async_track_time_interval = lambda *args: lambda: None
+stubs["homeassistant.helpers.event"].async_track_state_change_event = lambda *args: lambda: None
+stubs["homeassistant.helpers"].entity_registry = SimpleNamespace()
 with patch.dict(sys.modules, stubs):
     runtime = load("runtime", "__init__.py")
 
@@ -89,7 +91,7 @@ class SafetyTests(unittest.TestCase):
         self.assertIsNone(regulator.last_target)
         self.assertIsNone(regulator.last_command)
         regulator.acknowledge(decision, 0)
-        self.assertEqual(regulator.last_target, (15, 0, 0, 60))
+        self.assertEqual(regulator.last_target, (8, 0, 0, 60))
         self.assertFalse(self.evaluate(regulator, 1).should_call_service)
         regulator = self.regulator()
         self.evaluate(regulator, 0, grid=29, current=6)
@@ -204,7 +206,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
                 "charger_current_entity": "sensor.car"},
             options={"active_control": True, "dry_run": False},
         )
-        self.hass = SimpleNamespace(loop=asyncio.get_running_loop(), states=SimpleNamespace(get=self.states.get))
+        self.hass = SimpleNamespace(loop=asyncio.get_running_loop(), states=SimpleNamespace(get=self.states.get), async_create_task=asyncio.create_task)
         self.hass.config_entries = SimpleNamespace(async_update_entry=self.update_entry)
         self.adapter = FakeAdapter()
         self.controller = runtime.OneFuseLoaderController(self.hass, self.entry, self.adapter)
@@ -296,6 +298,48 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.async_tick()
         self.assertFalse(self.controller.settings.active_control)
         self.assertEqual(len(self.adapter.calls), 1)
+
+    async def test_source_changes_coalesce_and_apply_newest_boost_after_inflight_call(self):
+        self.adapter.gate = asyncio.Event()
+        first = asyncio.create_task(self.controller.async_tick())
+        await self.adapter.entered.wait()
+        self.states["sensor.grid"].state = "26"
+        for _ in range(20):
+            self.controller._handle_source_change(None)
+        refresh = self.controller._refresh_task
+        await asyncio.sleep(0)
+        self.assertEqual(len(self.adapter.calls), 1)
+        self.adapter.gate.set()
+        await first
+        await refresh
+        self.assertEqual(len(self.adapter.calls), 2)
+        self.assertEqual(self.adapter.calls[-1].current_p1, 6)
+        self.assertIsNone(self.controller._refresh_task)
+
+    async def test_disable_invalidates_a_waiting_source_refresh(self):
+        self.adapter.gate = asyncio.Event()
+        first = asyncio.create_task(self.controller.async_tick())
+        await self.adapter.entered.wait()
+        self.controller._handle_source_change(None)
+        refresh = self.controller._refresh_task
+        await asyncio.sleep(0)
+        disable = asyncio.create_task(self.controller.async_set_option("active_control", False))
+        await asyncio.sleep(0)
+        self.adapter.gate.set()
+        await asyncio.gather(first, refresh, disable)
+        self.assertEqual(len(self.adapter.calls), 1)
+        self.assertFalse(self.controller.settings.active_control)
+
+    async def test_bmw_context_failure_does_not_change_protective_decision(self):
+        class BrokenBMW:
+            def snapshot(self):
+                raise RuntimeError("source unavailable")
+
+        self.controller._bmw_context = BrokenBMW()
+        await self.controller.async_tick()
+        self.assertTrue(self.adapter.calls)
+        self.assertGreaterEqual(self.adapter.calls[0].current_p1, 6)
+        self.assertEqual(self.controller.bmw_context, {})
 
     async def test_invalid_option_is_rejected_without_mutation(self):
         with self.assertRaises(ValueError):

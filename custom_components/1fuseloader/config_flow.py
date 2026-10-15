@@ -8,6 +8,7 @@ from homeassistant.core import callback
 from homeassistant.helpers import device_registry as dr, entity_registry as er, selector
 
 from .const import (
+    CONF_BMW_DEVICE_ID,
     CONF_CHARGER_CURRENT_ENTITY,
     CONF_CONTROLLED_PHASE,
     CONF_DEVICE_ID,
@@ -54,6 +55,11 @@ def _config_schema(defaults: dict[str, Any] | None = None, *, include_name: bool
         }
     if include_name:
         fields = {vol.Required(CONF_NAME, default=d.get(CONF_NAME, DEFAULT_NAME)): str, **fields}
+    bmw_field = (
+        vol.Optional(CONF_BMW_DEVICE_ID, default=d[CONF_BMW_DEVICE_ID])
+        if d.get(CONF_BMW_DEVICE_ID) else vol.Optional(CONF_BMW_DEVICE_ID)
+    )
+    fields[bmw_field] = selector.DeviceSelector(selector.DeviceSelectorConfig(integration="cardata"))
     return vol.Schema(fields)
 
 
@@ -70,6 +76,12 @@ class OneFuseLoaderConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
         if device is None or easee_entry is None:
             errors[CONF_DEVICE_ID] = "device_not_easee"
+        if bmw_device_id := data.get(CONF_BMW_DEVICE_ID):
+            bmw_device, bmw_entry = dr.async_get_device_and_config_entry_for_domain(
+                self.hass, bmw_device_id, domain="cardata",
+            )
+            if bmw_device is None or bmw_entry is None:
+                errors[CONF_BMW_DEVICE_ID] = "device_not_cardata"
         grid_keys = (CONF_L1_ENTITY, CONF_L2_ENTITY, CONF_L3_ENTITY)
         grid_ids = [data.get(key) for key in grid_keys]
         for key in grid_keys:
@@ -102,6 +114,7 @@ class OneFuseLoaderConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             user_input = dict(user_input)
             user_input[CONF_DEVICE_ID] = str(user_input.get(CONF_DEVICE_ID, "")).strip()
+            user_input[CONF_BMW_DEVICE_ID] = str(user_input.get(CONF_BMW_DEVICE_ID) or "").strip()
 
             if not user_input[CONF_DEVICE_ID]:
                 errors[CONF_DEVICE_ID] = "device_id_required"
@@ -123,6 +136,9 @@ class OneFuseLoaderConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         defaults = {**entry.data, CONF_NAME: entry.title}
         errors: dict[str, str] = {}
         if user_input is not None:
+            user_input = dict(user_input)
+            # An omitted optional selector clears a previously selected BMW.
+            user_input[CONF_BMW_DEVICE_ID] = str(user_input.get(CONF_BMW_DEVICE_ID) or "").strip()
             defaults.update(user_input)
             errors = self._input_errors(user_input)
             if not errors:
@@ -146,8 +162,11 @@ class OneFuseLoaderConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 class OneFuseLoaderOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(self, user_input: dict[str, Any] | None = None):
-        opts = dict(DEFAULT_OPTIONS)
-        opts.update(self.config_entry.options or {})
+        try:
+            opts = validate_options(self.config_entry.options or {})
+        except ValueError:
+            # Invalid legacy input must remain editable in this form.
+            opts = {**DEFAULT_OPTIONS, **self.config_entry.options}
 
         errors: dict[str, str] = {}
         error_detail = ""
@@ -162,7 +181,7 @@ class OneFuseLoaderOptionsFlow(config_entries.OptionsFlow):
                 return self.async_create_entry(title="", data=validated)
         fields = {}
         for key, default in DEFAULT_OPTIONS.items():
-            if key in {"unused_phase_current", "force_min_when_available_too_low"}:
+            if key in {"unused_phase_current", "force_min_when_available_too_low", "safe_l1_amps"}:
                 continue
             marker = vol.Required(key, default=opts[key])
             if isinstance(default, bool):
