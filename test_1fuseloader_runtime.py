@@ -34,7 +34,7 @@ load("easee_adapter", "easee_adapter.py")
 stubs = {name: ModuleType(name) for name in (
     "homeassistant", "homeassistant.config_entries", "homeassistant.const",
     "homeassistant.core", "homeassistant.helpers", "homeassistant.helpers.event",
-    "homeassistant.helpers.typing",
+    "homeassistant.helpers.typing", "homeassistant.helpers.storage",
 )}
 stubs["homeassistant.config_entries"].ConfigEntry = object
 stubs["homeassistant.const"].Platform = str
@@ -43,6 +43,24 @@ stubs["homeassistant.core"].callback = lambda function: function
 stubs["homeassistant.helpers.typing"].ConfigType = dict
 stubs["homeassistant.helpers.event"].async_track_time_interval = lambda *args: lambda: None
 stubs["homeassistant.helpers.event"].async_track_state_change_event = lambda *args: lambda: None
+stubs["homeassistant.helpers.event"].async_call_later = lambda *args: lambda: None
+
+
+class FakeStore:
+    def __init__(self, *args):
+        self.data = None
+        self.failure = False
+
+    async def async_load(self):
+        return self.data
+
+    async def async_save(self, data):
+        if self.failure:
+            raise OSError("storage unavailable")
+        self.data = data
+
+
+stubs["homeassistant.helpers.storage"].Store = FakeStore
 stubs["homeassistant.helpers"].entity_registry = SimpleNamespace()
 with patch.dict(sys.modules, stubs):
     runtime = load("runtime", "__init__.py")
@@ -172,6 +190,7 @@ class SafetyTests(unittest.TestCase):
 class FakeAdapter:
     control_block_reason = None
     telemetry_block_reason = None
+    overload_block_reason = None
 
     def __init__(self):
         self.calls = []
@@ -201,7 +220,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
             "sensor.car": SimpleNamespace(state="8", last_reported=now - timedelta(hours=2), attributes={"unit_of_measurement": "A"}),
         }
         self.entry = SimpleNamespace(
-            title="Test", data={"device_id": "test", "controlled_phase": "L1",
+            title="Test", entry_id="test-entry", data={"device_id": "test", "controlled_phase": "L1",
                 "l1_entity": "sensor.grid", "status_entity": "sensor.status",
                 "charger_current_entity": "sensor.car"},
             options={"active_control": True, "dry_run": False},
@@ -351,6 +370,138 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.controller.add_listener(lambda: 1 / 0)
         await self.controller.async_tick()
         self.assertEqual(len(self.adapter.calls), 1)
+
+    def overload_controller(self):
+        self.entry.options["overload_enabled"] = True
+        self.states["sensor.grid"].state = "28"
+        self.states["sensor.car"].state = "6"
+        self.controller = runtime.OneFuseLoaderController(self.hass, self.entry, self.adapter)
+        return self.controller
+
+    async def test_overload_storage_write_failure_forces_zero_before_submission(self):
+        controller = self.overload_controller()
+        controller._budget_store.store.failure = True
+        await controller.async_tick()
+        self.assertEqual([decision.current_p1 for decision in self.adapter.calls], [0])
+        self.assertEqual(controller.last_decision.mode, "overload_control_blocked")
+        self.assertEqual(controller.last_decision.reason, "overload_budget_save_failed")
+        self.assertEqual(controller.regulator.last_target[0], 0)
+        # A later successful write must not silently clear the storage fault.
+        controller._budget_store.store.failure = False
+        await controller.async_tick()
+        self.assertTrue(all(decision.current_p1 == 0 for decision in self.adapter.calls))
+        self.assertEqual(controller._budget_error, "overload_budget_save_failed")
+
+    async def test_unverified_nonzero_offline_fallback_forces_zero(self):
+        controller = self.overload_controller()
+        self.adapter.overload_block_reason = "offline_fallback_above_zero"
+        await controller.async_tick()
+        self.assertEqual([decision.current_p1 for decision in self.adapter.calls], [0])
+        self.assertIn("offline_fallback_above_zero", controller.last_decision.reason)
+        self.assertEqual(controller.regulator.last_target[0], 0)
+
+    async def test_persisted_pending_response_restores_latched_without_new_grace(self):
+        controller = self.overload_controller()
+        controller._budget_store.clock = lambda: 1030
+        controller._budget_store.store.data = {
+            "version": 1, "saved_at": 1000,
+            "regulator": {"version": 1, "used_seconds": 120,
+                          "exposure_active": True, "transition_pending": True,
+                          "minimum_held": False, "failure_reason": None},
+        }
+        await controller.async_start()
+        try:
+            restored = controller.regulator.export_overload_state()
+            self.assertEqual(restored["used_seconds"], 150)
+            self.assertEqual(restored["failure_reason"], "interrupted_transition")
+            self.assertFalse(restored["transition_pending"])
+            self.assertTrue(controller.last_decision.overload_failure_latched)
+            self.assertEqual([decision.current_p1 for decision in self.adapter.calls], [0])
+        finally:
+            await controller.async_stop()
+
+    async def test_reset_internal_state_and_setting_changes_keep_used_budget(self):
+        controller = self.overload_controller()
+        restored = {"version": 1, "used_seconds": 312,
+                    "exposure_active": False, "transition_pending": False,
+                    "minimum_held": False, "failure_reason": None}
+        self.assertTrue(controller.regulator.import_overload_state(restored))
+        await controller.async_reset_state()
+        self.assertEqual(controller.regulator.export_overload_state()["used_seconds"], 312)
+        await controller.async_set_option("buffer_amps", 2.5)
+        self.assertGreaterEqual(controller.regulator.export_overload_state()["used_seconds"], 312)
+        await controller.async_set_switch("overload_enabled", False)
+        await controller.async_set_switch("overload_enabled", True)
+        self.assertGreaterEqual(controller.regulator.export_overload_state()["used_seconds"], 312)
+
+    async def test_invalid_persisted_state_blocks_overload_instead_of_refunding(self):
+        controller = self.overload_controller()
+        controller._budget_store.clock = lambda: 1030
+        controller._budget_store.store.data = {
+            "version": 1, "saved_at": 1000,
+            "regulator": {"version": 999, "used_seconds": 120,
+                          "exposure_active": True, "transition_pending": False,
+                          "minimum_held": False, "failure_reason": None},
+        }
+        await controller.async_start()
+        try:
+            self.assertEqual(controller._budget_error, "overload_budget_restore_failed")
+            self.assertEqual([decision.current_p1 for decision in self.adapter.calls], [0])
+            self.assertGreaterEqual(controller.regulator.export_overload_state()["used_seconds"], 1800)
+        finally:
+            await controller.async_stop()
+
+    async def test_overload_positive_lease_needs_the_full_ninety_second_reserve(self):
+        for remaining, target in ((90, 6), (89.9, 0)):
+            with self.subTest(remaining=remaining):
+                self.adapter.calls.clear()
+                controller = self.overload_controller()
+                self.assertTrue(controller.regulator.import_overload_state({
+                    "version": 1, "used_seconds": 1800 - remaining,
+                    "exposure_active": False, "transition_pending": False,
+                    "minimum_held": False, "failure_reason": None,
+                }))
+                await controller.async_tick()
+                self.assertEqual([decision.current_p1 for decision in self.adapter.calls], [target])
+                self.assertEqual(self.adapter.calls[0].ttl_seconds, 60)
+
+    async def test_restored_minimum_hold_requires_both_post_restart_reports(self):
+        controller = self.overload_controller()
+        controller._budget_store.clock = lambda: 1030
+        controller._budget_store.store.data = {
+            "version": 1, "saved_at": 1000,
+            "regulator": {"version": 1, "used_seconds": 120,
+                          "exposure_active": True, "transition_pending": False,
+                          "minimum_held": True, "failure_reason": None},
+        }
+        await controller.async_start()
+        try:
+            self.assertEqual(self.adapter.calls[-1].current_p1, 0)
+            self.assertEqual(controller.last_decision.mode, "overload_control_blocked")
+            floor = controller._overload_restore_receipt_floor
+            fresh = datetime.fromtimestamp(floor + 0.1, timezone.utc)
+            self.states["sensor.grid"].last_reported = fresh
+            await controller.async_tick()
+            self.assertEqual(controller.last_decision.current_p1, 0)
+            self.states["sensor.car"].last_reported = fresh
+            await controller.async_tick()
+            self.assertEqual(controller.last_decision.current_p1, 6)
+            self.assertGreaterEqual(controller.last_decision.overload_used_seconds, 150)
+        finally:
+            await controller.async_stop()
+
+    async def test_store_latency_is_subtracted_from_the_response_deadline(self):
+        controller = self.overload_controller()
+        decision = controller.regulator.evaluate(logic.RegulatorInput(
+            0, "charging", 38, charger_current=16,
+            grid_report_ts=1000, charger_report_ts=1000,
+        ))
+        self.assertEqual(decision.overload_transition_remaining_seconds, 10)
+        for elapsed, expected_delay in ((2, 8), (12, 0.05)):
+            with self.subTest(elapsed=elapsed):
+                with patch.object(runtime, "async_call_later", return_value=lambda: None) as schedule:
+                    controller._schedule_overload_deadline(decision, elapsed)
+                self.assertEqual(schedule.call_args.args[1], expected_delay)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,11 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(options["force_min_when_available_too_low"])
         self.assertEqual(options["unused_phase_current"], 0)
         self.assertEqual(options["max_sensor_age_seconds"], 120)
+        self.assertFalse(options["overload_enabled"])
+        self.assertEqual(options["overload_margin_amps"], 4)
+        self.assertEqual(options["overload_budget_seconds"], 1800)
+        self.assertEqual(options["overload_transition_limit_amps"], 38)
+        self.assertEqual(options["overload_response_seconds"], 10)
         # Existing 0.3.x entries used a 30-second resend and a 60-second TTL.
         legacy = dict(const.DEFAULT_OPTIONS)
         legacy.pop("max_sensor_age_seconds")
@@ -83,6 +88,44 @@ class SettingsTests(unittest.TestCase):
         self.assertIsInstance(options["buffer_amps"], float)
         self.assertIsInstance(options["max_charge_amps"], int)
 
+    def test_experimental_overload_requires_an_explicit_boolean_opt_in(self):
+        self.assertFalse(const.validate_options({})["overload_enabled"])
+        enabled = const.validate_options({"overload_enabled": True})
+        self.assertTrue(enabled["overload_enabled"])
+        self.assertEqual(enabled["main_fuse_amps"] + enabled["overload_margin_amps"], 29)
+        with self.assertRaises(ValueError):
+            const.validate_options({"overload_enabled": "true"})
+
+    def test_experimental_overload_caps_are_not_bypassable_by_options(self):
+        for options in (
+            {"overload_margin_amps": 4.1}, {"overload_margin_amps": 0},
+            {"overload_budget_seconds": 1801}, {"overload_budget_seconds": 59},
+            {"overload_transition_limit_amps": 38.1},
+            {"overload_response_seconds": 11}, {"overload_response_seconds": 0},
+            {"overload_budget_seconds": 60.5},
+            {"overload_transition_limit_amps": float("nan")},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                const.validate_options(options)
+
+    def test_enabled_overload_checks_the_current_fuse_and_dynamic_control(self):
+        for options in (
+            {"overload_enabled": True, "enable_dynamic_limit": False},
+            {"overload_enabled": True, "main_fuse_amps": 10, "min_charge_amps": 10},
+            {"overload_enabled": True, "main_fuse_amps": 35},
+            {"overload_enabled": True, "overload_transition_limit_amps": 28.5},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                const.validate_options(options)
+        # Keeping the disabled experimental defaults must not make an existing
+        # larger installation unloadable. Its real policy still needs tuning
+        # before opt-in, rather than silently expanding the experimental cap.
+        self.assertFalse(const.validate_options({"main_fuse_amps": 63})["overload_enabled"])
+        self.assertEqual(
+            const.validate_options({"overload_enabled": True, "overload_transition_limit_amps": 29})["overload_transition_limit_amps"],
+            29,
+        )
+
     def test_custom_integration_translations_include_full_flow_text(self):
         def leaf_keys(value, prefix=""):
             keys = set()
@@ -97,6 +140,8 @@ class SettingsTests(unittest.TestCase):
         self.assertIn("config.error.current_unit_required", leaf_keys(english))
         self.assertIn("config.step.reconfigure.data.l1_entity", leaf_keys(english))
         self.assertIn("options.step.init.data.max_sensor_age_seconds", leaf_keys(english))
+        for option in ("overload_enabled", "overload_margin_amps", "overload_budget_seconds", "overload_transition_limit_amps", "overload_response_seconds"):
+            self.assertIn(f"options.step.init.data.{option}", leaf_keys(english))
         self.assertEqual(
             json.loads((COMPONENT / "strings.json").read_text(encoding="utf-8")), english
         )
@@ -123,6 +168,34 @@ class HomeAssistantFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["type"], "create_entry")
         self.assertEqual(result["data"]["buffer_amps"], 2.5)
         self.assertEqual(result["data"]["unused_phase_current"], 0)
+
+    async def test_options_flow_exposes_validated_experimental_settings(self):
+        flow = self.flow_module.OneFuseLoaderOptionsFlow()
+        with patch.object(type(flow), "config_entry", new_callable=PropertyMock) as entry:
+            entry.return_value = SimpleNamespace(options={})
+            form = await flow.async_step_init()
+            fields = {marker.schema: field for marker, field in form["data_schema"].schema.items()}
+            self.assertIs(fields["overload_enabled"], bool)
+            self.assertEqual(fields["overload_transition_limit_amps"].config["max"], 38)
+            self.assertEqual(fields["overload_budget_seconds"].config["min"], 60)
+            rejected = await flow.async_step_init({"overload_enabled": True, "overload_transition_limit_amps": 28})
+            self.assertEqual(rejected["errors"], {"base": "invalid_settings"})
+            accepted = await flow.async_step_init({"overload_enabled": True})
+        self.assertEqual(accepted["type"], "create_entry")
+        self.assertTrue(accepted["data"]["overload_enabled"])
+
+    async def test_experimental_entity_ranges_match_shared_validation(self):
+        numbers = importlib.import_module("custom_components.1fuseloader.number")
+        switches = importlib.import_module("custom_components.1fuseloader.switch")
+        experimental = [item for item in numbers.NUMBER_DESCRIPTIONS if item.option_key.startswith("overload_")]
+        self.assertEqual(len(experimental), 4)
+        for description in experimental:
+            with self.subTest(option=description.option_key):
+                self.assertEqual(
+                    (description.native_min_value, description.native_max_value, description.native_step),
+                    const.OPTION_NUMBER_RANGES[description.option_key],
+                )
+        self.assertIn("overload_enabled", {item.option_key for item in switches.SWITCH_DESCRIPTIONS})
 
     async def test_config_input_rejects_missing_entity_and_wrong_current_unit(self):
         flow = self.flow_module.OneFuseLoaderConfigFlow()

@@ -22,6 +22,7 @@ SWITCH_DESCRIPTIONS = [
     OneFuseSwitchDescription(key="enable_dynamic_limit", option_key="enable_dynamic_limit", name="Enable Dynamic Limit", icon="mdi:ev-station"),
     OneFuseSwitchDescription(key="enable_soft_guard", option_key="enable_soft_guard", name="Enable Soft Guard", icon="mdi:shield-half-full"),
     OneFuseSwitchDescription(key="enable_pause_resume", option_key="enable_pause_resume", name="Enable Pause Resume", icon="mdi:pause-play"),
+    OneFuseSwitchDescription(key="overload_enabled", option_key="overload_enabled", name="Experimental Timed Overload", icon="mdi:timer-alert-outline"),
 ]
 
 

@@ -52,7 +52,7 @@
     "step": {
       "init": {
         "title": "1FuseLoader options",
-        "description": "Tune thresholds. Current settings are checked together before saving. Unused phases stay at 0 A. TTL values are seconds; Easee receives rounded-up whole minutes. {error} Current decreases immediately and increases gradually after stable headroom. The minimum-current reserve applies at the configured minimum current; the normal buffer applies at higher charging current.",
+        "description": "Tune thresholds. Current settings are checked together before saving. Unused phases stay at 0 A. TTL values are seconds; Easee receives rounded-up whole minutes. {error} Current decreases immediately and increases gradually after stable headroom. The minimum-current reserve applies at the configured minimum current; the normal buffer applies at higher charging current. Experimental timed overload is off by default. When enabled, the minimum current may continue above the fuse rating within a cumulative budget, after a separate short response window. These settings do not establish the installation's allowable overload or replace physical protection. Short dips, setting changes and restarts do not replenish the budget. This release provides no automatic budget reset or user reset button.",
         "data": {
           "main_fuse_amps": "Main fuse amps",
           "buffer_amps": "Buffer amps",
@@ -82,7 +82,12 @@
           "increase_stable_seconds": "Stable headroom before increasing (seconds)",
           "increase_interval_seconds": "Interval between current increases (seconds)",
           "restart_stable_seconds": "Stable headroom before restarting (seconds)",
-          "measurement_settle_seconds": "Wait for grid report after EV reduction (seconds)"
+          "measurement_settle_seconds": "Wait for grid report after EV reduction (seconds)",
+          "overload_enabled": "Experimental timed overload (explicit opt-in)",
+          "overload_margin_amps": "Experimental sustained overload above main fuse (A, maximum 4)",
+          "overload_budget_seconds": "Experimental cumulative overload budget (seconds, maximum 1800)",
+          "overload_transition_limit_amps": "Experimental peak limit during response window (A, maximum 38)",
+          "overload_response_seconds": "Experimental response window after requesting minimum current (seconds, maximum 10)"
         }
       }
     },

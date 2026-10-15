@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0b4
+
+- Add a disabled-by-default experimental timed-overload profile: request minimum
+  EV current, permit a separately bounded response window, then hold minimum
+  current within a sustained L1 ceiling and cumulative exposure budget.
+- Bound the available settings to at most +4 A, 1800 s cumulative exposure,
+  38 A transition peak and 10 s response time; require explicit opt-in and
+  cross-validate the settings through all Home Assistant UI entry points.
+- Persist experimental exposure and unresolved response state across restart
+  and configuration changes; brief dips and switch toggles do not replenish
+  the budget. Surface budget, transition and failure diagnostics.
+- Account for whole-minute Easee leases before permitting another positive
+  overload command; charging can end before the nominal budget expires.
+- Document HACS prerelease installation, the separate overload opt-in and the
+  need to verify the installation and charger offline fallback before using it.
+  These operational settings do not certify a fuse or a physical stop deadline.
+
+## 0.4.0b3
+
+- Handle the opposite grid/EV report order during an acknowledged reduction
+  within a bounded alignment window and conservative nominal-current check.
+- Keep completed/disconnected sessions from receiving an unnecessary zero
+  command solely because their final current reports arrive out of order.
+
 ## 0.4.0b2
 
 - Preserve minimum charging through moderate house-load peaks by using the

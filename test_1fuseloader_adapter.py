@@ -83,6 +83,26 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.charger.pause.assert_not_awaited()
         self.charger.resume.assert_not_awaited()
 
+    async def test_overload_requires_zero_offline_readback_on_every_phase(self):
+        self.assertEqual(self.client.overload_block_reason, "offline_fallback_not_zero_or_unverified")
+        for phase in (1, 2, 3):
+            self.product.state[f"offlineMaxCircuitCurrentP{phase}"] = 0
+        self.assertIsNone(self.client.overload_block_reason)
+        for phase in (1, 2, 3):
+            for value in (10, 6, -1, None, True, float("nan"), "unknown"):
+                with self.subTest(phase=phase, value=value):
+                    self.product.state[f"offlineMaxCircuitCurrentP{phase}"] = value
+                    self.assertEqual(self.client.overload_block_reason, "offline_fallback_not_zero_or_unverified")
+            self.product.state[f"offlineMaxCircuitCurrentP{phase}"] = 0
+
+    async def test_overload_offline_guard_also_requires_healthy_stream(self):
+        for phase in (1, 2, 3):
+            self.product.state[f"offlineMaxCircuitCurrentP{phase}"] = 0
+        self.product.state["signalRConnected"] = False
+        self.assertIsNotNone(self.client.overload_block_reason)
+        await self.client.async_execute(decision(amps=0))
+        self.circuit.set_dynamic_current.assert_awaited_once_with(0, 0, 0, 1)
+
     async def test_identical_limit_renews_ttl_on_every_call(self):
         await self.client.async_execute(decision())
         await self.client.async_execute(decision())

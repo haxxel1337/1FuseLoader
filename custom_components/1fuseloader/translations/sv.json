@@ -52,7 +52,7 @@
     "step": {
       "init": {
         "title": "Inställningar för 1FuseLoader",
-        "description": "Justera gränser. Alla värden valideras tillsammans före sparning. Oanvända faser är låsta till 0 A. TTL anges i sekunder; Easee får avrundat uppåt till hela minuter. {error} Strömmen sänks direkt och höjs stegvis efter stabil marginal. Minströmsmarginalen gäller vid den valda lägsta laddströmmen; den planerade marginalen används vid högre laddström.",
+        "description": "Justera gränser. Alla värden valideras tillsammans före sparning. Oanvända faser är låsta till 0 A. TTL anges i sekunder; Easee får avrundat uppåt till hela minuter. {error} Strömmen sänks direkt och höjs stegvis efter stabil marginal. Minströmsmarginalen gäller vid den valda lägsta laddströmmen; den planerade marginalen används vid högre laddström. Experimentell tidsbegränsad överlast är av från början. När den aktiveras kan minströmmen fortsätta över säkringens märkström inom en sammanlagd tidsbudget, efter ett separat kort svarsfönster. Inställningarna fastställer inte installationens tillåtna överlast och ersätter inte fysiska skydd. Korta dippar, ändrade inställningar och omstarter fyller inte på budgeten. Denna version har ingen automatisk återställning av budgeten eller återställningsknapp.",
         "data": {
           "main_fuse_amps": "Huvudsäkring (A)",
           "buffer_amps": "Marginal (A)",
@@ -82,7 +82,12 @@
           "increase_stable_seconds": "Stabil marginal före höjning (s)",
           "increase_interval_seconds": "Intervall mellan höjningar (s)",
           "restart_stable_seconds": "Stabil marginal före omstart (s)",
-          "measurement_settle_seconds": "Väntan på nätmätning efter sänkt bilström (s)"
+          "measurement_settle_seconds": "Väntan på nätmätning efter sänkt bilström (s)",
+          "overload_enabled": "Experimentell tidsbegränsad överlast (aktivt tillval)",
+          "overload_margin_amps": "Experimentell varaktig överlast över huvudsäkringen (A, högst 4)",
+          "overload_budget_seconds": "Experimentell sammanlagd överlastbudget (sekunder, högst 1800)",
+          "overload_transition_limit_amps": "Experimentell toppgräns under svarsfönstret (A, högst 38)",
+          "overload_response_seconds": "Experimentellt svarsfönster efter begärd minström (sekunder, högst 10)"
         }
       }
     },

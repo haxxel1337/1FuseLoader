@@ -40,6 +40,10 @@ NUMBER_DESCRIPTIONS = [
     OneFuseNumberDescription(key="increase_interval_seconds", option_key="increase_interval_seconds", name="Seconds Between 1 A Increases", native_min_value=5, native_max_value=120, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:stairs-up"),
     OneFuseNumberDescription(key="restart_stable_seconds", option_key="restart_stable_seconds", name="Stable Headroom Before Restart", native_min_value=15, native_max_value=600, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:play-pause"),
     OneFuseNumberDescription(key="measurement_settle_seconds", option_key="measurement_settle_seconds", name="Wait for Grid Report After EV Reduction", native_min_value=1, native_max_value=30, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:sync-clock"),
+    OneFuseNumberDescription(key="overload_margin_amps", option_key="overload_margin_amps", name="Experimental Overload Margin", native_min_value=0.5, native_max_value=4, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:speedometer-slow"),
+    OneFuseNumberDescription(key="overload_budget_seconds", option_key="overload_budget_seconds", name="Experimental Cumulative Overload Budget", native_min_value=60, native_max_value=1800, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-sand"),
+    OneFuseNumberDescription(key="overload_transition_limit_amps", option_key="overload_transition_limit_amps", name="Experimental Overload Transition Limit", native_min_value=10, native_max_value=38, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:speedometer"),
+    OneFuseNumberDescription(key="overload_response_seconds", option_key="overload_response_seconds", name="Experimental Overload Response Window", native_min_value=1, native_max_value=10, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-alert"),
 ]
 
 

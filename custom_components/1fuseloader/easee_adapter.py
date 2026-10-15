@@ -99,6 +99,24 @@ class EaseeCommandAdapter:
         return None
 
     @property
+    def overload_block_reason(self) -> str | None:
+        """Gate optional overload against read-back zero offline circuit limits."""
+        problem = self.telemetry_block_reason
+        if problem:
+            return problem
+        for phase in (1, 2, 3):
+            value = self._product_data.state.get(f"offlineMaxCircuitCurrentP{phase}")
+            if isinstance(value, bool):
+                return "offline_fallback_not_zero_or_unverified"
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return "offline_fallback_not_zero_or_unverified"
+            if not isfinite(number) or number != 0:
+                return "offline_fallback_not_zero_or_unverified"
+        return None
+
+    @property
     def telemetry_block_reason(self) -> str | None:
         """Use stream health, since unchanged status/current entities can be old.
 

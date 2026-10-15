@@ -56,6 +56,11 @@ OPT_INCREASE_STABLE_SECONDS = "increase_stable_seconds"
 OPT_INCREASE_INTERVAL_SECONDS = "increase_interval_seconds"
 OPT_RESTART_STABLE_SECONDS = "restart_stable_seconds"
 OPT_MEASUREMENT_SETTLE_SECONDS = "measurement_settle_seconds"
+OPT_OVERLOAD_ENABLED = "overload_enabled"
+OPT_OVERLOAD_MARGIN_AMPS = "overload_margin_amps"
+OPT_OVERLOAD_BUDGET_SECONDS = "overload_budget_seconds"
+OPT_OVERLOAD_TRANSITION_LIMIT_AMPS = "overload_transition_limit_amps"
+OPT_OVERLOAD_RESPONSE_SECONDS = "overload_response_seconds"
 
 DEFAULT_OPTIONS = {
     OPT_MAIN_FUSE_AMPS: 25.0,
@@ -87,6 +92,13 @@ DEFAULT_OPTIONS = {
     OPT_INCREASE_INTERVAL_SECONDS: 15,
     OPT_RESTART_STABLE_SECONDS: 60,
     OPT_MEASUREMENT_SETTLE_SECONDS: 10,
+    # Deliberate overload operation is an explicit installation-specific opt-in.
+    # These limits are operational settings, not a fuse thermal model.
+    OPT_OVERLOAD_ENABLED: False,
+    OPT_OVERLOAD_MARGIN_AMPS: 4.0,
+    OPT_OVERLOAD_BUDGET_SECONDS: 1800,
+    OPT_OVERLOAD_TRANSITION_LIMIT_AMPS: 38.0,
+    OPT_OVERLOAD_RESPONSE_SECONDS: 10,
 }
 
 OPTION_KEYS = set(DEFAULT_OPTIONS)
@@ -117,6 +129,10 @@ OPTION_NUMBER_RANGES = {
     OPT_INCREASE_INTERVAL_SECONDS: (5, 120, 5),
     OPT_RESTART_STABLE_SECONDS: (15, 600, 5),
     OPT_MEASUREMENT_SETTLE_SECONDS: (1, 30, 1),
+    OPT_OVERLOAD_MARGIN_AMPS: (0.5, 4, 0.5),
+    OPT_OVERLOAD_BUDGET_SECONDS: (60, 1800, 1),
+    OPT_OVERLOAD_TRANSITION_LIMIT_AMPS: (10, 38, 0.5),
+    OPT_OVERLOAD_RESPONSE_SECONDS: (1, 10, 1),
 }
 
 
@@ -166,6 +182,16 @@ def validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("Soft current must not exceed maximum charge current")
     if result[OPT_MINIMUM_RESERVE_AMPS] > result[OPT_BUFFER_AMPS]:
         raise ValueError("Minimum reserve must not exceed the normal buffer")
+    if result[OPT_OVERLOAD_ENABLED]:
+        if not result[OPT_ENABLE_DYNAMIC_LIMIT]:
+            raise ValueError("Experimental overload operation requires dynamic current control")
+        if result[OPT_MIN_CHARGE_AMPS] >= result[OPT_MAIN_FUSE_AMPS]:
+            raise ValueError("Minimum charge current must be below the main fuse rating for overload operation")
+        overload_ceiling = result[OPT_MAIN_FUSE_AMPS] + result[OPT_OVERLOAD_MARGIN_AMPS]
+        if result[OPT_OVERLOAD_TRANSITION_LIMIT_AMPS] < overload_ceiling:
+            raise ValueError("Overload transition limit must not be below the sustained overload ceiling")
+        if result[OPT_OVERLOAD_RESPONSE_SECONDS] >= result[OPT_OVERLOAD_BUDGET_SECONDS]:
+            raise ValueError("Overload response window must be shorter than the cumulative overload budget")
     # Kept only for legacy storage compatibility; the old threshold no longer
     # drives control and must not prevent editing the real fuse rating.
     result[OPT_SAFE_L1_AMPS] = min(result[OPT_SAFE_L1_AMPS], result[OPT_MAIN_FUSE_AMPS])

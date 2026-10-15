@@ -9,7 +9,8 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event, async_track_time_interval
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
@@ -20,9 +21,13 @@ from .const import (
 from .easee_adapter import EaseeCommandAdapter
 from .bmw_context import BMWContext
 from .logic import OneFuseRegulator, RegulatorInput, RegulatorSettings
+from .overload_persistence import OverloadBudgetStore
 
 _LOGGER = logging.getLogger(__name__)
 ACTION_TIMEOUT_SECONDS = 20
+EXPOSURE_STORE_TIMEOUT_SECONDS = 2
+# One minute lease plus storage, request and scheduling allowances.
+OVERLOAD_LEASE_RESERVE_SECONDS = 90
 
 
 def _get_state_value(hass: HomeAssistant, entity_id: str | None) -> Any:
@@ -58,6 +63,11 @@ class OneFuseLoaderController:
         self._bmw_context = BMWContext(hass, entry.data.get(CONF_BMW_DEVICE_ID))
         self.bmw_context: dict[str, Any] = {}
         self._adapter = command_adapter
+        self._budget_store = OverloadBudgetStore(Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.overload"))
+        self._budget_loaded = False
+        self._budget_error: str | None = None
+        self._overload_restore_receipt_floor: float | None = None
+        self._unsub_deadline = None
         if command_adapter is not None:
             self.control_block_reason = command_adapter.control_block_reason
 
@@ -124,6 +134,17 @@ class OneFuseLoaderController:
         async with self._lock:
             self._stopped = False
             self._reload_settings_locked()
+            if not self._budget_loaded:
+                try:
+                    saved = await asyncio.wait_for(self._budget_store.async_load(), EXPOSURE_STORE_TIMEOUT_SECONDS)
+                    if saved is not None:
+                        if not self.regulator.import_overload_state(saved):
+                            raise ValueError("Invalid restored exposure")
+                        if saved.get("minimum_held"):
+                            self._overload_restore_receipt_floor = datetime.now(timezone.utc).timestamp()
+                except Exception:
+                    self._budget_error = "overload_budget_restore_failed"
+                self._budget_loaded = True
             source_entities = [self.entry.data.get(key) for key in (
                 CONF_L1_ENTITY, CONF_L2_ENTITY, CONF_L3_ENTITY,
                 CONF_STATUS_ENTITY, CONF_CHARGER_CURRENT_ENTITY,
@@ -189,6 +210,9 @@ class OneFuseLoaderController:
         if self.unsub_timer:
             self.unsub_timer()
             self.unsub_timer = None
+        if self._unsub_deadline:
+            self._unsub_deadline()
+            self._unsub_deadline = None
         async with self._lock:
             pass
         pending = self._refresh_task
@@ -266,7 +290,35 @@ class OneFuseLoaderController:
         except Exception:
             self.bmw_context = {}
         inp = self._read_input()
+        if self.settings.overload_enabled:
+            offline_problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
+            if offline_problem or self._budget_error:
+                inp = replace(inp, data_valid=False, data_error=self._budget_error or offline_problem)
         decision = self.regulator.evaluate(inp)
+        exposure = self.regulator.export_overload_state()
+        if self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"]:
+            try:
+                await asyncio.wait_for(self._budget_store.async_save(exposure), EXPOSURE_STORE_TIMEOUT_SECONDS)
+            except Exception:
+                self._budget_error = "overload_budget_save_failed"
+        if self.settings.overload_enabled and decision.current_p1 > 0 and (
+            self._budget_error or (
+                decision.mode.removeprefix("dry_run_").startswith("overload")
+                and (decision.overload_remaining_seconds < OVERLOAD_LEASE_RESERVE_SECONDS
+                     or (self._overload_restore_receipt_floor is not None and (
+                         inp.grid_report_ts is None or inp.charger_report_ts is None
+                         or inp.grid_report_ts < self._overload_restore_receipt_floor
+                         or inp.charger_report_ts < self._overload_restore_receipt_floor
+                     )))
+            )
+        ):
+            decision = replace(
+                decision, mode="overload_control_blocked",
+                reason=self._budget_error or "Overload requires a complete lease reserve and fresh post-restart reports.",
+                command="set_limit", current_p1=0, current_p2=0, current_p3=0,
+                should_call_service=self.settings.active_control,
+            )
+        self._schedule_overload_deadline(decision, max(0.0, self.hass.loop.time() - inp.now_ts))
         self.last_decision = decision
         self.last_service_error = None
         if not decision.should_call_service:
@@ -302,6 +354,27 @@ class OneFuseLoaderController:
             self.regulator.acknowledge(decision, self.hass.loop.time())
             self.last_service_result = "submitted_unverified"
         self.notify()
+
+    def _schedule_overload_deadline(self, decision: Any, elapsed: float = 0.0) -> None:
+        if self._unsub_deadline:
+            self._unsub_deadline()
+            self._unsub_deadline = None
+        if not self.settings.overload_enabled or self._stopped:
+            return
+        delays = []
+        if decision.overload_transition_remaining_seconds is not None:
+            delays.append(decision.overload_transition_remaining_seconds)
+        if decision.mode.removeprefix("dry_run_").startswith("overload") and decision.current_p1 > 0:
+            delays.append(decision.overload_remaining_seconds - OVERLOAD_LEASE_RESERVE_SECONDS)
+        if not delays:
+            return
+
+        async def deadline_tick(_now: datetime) -> None:
+            # The event loop and remote command still have delivery latency;
+            # this removes the avoidable five-second watchdog rounding only.
+            self._handle_source_change(None)
+
+        self._unsub_deadline = async_call_later(self.hass, max(0.05, min(delays) - elapsed), deadline_tick)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
