@@ -319,14 +319,14 @@ manually editing `.storage`.
 ## HACS prerelease installation
 
 Add `https://github.com/haxxel1337/1FuseLoader` as a custom **Integration**
-repository in HACS. For the **v0.4.0b6 prerelease**, open the
+repository in HACS. For a **0.4.0 prerelease**, open the
 repository's download/redownload dialog, enable beta/prerelease versions and
 select that exact version. Confirm HACS reports the installed version, then
 restart Home Assistant with the operator's approval. Existing UI configuration
 is retained. The integration is classified as a **service**, so it appears in
 the normal Integrations list instead of Helpers. Downloaded files and loaded
 runtime can have different versions until restart. GitHub's stable **Latest**
-badge can still refer to v0.3.3 while b5 is available as a prerelease. Existing
+badge can still refer to v0.3.3 while a newer beta is available as a prerelease. Existing
 overload opt-in is preserved; this update never enables it automatically.
 
 The startup default addresses a possible Easee 6 A waiting condition; it is not
