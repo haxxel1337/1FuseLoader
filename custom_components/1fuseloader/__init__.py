@@ -4,6 +4,7 @@ import asyncio
 import logging
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
+from math import isfinite
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -11,6 +12,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event, async_track_time_interval
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
@@ -20,7 +22,7 @@ from .const import (
 )
 from .easee_adapter import EaseeCommandAdapter
 from .bmw_context import BMWContext
-from .logic import OneFuseRegulator, RegulatorInput, RegulatorSettings
+from .logic import ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, OneFuseRegulator, RegulatorInput, RegulatorSettings
 from .overload_persistence import OverloadBudgetStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -51,6 +53,13 @@ class OneFuseLoaderController:
         self.last_decision = None
         self.last_service_result = "not_sent"
         self.last_service_error: str | None = None
+        # Keep actual command history separate from each watchdog evaluation.
+        # These are memory-only diagnostic receipts, never physical proof or
+        # pause ownership restored across controller restarts.
+        self.last_command_attempt: dict[str, Any] | None = None
+        self.last_accepted_command: dict[str, Any] | None = None
+        self.last_accepted_limit: dict[str, Any] | None = None
+        self.source_diagnostics: dict[str, Any] = {}
         self.control_block_reason: str | None = "Easee adapter has not been initialized."
         self.unsub_timer = None
         self.unsub_states = None
@@ -247,12 +256,14 @@ class OneFuseLoaderController:
                     errors.append("L1 telemetry is stale or has an invalid timestamp.")
         # Easee states are event-driven: a stable value may be hours old. Its
         # adapter verifies source heartbeat/online health instead of entity age.
+        health_error = "easee_source_unverified"
         if self._adapter is None:
             errors.append("Easee source health has not been verified.")
         else:
             health_error = self._adapter.telemetry_block_reason
             if health_error:
                 errors.append(str(health_error))
+        self._read_source_diagnostics(grid_state, current_state, status_state, health_error, errors)
         return RegulatorInput(
             now_ts=self.hass.loop.time(),
             status=str(status_state.state if status_state is not None else "unknown"),
@@ -270,6 +281,123 @@ class OneFuseLoaderController:
     def _report_timestamp(state: Any) -> float | None:
         reported = getattr(state, "last_reported", None)
         return reported.timestamp() if isinstance(reported, datetime) and reported.tzinfo else None
+
+    @staticmethod
+    def _utc_time(value: Any) -> datetime | None:
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            return None
+        return value.astimezone(timezone.utc)
+
+    def _read_source_diagnostics(self, grid: Any, current: Any, status: Any,
+                                 health_error: str | None, input_errors: list[str]) -> None:
+        """Read only whitelisted cached HA attributes from the selected device.
+
+        A state report is HA receipt/publication time, not the measurement's
+        physical acquisition time. Easee entities can contain private site
+        details, so never copy their complete attribute dictionaries here.
+        Diagnostic failure must not inhibit the protective control path.
+        """
+        source_errors = list(input_errors)
+        for label, state in (("L1", grid), ("Charger current", current)):
+            if state is None:
+                continue  # Missing-state detail already comes from _read_input.
+            value = getattr(state, "state", None)
+            try:
+                valid = not isinstance(value, bool) and isfinite(float(value)) and float(value) >= 0
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+            if not valid:
+                source_errors.append(f"{label} telemetry must be a finite, non-negative current.")
+        if status is not None and str(getattr(status, "state", "")).strip().lower() not in ALLOWED_ACTIVE_STATUSES | IDLE_STATUSES:
+            source_errors.append("Charger status telemetry is unavailable, unsupported or a fault.")
+        diagnostics: dict[str, Any] = {
+            "source_health": "unhealthy" if source_errors else "healthy",
+            "source_errors": source_errors,
+            "source_health_reason": " ".join(source_errors) or "Required source checks passed.",
+            "easee_source_health": health_error or "healthy",
+            "source_health_scope": "required_input_values_and_source_heartbeat; see regulator reason for policy and alignment",
+            "report_time_scope": "ha_receipt_not_physical_acquisition",
+            "easee_stream_pulse_utc": None,
+            "reported_circuit_p1": None, "reported_circuit_p2": None, "reported_circuit_p3": None,
+            "reported_circuit_reported_at_utc": None,
+            "reported_circuit_source": None,
+            "reported_circuit_available": False,
+        }
+        for name, state in (("grid", grid), ("charger_current", current), ("charger_status", status)):
+            reported = self._utc_time(getattr(state, "last_reported", None))
+            diagnostics[f"{name}_reported_at_utc"] = reported.isoformat() if reported else None
+        try:
+            registry = er.async_get(self.hass)
+            entries = er.async_entries_for_device(registry, self.entry.data.get(CONF_DEVICE_ID))
+            candidates = []
+            pulses = []
+            for entity in entries:
+                if entity.platform != "easee" or entity.disabled_by:
+                    continue
+                state = self.hass.states.get(entity.entity_id)
+                if state is None or state.state in {"unavailable", "unknown"}:
+                    continue
+                attributes = getattr(state, "attributes", {})
+                if attributes.get("restored"):
+                    continue
+                pulse = self._utc_time(attributes.get("state_latestPulse"))
+                if pulse is not None:
+                    pulses.append(pulse)
+                values = [attributes.get(f"state_dynamicCircuitCurrentP{phase}") for phase in (1, 2, 3)]
+                if any(isinstance(value, bool) for value in values):
+                    continue
+                try:
+                    currents = tuple(float(value) for value in values)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if attributes.get("unit_of_measurement") != "A" or not all(isfinite(value) and 0 <= value <= 1000 for value in currents):
+                    continue
+                candidates.append((entity.entity_id, currents, self._utc_time(getattr(state, "last_reported", None))))
+            if pulses:
+                pulse = max(pulses)
+                diagnostics["easee_stream_pulse_utc"] = pulse.isoformat()
+            if len(candidates) == 1:
+                entity_id, currents, reported = candidates[0]
+                diagnostics.update({
+                    **{f"reported_circuit_p{phase}": currents[phase - 1] for phase in (1, 2, 3)},
+                    "reported_circuit_reported_at_utc": reported.isoformat() if reported else None,
+                    "reported_circuit_source": entity_id,
+                    "reported_circuit_available": True,
+                })
+            elif candidates:
+                diagnostics["reported_circuit_source"] = "ambiguous_selected_device_sources"
+        except Exception:
+            # This is diagnostic only. Do not expose exception text/site data.
+            diagnostics["reported_circuit_source"] = "cached_readback_unavailable"
+        self.source_diagnostics = diagnostics
+
+    def diagnostic_attributes(self) -> dict[str, Any]:
+        accepted = self.last_accepted_limit
+        reported = tuple(self.source_diagnostics.get(f"reported_circuit_p{phase}") for phase in (1, 2, 3))
+        comparison = None
+        post_acceptance = None
+        if accepted is not None and self.source_diagnostics.get("reported_circuit_available"):
+            comparison = reported == tuple(accepted[f"target_p{phase}"] for phase in (1, 2, 3))
+            report_time = self._utc_time(self.source_diagnostics.get("reported_circuit_reported_at_utc"))
+            accepted_time = self._utc_time(accepted.get("completed_at_utc"))
+            if report_time is not None and accepted_time is not None:
+                post_acceptance = report_time >= accepted_time
+        return {
+            **self.source_diagnostics,
+            "last_command_attempt": dict(self.last_command_attempt) if self.last_command_attempt else None,
+            "last_accepted_command": dict(self.last_accepted_command) if self.last_accepted_command else None,
+            "last_accepted_limit": dict(accepted) if accepted else None,
+            "reported_cap_matches_last_accepted_limit": comparison,
+            "reported_cap_report_after_acceptance": post_acceptance,
+            "readback_scope": "cached_circuit_cap_only",
+            "physical_current_verified": False,
+            "device_ttl_verified": False,
+        }
 
     async def async_tick(self) -> None:
         # Drop redundant timer ticks while an action or reconfiguration is in
@@ -320,7 +448,6 @@ class OneFuseLoaderController:
             )
         self._schedule_overload_deadline(decision, max(0.0, self.hass.loop.time() - inp.now_ts))
         self.last_decision = decision
-        self.last_service_error = None
         if not decision.should_call_service:
             self.last_service_result = "not_sent"
             self.notify()
@@ -341,11 +468,21 @@ class OneFuseLoaderController:
             )
             self.notify()
             return
+        attempt = {
+            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+            "completed_at_utc": None, "command": decision.command,
+            "target_p1": decision.current_p1, "target_p2": decision.current_p2,
+            "target_p3": decision.current_p3, "ttl_seconds": decision.ttl_seconds,
+            "result": "pending", "error": None,
+        }
+        self.last_command_attempt = attempt
+        self.last_service_error = None
         try:
             await asyncio.wait_for(self._adapter.async_execute(decision), ACTION_TIMEOUT_SECONDS)
         except Exception as err:
             self.last_service_result = "error"
             self.last_service_error = type(err).__name__
+            attempt.update(result="error", error=self.last_service_error)
             self.last_decision = replace(
                 decision, reason=f"Command submission failed ({type(err).__name__}); charger state is unverified.",
             )
@@ -353,6 +490,12 @@ class OneFuseLoaderController:
         else:
             self.regulator.acknowledge(decision, self.hass.loop.time())
             self.last_service_result = "submitted_unverified"
+            attempt["result"] = "submitted_unverified"
+        attempt["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        if attempt["result"] == "submitted_unverified":
+            self.last_accepted_command = dict(attempt)
+            if decision.command in {"set_limit", "resume"}:
+                self.last_accepted_limit = dict(attempt)
         self.notify()
 
     def _schedule_overload_deadline(self, decision: Any, elapsed: float = 0.0) -> None:

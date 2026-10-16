@@ -40,6 +40,19 @@ class SettingsTests(unittest.TestCase):
     def test_legacy_forced_minimum_is_disabled_on_validation(self):
         self.assertFalse(const.validate_options({"force_min_when_available_too_low": True})["force_min_when_available_too_low"])
 
+    def test_startup_setting_keeps_legacy_minimum_and_maximum_editable(self):
+        options = const.validate_options({})
+        self.assertEqual(options["startup_charge_amps"], 7)
+        self.assertEqual(options["min_charge_amps"], 6)
+        # The regulator clamps the requested start offer to the configured car
+        # range. A newly introduced default must not unload an old 6 A entry.
+        legacy = const.validate_options({"max_charge_amps": 6})
+        self.assertEqual(legacy["max_charge_amps"], 6)
+        self.assertEqual(legacy["startup_charge_amps"], 7)
+        for value in (5, 17, 6.5, True, float("nan")):
+            with self.subTest(startup=value), self.assertRaises(ValueError):
+                const.validate_options({"startup_charge_amps": value})
+
     def test_rejects_unsafe_numeric_values_before_storage(self):
         cases = [
             {"buffer_amps": -100}, {"main_fuse_amps": float("nan")},

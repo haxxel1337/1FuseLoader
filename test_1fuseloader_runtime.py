@@ -247,6 +247,189 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.controller.regulator.last_target)
         self.assertNotIn("private detail", self.controller.last_decision.reason)
 
+    async def test_no_action_preserves_actual_failed_attempt_and_error(self):
+        self.adapter.failure = RuntimeError("private detail which must not escape")
+        await self.controller.async_tick()
+        failed = dict(self.controller.last_command_attempt)
+        self.assertEqual(failed["result"], "error")
+        self.assertEqual(failed["error"], "RuntimeError")
+        self.assertIsNotNone(datetime.fromisoformat(failed["started_at_utc"]).utcoffset())
+        self.entry.options["active_control"] = False
+        await self.controller.async_reconfigure()
+        self.assertEqual(self.controller.last_service_result, "not_sent")
+        self.assertEqual(self.controller.last_service_error, "RuntimeError")
+        self.assertEqual(self.controller.last_command_attempt, failed)
+        self.assertIsNone(self.controller.last_accepted_limit)
+        self.assertNotIn("private detail", str(self.controller.diagnostic_attributes()))
+
+    async def test_failed_reduction_does_not_replace_last_accepted_limit(self):
+        await self.controller.async_tick()
+        accepted = dict(self.controller.last_accepted_limit)
+        self.assertEqual(accepted["target_p1"], 8)
+        self.states["sensor.grid"].state = "25"
+        self.adapter.failure = OSError("private remote endpoint")
+        await self.controller.async_tick()
+        self.assertEqual(self.controller.last_command_attempt["target_p1"], 6)
+        self.assertEqual(self.controller.last_command_attempt["result"], "error")
+        self.assertEqual(self.controller.last_accepted_limit, accepted)
+        self.assertEqual(self.controller.last_accepted_command, accepted)
+        self.assertEqual(self.controller.regulator.last_target[0], 8)
+
+    async def test_dry_run_and_blocked_decisions_are_not_actual_attempts(self):
+        self.adapter.control_block_reason = "unsupported_easee_version"
+        await self.controller.async_tick()
+        self.assertIsNone(self.controller.last_command_attempt)
+        self.adapter.control_block_reason = None
+        self.entry.options["dry_run"] = True
+        await self.controller.async_reconfigure()
+        self.assertIsNone(self.controller.last_command_attempt)
+        self.assertIsNone(self.controller.last_accepted_command)
+
+    def cached_registry(self, entries):
+        registry = object()
+        def selected(actual_registry, device_id):
+            self.assertIs(actual_registry, registry)
+            self.assertEqual(device_id, "test")
+            return entries
+        return SimpleNamespace(async_get=lambda hass: registry, async_entries_for_device=selected)
+
+    def circuit_source(self, **overrides):
+        attributes = {
+            "unit_of_measurement": "A",
+            "state_dynamicCircuitCurrentP1": 8,
+            "state_dynamicCircuitCurrentP2": 16,
+            "state_dynamicCircuitCurrentP3": 0,
+            "site.siteKey": "PRIVATE_SENTINEL",
+        }
+        attributes.update(overrides)
+        self.states["sensor.circuit"] = SimpleNamespace(
+            state="16", attributes=attributes,
+            last_reported=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+        return SimpleNamespace(platform="easee", disabled_by=None, entity_id="sensor.circuit")
+
+    async def test_readback_uses_selected_device_explicit_phases_not_native_max(self):
+        circuit = self.circuit_source()
+        with patch.object(runtime, "er", self.cached_registry([circuit])):
+            await self.controller.async_tick()
+        diagnostics = self.controller.diagnostic_attributes()
+        self.assertEqual(diagnostics["reported_circuit_p1"], 8)
+        self.assertEqual(diagnostics["reported_circuit_p2"], 16)
+        self.assertEqual(diagnostics["reported_circuit_p3"], 0)
+        self.assertFalse(diagnostics["reported_cap_matches_last_accepted_limit"])
+        self.assertFalse(diagnostics["reported_cap_report_after_acceptance"])
+        self.assertEqual(diagnostics["readback_scope"], "cached_circuit_cap_only")
+        self.assertFalse(diagnostics["physical_current_verified"])
+        self.assertFalse(diagnostics["device_ttl_verified"])
+        self.assertNotIn("PRIVATE_SENTINEL", str(diagnostics))
+        self.assertNotIn("site.siteKey", str(diagnostics))
+
+    async def test_matching_old_report_is_not_physical_or_ttl_confirmation(self):
+        circuit = self.circuit_source(state_dynamicCircuitCurrentP2=0)
+        with patch.object(runtime, "er", self.cached_registry([circuit])):
+            await self.controller.async_tick()
+        diagnostics = self.controller.diagnostic_attributes()
+        self.assertTrue(diagnostics["reported_cap_matches_last_accepted_limit"])
+        self.assertFalse(diagnostics["reported_cap_report_after_acceptance"])
+        self.assertGreater((datetime.now(timezone.utc) - datetime.fromisoformat(
+            diagnostics["reported_circuit_reported_at_utc"])).total_seconds(), 3500)
+        self.assertFalse(diagnostics["physical_current_verified"])
+        self.assertFalse(diagnostics["device_ttl_verified"])
+
+    async def test_matching_new_report_and_idle_tick_keep_submission_unverified(self):
+        circuit = self.circuit_source(state_dynamicCircuitCurrentP2=0)
+        with patch.object(runtime, "er", self.cached_registry([circuit])):
+            await self.controller.async_tick()
+            accepted = dict(self.controller.last_accepted_limit)
+            self.states[circuit.entity_id].last_reported = datetime.now(timezone.utc)
+            await self.controller.async_tick()
+        diagnostics = self.controller.diagnostic_attributes()
+        self.assertEqual(self.controller.last_service_result, "not_sent")
+        self.assertEqual(self.controller.last_command_attempt, accepted)
+        self.assertEqual(self.controller.last_accepted_limit, accepted)
+        self.assertTrue(diagnostics["reported_cap_matches_last_accepted_limit"])
+        self.assertTrue(diagnostics["reported_cap_report_after_acceptance"])
+        self.assertEqual(accepted["result"], "submitted_unverified")
+        self.assertFalse(diagnostics["physical_current_verified"])
+        self.assertFalse(diagnostics["device_ttl_verified"])
+
+    async def test_restored_ambiguous_or_invalid_readback_is_unavailable(self):
+        for overrides in ({"restored": True}, {"state_dynamicCircuitCurrentP1": True},
+                          {"state_dynamicCircuitCurrentP1": float("nan")}, {"unit_of_measurement": "W"}):
+            with self.subTest(overrides=overrides):
+                circuit = self.circuit_source(**overrides)
+                with patch.object(runtime, "er", self.cached_registry([circuit])):
+                    await self.controller.async_tick()
+                self.assertIsNone(self.controller.source_diagnostics["reported_circuit_p1"])
+                self.assertFalse(self.controller.source_diagnostics["reported_circuit_available"])
+                self.assertIsNone(self.controller.diagnostic_attributes()["reported_cap_matches_last_accepted_limit"])
+        circuit = self.circuit_source()
+        duplicate = SimpleNamespace(platform="easee", disabled_by=None, entity_id="sensor.other_circuit")
+        self.states[duplicate.entity_id] = self.states[circuit.entity_id]
+        with patch.object(runtime, "er", self.cached_registry([circuit, duplicate])):
+            await self.controller.async_tick()
+        self.assertFalse(self.controller.source_diagnostics["reported_circuit_available"])
+        self.assertEqual(self.controller.source_diagnostics["reported_circuit_source"], "ambiguous_selected_device_sources")
+
+    async def test_fresh_pulse_does_not_relabel_old_current_as_fresh_measurement(self):
+        pulse = datetime.now(timezone.utc)
+        self.states["binary_sensor.online"] = SimpleNamespace(
+            state="on", last_reported=pulse,
+            attributes={"state_latestPulse": pulse, "site.siteKey": "PRIVATE_SENTINEL"},
+        )
+        online = SimpleNamespace(platform="easee", disabled_by=None, entity_id="binary_sensor.online")
+        with patch.object(runtime, "er", self.cached_registry([online])):
+            await self.controller.async_tick()
+        diagnostics = self.controller.diagnostic_attributes()
+        self.assertEqual(diagnostics["source_health"], "healthy")
+        self.assertLess((datetime.now(timezone.utc) - datetime.fromisoformat(
+            diagnostics["easee_stream_pulse_utc"])).total_seconds(), 2)
+        self.assertGreater((datetime.now(timezone.utc) - datetime.fromisoformat(
+            diagnostics["charger_current_reported_at_utc"])).total_seconds(), 7100)
+        self.assertEqual(diagnostics["report_time_scope"], "ha_receipt_not_physical_acquisition")
+        self.assertFalse(diagnostics["physical_current_verified"])
+        self.assertFalse(any(key.endswith("_age_seconds") for key in diagnostics))
+
+    async def test_stale_grid_is_unhealthy_despite_healthy_easee_stream(self):
+        self.states["sensor.grid"].last_reported -= timedelta(minutes=3)
+        await self.controller.async_tick()
+        diagnostics = self.controller.diagnostic_attributes()
+        self.assertEqual(diagnostics["source_health"], "unhealthy")
+        self.assertEqual(diagnostics["easee_source_health"], "healthy")
+        self.assertIn("L1 telemetry is stale", diagnostics["source_health_reason"])
+        self.assertTrue(diagnostics["source_errors"])
+        self.assertEqual(self.controller.last_decision.mode, "unavailable")
+
+    async def test_invalid_required_values_are_unhealthy_with_healthy_easee_stream(self):
+        for entity_id, value, label in (
+            ("sensor.grid", "unavailable", "L1"),
+            ("sensor.grid", "nan", "L1"),
+            ("sensor.grid", "-1", "L1"),
+            ("sensor.car", "unavailable", "Charger current"),
+            ("sensor.status", "unknown", "Charger status"),
+        ):
+            with self.subTest(entity_id=entity_id, value=value):
+                previous = self.states[entity_id].state
+                self.states[entity_id].state = value
+                await self.controller.async_tick()
+                diagnostics = self.controller.diagnostic_attributes()
+                self.assertEqual(diagnostics["source_health"], "unhealthy")
+                self.assertEqual(diagnostics["easee_source_health"], "healthy")
+                self.assertIn(label, diagnostics["source_health_reason"])
+                self.assertEqual(self.controller.last_decision.mode, "unavailable")
+                self.states[entity_id].state = previous
+
+    async def test_policy_headroom_wait_is_not_a_source_transport_fault(self):
+        self.states["sensor.grid"].state = "22"
+        self.states["sensor.car"].state = "0"
+        self.states["sensor.status"].state = "awaiting_start"
+        await self.controller.async_tick()
+        diagnostics = self.controller.diagnostic_attributes()
+        self.assertEqual(diagnostics["source_health"], "healthy")
+        self.assertEqual(diagnostics["easee_source_health"], "healthy")
+        self.assertFalse(diagnostics["source_errors"])
+        self.assertEqual(self.controller.last_decision.current_p1, 0)
+
     async def test_stale_grid_requests_zero(self):
         self.states["sensor.grid"].last_reported -= timedelta(minutes=3)
         await self.controller.async_tick()

@@ -8,6 +8,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE, UnitOfElectricCurrent
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_BMW_DEVICE_ID, DOMAIN, NAME
@@ -74,6 +75,24 @@ SENSOR_DESCRIPTIONS = [
         name="Command Result",
         icon="mdi:list-status",
     ),
+    SensorEntityDescription(
+        key="last_attempt_result",
+        name="Last Command Attempt Result",
+        icon="mdi:history",
+    ),
+    SensorEntityDescription(
+        key="reported_circuit_p1",
+        name="Reported Circuit P1",
+        native_unit_of_measurement=UnitOfElectricCurrent.AMPERE,
+        device_class=SensorDeviceClass.CURRENT,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:current-ac",
+    ),
+    SensorEntityDescription(
+        key="source_health",
+        name="Source Health",
+        icon="mdi:heart-pulse",
+    ),
 ]
 
 BMW_SENSOR_DESCRIPTIONS = [
@@ -103,6 +122,7 @@ class OneFuseSensor(SensorEntity):
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
+            entry_type=DeviceEntryType.SERVICE,
             name=entry.title,
             manufacturer="Axel / ChatGPT",
             model=NAME,
@@ -124,6 +144,10 @@ class OneFuseSensor(SensorEntity):
         if key.startswith("bmw_"):
             field = self.controller.bmw_context.get(key.removeprefix("bmw_"), {})
             return field.get("value") if field.get("available") else None
+        if key == "last_attempt_result":
+            return (self.controller.last_command_attempt or {}).get("result", "none")
+        if key in {"reported_circuit_p1", "source_health"}:
+            return self.controller.source_diagnostics.get(key)
         d = self.controller.last_decision
         if d is None:
             return None
@@ -163,8 +187,27 @@ class OneFuseSensor(SensorEntity):
         d = self.controller.last_decision
         if d is None:
             return None
+        diagnostics = {}
+        key = self.entity_description.key
+        if key in {"source_health", "reported_circuit_p1", "last_attempt_result", "service_result"}:
+            snapshot = self.controller.diagnostic_attributes()
+            if key == "source_health":
+                diagnostics = snapshot
+            elif key == "reported_circuit_p1":
+                diagnostics = {
+                    name: value for name, value in snapshot.items()
+                    if (name.startswith("reported_circuit_") and not name.endswith("_age_seconds"))
+                    or name in {"last_accepted_limit", "reported_cap_matches_last_accepted_limit",
+                                "reported_cap_report_after_acceptance", "readback_scope",
+                                "physical_current_verified", "device_ttl_verified"}
+                }
+            else:
+                diagnostics = {name: snapshot[name] for name in (
+                    "last_command_attempt", "last_accepted_command", "last_accepted_limit",
+                )}
         return {
             **asdict(d),
+            **diagnostics,
             "proposed_command": d.command,
             "command_result": self.controller.last_service_result,
             "command_error": self.controller.last_service_error,

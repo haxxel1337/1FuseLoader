@@ -269,7 +269,9 @@ class OverloadTests(unittest.TestCase):
                 self.assert_stop(self.sample(regulator, 0), "invalid_persisted_exposure")
 
     def test_failed_allowance_does_not_disable_safe_nominal_recovery(self):
-        regulator = self.regulator()
+        # Retain this regression's original nominal 6 A start configuration;
+        # the independent startup suite covers the new configurable default.
+        regulator = self.regulator(startup_charge_amps=6)
         self.sample(regulator, 0, grid=38.1, ev=16)
         nominal = self.sample(regulator, 1, grid=5, ev=0, status="awaiting_start")
         self.assertEqual(nominal.current_p1, 0)

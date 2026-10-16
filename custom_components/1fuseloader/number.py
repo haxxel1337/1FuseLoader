@@ -8,6 +8,7 @@ from homeassistant.const import UnitOfElectricCurrent, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, NAME, DEFAULT_OPTIONS, validate_option_value, validate_options
@@ -23,6 +24,7 @@ NUMBER_DESCRIPTIONS = [
     OneFuseNumberDescription(key="buffer_amps", option_key="buffer_amps", name="Buffer", native_min_value=0, native_max_value=10, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:shield-half-full"),
     OneFuseNumberDescription(key="minimum_reserve_amps", option_key="minimum_reserve_amps", name="Reserve While Keeping Minimum Charge", native_min_value=0, native_max_value=5, native_step=0.1, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:shield-outline"),
     OneFuseNumberDescription(key="min_charge_amps", option_key="min_charge_amps", name="Min Charge", native_min_value=6, native_max_value=16, native_step=1, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:battery-arrow-down"),
+    OneFuseNumberDescription(key="startup_charge_amps", option_key="startup_charge_amps", name="Startup Charge", native_min_value=6, native_max_value=16, native_step=1, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:ev-plug-type2"),
     OneFuseNumberDescription(key="max_charge_amps", option_key="max_charge_amps", name="Max Charge", native_min_value=6, native_max_value=32, native_step=1, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:battery-arrow-up"),
     OneFuseNumberDescription(key="soft_limit_amps", option_key="soft_limit_amps", name="Soft Guard Limit", native_min_value=10, native_max_value=80, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:speedometer-slow"),
     OneFuseNumberDescription(key="soft_for_seconds", option_key="soft_for_seconds", name="Soft Guard Delay", native_min_value=0, native_max_value=300, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-sand"),
@@ -39,7 +41,7 @@ NUMBER_DESCRIPTIONS = [
     OneFuseNumberDescription(key="increase_stable_seconds", option_key="increase_stable_seconds", name="Stable Load Before Increasing", native_min_value=5, native_max_value=300, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-sand"),
     OneFuseNumberDescription(key="increase_interval_seconds", option_key="increase_interval_seconds", name="Seconds Between 1 A Increases", native_min_value=5, native_max_value=120, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:stairs-up"),
     OneFuseNumberDescription(key="restart_stable_seconds", option_key="restart_stable_seconds", name="Stable Headroom Before Restart", native_min_value=15, native_max_value=600, native_step=5, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:play-pause"),
-    OneFuseNumberDescription(key="measurement_settle_seconds", option_key="measurement_settle_seconds", name="Wait for Grid Report After EV Reduction", native_min_value=1, native_max_value=30, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:sync-clock"),
+    OneFuseNumberDescription(key="measurement_settle_seconds", option_key="measurement_settle_seconds", name="Current Report Alignment Window", native_min_value=1, native_max_value=30, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:sync-clock"),
     OneFuseNumberDescription(key="overload_margin_amps", option_key="overload_margin_amps", name="Experimental Overload Margin", native_min_value=0.5, native_max_value=4, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:speedometer-slow"),
     OneFuseNumberDescription(key="overload_budget_seconds", option_key="overload_budget_seconds", name="Experimental Cumulative Overload Budget", native_min_value=60, native_max_value=1800, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-sand"),
     OneFuseNumberDescription(key="overload_transition_limit_amps", option_key="overload_transition_limit_amps", name="Experimental Overload Transition Limit", native_min_value=10, native_max_value=38, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:speedometer"),
@@ -63,6 +65,7 @@ class OneFuseNumber(NumberEntity):
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
+            entry_type=DeviceEntryType.SERVICE,
             name=entry.title,
             manufacturer="Axel / ChatGPT",
             model=NAME,
