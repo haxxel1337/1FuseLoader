@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0b7
+
+- Recognize the verified Currently One MQTT source and validate its actual L1
+  frame receipts and advancing source timestamps. Identical current values can
+  remain fresh and align with EV reports without forcing MQTT sensor updates.
+  Invalid, replayed, retained or stale frames cannot renew source health, and
+  connection loss still blocks control.
+- Retain an accepted lower cap during a bounded, physically observed partial EV
+  reduction while the corresponding grid report catches up. Partial responses
+  and lease renewals cannot replenish the alignment budget or permit increases.
+- During an experimental overload transition, wait for grid feedback reflecting
+  the final minimum-current response within the original response deadline.
+  Intermediate grid reports cannot falsely complete that response.
+- Keep experimental overload an explicit opt-in. Its maximum +4 A / 1800 s
+  cumulative budget, 38 A transition ceiling and 10 s response deadline remain
+  separate from normal headroom control and physical installation limits.
+
 ## 0.4.0b6
 
 - Default to fast recovery during actual charging: offer buffered available

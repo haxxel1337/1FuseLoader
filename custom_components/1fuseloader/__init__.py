@@ -24,6 +24,7 @@ from .easee_adapter import EaseeCommandAdapter
 from .bmw_context import BMWContext
 from .logic import ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, OneFuseRegulator, RegulatorInput, RegulatorSettings
 from .overload_persistence import OverloadBudgetStore
+from .mqtt_freshness import MqttL1Config, MqttL1Source
 
 _LOGGER = logging.getLogger(__name__)
 ACTION_TIMEOUT_SECONDS = 20
@@ -63,6 +64,10 @@ class OneFuseLoaderController:
         self.control_block_reason: str | None = "Easee adapter has not been initialized."
         self.unsub_timer = None
         self.unsub_states = None
+        self._source_entities: tuple[str, ...] = ()
+        self._l1_source: MqttL1Source | None = None
+        self._l1_source_config: MqttL1Config | None = None
+        self._l1_source_error: str | None = None
         self.listeners: list[Any] = []
         self._lock = asyncio.Lock()
         self._stopped = False
@@ -129,7 +134,10 @@ class OneFuseLoaderController:
         self._generation += 1
         async with self._lock:
             changed = self._reload_settings_locked()
-            if changed and not self._stopped:
+            source_changed = await self._async_configure_l1_source_locked()
+            if self.unsub_states is not None:
+                self._subscribe_source_entities()
+            if (changed or source_changed) and not self._stopped:
                 await self._async_tick_locked()
 
     async def async_reset_state(self) -> None:
@@ -154,13 +162,12 @@ class OneFuseLoaderController:
                 except Exception:
                     self._budget_error = "overload_budget_restore_failed"
                 self._budget_loaded = True
-            source_entities = [self.entry.data.get(key) for key in (
-                CONF_L1_ENTITY, CONF_L2_ENTITY, CONF_L3_ENTITY,
-                CONF_STATUS_ENTITY, CONF_CHARGER_CURRENT_ENTITY,
-            ) if self.entry.data.get(key)]
-            self.unsub_states = async_track_state_change_event(
-                self.hass, source_entities, self._handle_source_change,
-            )
+            if self._stopped:
+                return
+            self._subscribe_source_entities()
+            await self._async_configure_l1_source_locked()
+            if self._stopped:
+                return
             # Preserve the user's active/dry-run preferences across HA restarts.
             # Pause ownership is deliberately memory-only, so a restart cannot
             # resume a car which a person may have paused in the meantime.
@@ -172,7 +179,14 @@ class OneFuseLoaderController:
             except Exception as err:
                 self.control_block_reason = f"Easee adapter initialization failed ({type(err).__name__})."
                 _LOGGER.warning("1FuseLoader adapter initialization failed (%s)", type(err).__name__)
+            if self._stopped:
+                return
             await self._async_tick_locked()
+            # async_stop marks stopped before waiting for this lock. It may
+            # already have removed listeners while any startup await yielded;
+            # never install a new watchdog after that cleanup has run.
+            if self._stopped:
+                return
             interval = int((self.entry.options or DEFAULT_OPTIONS).get("poll_interval_seconds", 5))
 
             async def interval_tick(_now: datetime) -> None:
@@ -185,6 +199,69 @@ class OneFuseLoaderController:
                 interval_tick,
                 timedelta(seconds=max(5, interval)),
             )
+
+    def _subscribe_source_entities(self) -> None:
+        source_entities = tuple(self.entry.data[key] for key in (
+            CONF_L1_ENTITY, CONF_L2_ENTITY, CONF_L3_ENTITY,
+            CONF_STATUS_ENTITY, CONF_CHARGER_CURRENT_ENTITY,
+        ) if self.entry.data.get(key))
+        if self.unsub_states is not None and source_entities == self._source_entities:
+            return
+        if self.unsub_states is not None:
+            self.unsub_states()
+        self._source_entities = source_entities
+        self.unsub_states = async_track_state_change_event(
+            self.hass, source_entities, self._handle_source_change,
+        )
+
+    async def _async_configure_l1_source_locked(self) -> bool:
+        """Resolve only the selected source using public entity/device metadata."""
+        if self._stopped:
+            return False
+        config = None
+        try:
+            registry = er.async_get(self.hass)
+            entity_id = self.entry.data.get(CONF_L1_ENTITY)
+            entity = registry.async_get(entity_id) if entity_id else None
+            if entity is not None and entity.platform == "mqtt":
+                from homeassistant.helpers import device_registry as dr
+                device = dr.async_get(self.hass).async_get(entity.device_id)
+                config = MqttL1Config.from_registry(entity_id, entity, device)
+        except Exception:
+            # Never keep an already enabled receipt source after its binding
+            # becomes unverifiable. Unknown sources retain the original policy.
+            if self._l1_source is not None:
+                self._l1_source.stop()
+                self._l1_source = None
+                self._l1_source_config = None
+                self._l1_source_error = "L1 MQTT source identity could not be verified."
+                return True
+            return False
+        if config == self._l1_source_config and self._l1_source_error is None:
+            return False
+        if self._l1_source is not None:
+            self._l1_source.stop()
+        self._l1_source = None
+        self._l1_source_config = config
+        self._l1_source_error = None
+        if config is None:
+            return True
+        source = MqttL1Source(
+            config, monotonic=self.hass.loop.time,
+            utc_now=lambda: datetime.now(timezone.utc),
+            age_limit=lambda: self.settings.max_sensor_age_seconds,
+            on_change=lambda: self._handle_source_change(None),
+        )
+        self._l1_source = source
+        try:
+            await source.async_start(self.hass)
+        except Exception as err:
+            self._l1_source = None
+            self._l1_source_error = f"L1 MQTT receipt subscription failed ({type(err).__name__})."
+        if self._stopped:
+            source.stop()
+            self._l1_source = None
+        return True
 
     @callback
     def _handle_source_change(self, _event: Any) -> None:
@@ -213,9 +290,15 @@ class OneFuseLoaderController:
         self._stopped = True
         self._generation += 1
         self._pending_refresh = False
+        if self._l1_source is not None:
+            self._l1_source.stop()
+            self._l1_source = None
+        self._l1_source_config = None
+        self._l1_source_error = None
         if self.unsub_states:
             self.unsub_states()
             self.unsub_states = None
+        self._source_entities = ()
         if self.unsub_timer:
             self.unsub_timer()
             self.unsub_timer = None
@@ -234,6 +317,19 @@ class OneFuseLoaderController:
         grid_state = self.hass.states.get(data.get(CONF_L1_ENTITY))
         status_state = self.hass.states.get(data.get(CONF_STATUS_ENTITY))
         current_state = self.hass.states.get(data.get(CONF_CHARGER_CURRENT_ENTITY))
+        grid_value = grid_state.state if grid_state is not None else None
+        grid_report_ts = self._report_timestamp(grid_state)
+        mqtt_snapshot = None
+        if self._l1_source is not None:
+            mqtt_snapshot = self._l1_source.snapshot()
+            grid_value = mqtt_snapshot.current
+            grid_report_ts = mqtt_snapshot.report_ts
+            if mqtt_snapshot.error:
+                errors.append(mqtt_snapshot.error)
+        elif self._l1_source_error:
+            grid_value = None
+            grid_report_ts = None
+            errors.append(self._l1_source_error)
         for label, state, requires_amps in (
             ("L1", grid_state, True), ("Charger status", status_state, False),
             ("Charger current", current_state, True),
@@ -246,7 +342,7 @@ class OneFuseLoaderController:
                 errors.append(f"{label} telemetry is restored and has not been verified live.")
             if requires_amps and attributes.get("unit_of_measurement") != "A":
                 errors.append(f"{label} telemetry must have unit A.")
-        if grid_state is not None:
+        if grid_state is not None and self._l1_source is None and not self._l1_source_error:
             reported = getattr(grid_state, "last_reported", None) or getattr(grid_state, "last_updated", None)
             if not isinstance(reported, datetime) or reported.tzinfo is None:
                 errors.append("L1 telemetry has no trustworthy report timestamp.")
@@ -263,17 +359,31 @@ class OneFuseLoaderController:
             health_error = self._adapter.telemetry_block_reason
             if health_error:
                 errors.append(str(health_error))
-        self._read_source_diagnostics(grid_state, current_state, status_state, health_error, errors)
+        self._read_source_diagnostics(
+            grid_state, current_state, status_state, health_error, errors,
+            grid_value=grid_value, grid_report_ts=grid_report_ts,
+        )
+        self.source_diagnostics.update({
+            "grid_source_kind": "currently_one_validated_mqtt" if self._l1_source_config or self._l1_source_error else "ha_entity_report",
+            "grid_state_reported_at_utc": (self._utc_time(getattr(grid_state, "last_reported", None)).isoformat()
+                                           if self._utc_time(getattr(grid_state, "last_reported", None)) else None),
+            "grid_mqtt_received_at_utc": (datetime.fromtimestamp(mqtt_snapshot.receipt_ts, timezone.utc).isoformat()
+                                          if mqtt_snapshot and mqtt_snapshot.receipt_ts is not None else None),
+            "grid_mqtt_sample_at_utc": (datetime.fromtimestamp(mqtt_snapshot.sample_ts, timezone.utc).isoformat()
+                                        if mqtt_snapshot and mqtt_snapshot.sample_ts is not None else None),
+        })
+        if self._l1_source_config or self._l1_source_error:
+            self.source_diagnostics["report_time_scope"] = "grid_validated_mqtt_sample_and_receipt;easee_ha_receipt_not_physical_acquisition"
         return RegulatorInput(
             now_ts=self.hass.loop.time(),
             status=str(status_state.state if status_state is not None else "unknown"),
-            grid_l1=grid_state.state if grid_state is not None else None,
+            grid_l1=grid_value,
             grid_l2=_get_state_value(self.hass, data.get(CONF_L2_ENTITY)),
             grid_l3=_get_state_value(self.hass, data.get(CONF_L3_ENTITY)),
             charger_current=current_state.state if current_state is not None else None,
             data_valid=not errors,
             data_error=" ".join(errors) or None,
-            grid_report_ts=self._report_timestamp(grid_state),
+            grid_report_ts=grid_report_ts,
             charger_report_ts=self._report_timestamp(current_state),
             wall_now_ts=datetime.now(timezone.utc).timestamp(),
         )
@@ -295,7 +405,8 @@ class OneFuseLoaderController:
         return value.astimezone(timezone.utc)
 
     def _read_source_diagnostics(self, grid: Any, current: Any, status: Any,
-                                 health_error: str | None, input_errors: list[str]) -> None:
+                                 health_error: str | None, input_errors: list[str], *,
+                                 grid_value: Any = None, grid_report_ts: float | None = None) -> None:
         """Read only whitelisted cached HA attributes from the selected device.
 
         A state report is HA receipt/publication time, not the measurement's
@@ -307,7 +418,7 @@ class OneFuseLoaderController:
         for label, state in (("L1", grid), ("Charger current", current)):
             if state is None:
                 continue  # Missing-state detail already comes from _read_input.
-            value = getattr(state, "state", None)
+            value = grid_value if label == "L1" else getattr(state, "state", None)
             try:
                 valid = not isinstance(value, bool) and isfinite(float(value)) and float(value) >= 0
             except (TypeError, ValueError, OverflowError):
@@ -330,7 +441,9 @@ class OneFuseLoaderController:
             "reported_circuit_available": False,
         }
         for name, state in (("grid", grid), ("charger_current", current), ("charger_status", status)):
-            reported = self._utc_time(getattr(state, "last_reported", None))
+            reported = (datetime.fromtimestamp(grid_report_ts, timezone.utc)
+                        if name == "grid" and grid_report_ts is not None
+                        else self._utc_time(getattr(state, "last_reported", None)) if name != "grid" else None)
             diagnostics[f"{name}_reported_at_utc"] = reported.isoformat() if reported else None
         try:
             registry = er.async_get(self.hass)
@@ -412,6 +525,11 @@ class OneFuseLoaderController:
             await self._async_tick_locked()
 
     async def _async_tick_locked(self) -> None:
+        # Recheck public identity metadata as well as entry updates. A renamed,
+        # rebound or removed source cannot leave an old MQTT subscription live.
+        await self._async_configure_l1_source_locked()
+        if self._stopped:
+            return
         # BMW is optional advisory context. Failure cannot stop or delay the
         # local meter/Easee regulator and never causes a BMW API request.
         try:
@@ -430,6 +548,8 @@ class OneFuseLoaderController:
                 await asyncio.wait_for(self._budget_store.async_save(exposure), EXPOSURE_STORE_TIMEOUT_SECONDS)
             except Exception:
                 self._budget_error = "overload_budget_save_failed"
+        if self._stopped:
+            return
         if self.settings.overload_enabled and decision.current_p1 > 0 and (
             self._budget_error or (
                 decision.mode.removeprefix("dry_run_").startswith("overload")

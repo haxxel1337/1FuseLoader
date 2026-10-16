@@ -1,7 +1,7 @@
 {
   "domain": "1fuseloader",
   "name": "1FuseLoader",
-  "version": "0.4.0b6",
+  "version": "0.4.0b7",
   "codeowners": [
     "@haxxel1337"
   ],
@@ -10,7 +10,8 @@
   "integration_type": "service",
   "dependencies": [],
   "after_dependencies": [
-    "easee"
+    "easee",
+    "mqtt"
   ],
   "documentation": "https://github.com/haxxel1337/1FuseLoader",
   "iot_class": "local_polling",

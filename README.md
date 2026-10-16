@@ -109,7 +109,8 @@ Takeover of an already charging session starts at its measured current rather
 than jumping to the maximum. A submitted reduction must be observed before a
 rise is allowed; renewing its TTL does not reset ramp timers.
 
-When observed EV reduction arrives before a new grid report, the regulator can
+When observed EV reduction, including a partial response that has not yet reached
+the requested cap, arrives before a new grid report, the regulator can
 briefly retain the already accepted lower cap while waiting for alignment
 (default 10 seconds, configurable). Any new grid report is evaluated immediately;
 invalid/stale telemetry still requests zero. This is a report-alignment window,
@@ -182,6 +183,13 @@ timeout, untrustworthy telemetry or exhausted budget requests zero rather than
 starting another grace window. It never increases EV current or starts an
 idle car merely to use the experimental overload allowance.
 
+A high grid report from an intermediate EV response cannot prove that the final
+minimum-current response exceeded the ceiling. If the EV reaches its minimum
+after that grid report, the controller waits for matching grid feedback within
+the same original response deadline. A grid value already at or below the
+ceiling is conservative while the EV is still reducing; a subsequent grid report
+above the ceiling after the minimum response still stops immediately.
+
 Exposure is cumulative rather than a thermal cooling estimate. The controller
 persists its budget and unresolved exposure across unload/restart and setting
 changes; a short dip below the fuse rating, toggling the switch or restarting HA
@@ -205,7 +213,15 @@ been checked. Settings are capped at a 4 A margin, 1800 s budget, 38 A peak
 and 10 s response window; lowering them does not erase prior exposure.
 
 Missing, invalid, restored or stale grid data resets the guard timers and
-requests 0 A when control is enabled. Grid freshness uses `State.last_reported`.
+requests 0 A when control is enabled. For a verified Currently One MQTT device,
+the controller validates L1 directly from received device frames and requires
+an advancing source timestamp. Repeated identical L1 values can therefore renew
+freshness and provide report alignment even when HA suppresses unchanged sensor
+state writes. Retained messages, invalid L1 values, replayed/stale timestamps and
+connection loss cannot renew this source. This adapter only supports the verified
+vendor identity and protocol; it does not infer L1 freshness from another phase,
+power sensor or broker connection alone. Other grid sources continue to use
+`State.last_reported`.
 Easee status/current are event driven, so their unchanged state timestamps are
 not used as heartbeats; the adapter checks the charger's online state, SignalR
 connection and latest received stream pulse instead. The default age limit is
