@@ -379,6 +379,113 @@ class ControllerSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.message_unsubscribed, self.connection_unsubscribed), (1, 1))
         self.assertIsNone(self.controller._l1_source)
 
+    async def stop_while_startup_is_waiting(self, entered, gate):
+        starting = asyncio.create_task(self.controller.async_start())
+        await entered.wait()
+        stopping = asyncio.create_task(self.controller.async_stop())
+        await asyncio.sleep(0)
+        self.assertTrue(self.controller._stopped)
+        gate.set()
+        await asyncio.gather(starting, stopping)
+        self.assertIsNone(self.controller.unsub_timer)
+        self.assertIsNone(self.controller.unsub_states)
+        self.assertIsNone(self.controller._l1_source)
+
+    async def test_full_start_stop_during_source_subscription_cannot_install_late_timer(self):
+        entered, gate = asyncio.Event(), asyncio.Event()
+
+        async def subscribe(*args, **kwargs):
+            entered.set()
+            await gate.wait()
+            return self.unsubscribe_messages
+
+        self.modules["homeassistant.components"].mqtt.async_subscribe = subscribe
+        self.controller._budget_loaded = True
+        initialize = AsyncMock()
+        self.controller._adapter.async_initialize = initialize
+        state_unsubscribe = Mock()
+        with patch.object(self.runtime, "async_track_time_interval") as timer, \
+                patch.object(self.runtime, "async_track_state_change_event", return_value=state_unsubscribe):
+            await self.stop_while_startup_is_waiting(entered, gate)
+            timer.assert_not_called()
+            state_unsubscribe.assert_called_once_with()
+        initialize.assert_not_awaited()
+        self.assertEqual(self.controller._adapter.calls, [])
+        self.assertEqual((self.message_unsubscribed, self.connection_unsubscribed), (1, 1))
+
+    async def test_full_start_stop_during_budget_load_cannot_add_listeners(self):
+        entered, gate = asyncio.Event(), asyncio.Event()
+
+        async def load():
+            entered.set()
+            await gate.wait()
+
+        self.controller._budget_store.async_load = load
+        with patch.object(self.runtime, "async_track_time_interval") as timer, \
+                patch.object(self.runtime, "async_track_state_change_event") as states:
+            await self.stop_while_startup_is_waiting(entered, gate)
+            timer.assert_not_called()
+            states.assert_not_called()
+        self.assertEqual(self.controller._adapter.calls, [])
+
+    async def test_full_start_stop_during_adapter_initialize_cannot_tick_or_register_timer(self):
+        entered, gate = asyncio.Event(), asyncio.Event()
+
+        async def initialize():
+            entered.set()
+            await gate.wait()
+
+        self.controller._budget_loaded = True
+        self.controller._adapter.async_initialize = initialize
+        with patch.object(self.runtime, "async_track_time_interval") as timer:
+            await self.stop_while_startup_is_waiting(entered, gate)
+            timer.assert_not_called()
+        self.assertEqual(self.controller._adapter.calls, [])
+        self.assertEqual((self.message_unsubscribed, self.connection_unsubscribed), (1, 1))
+
+    async def test_full_start_stop_during_first_command_waits_without_installing_timer(self):
+        self.entity.platform = "other_integration"
+        self.controller._budget_loaded = True
+        self.controller._adapter.gate = asyncio.Event()
+        with patch.object(self.runtime, "async_track_time_interval") as timer:
+            await self.stop_while_startup_is_waiting(self.controller._adapter.entered, self.controller._adapter.gate)
+            timer.assert_not_called()
+        # The command was already in flight before stop; no subsequent command
+        # or watchdog is allowed after its completion.
+        self.assertEqual(len(self.controller._adapter.calls), 1)
+
+    async def test_full_start_stop_during_exposure_save_does_not_start_a_command(self):
+        entered, gate = asyncio.Event(), asyncio.Event()
+
+        async def save(_data):
+            entered.set()
+            await gate.wait()
+
+        self.entity.platform = "other_integration"
+        self.controller._budget_loaded = True
+        self.controller.entry.options["overload_enabled"] = True
+        self.controller._budget_store.async_save = save
+        with patch.object(self.runtime, "async_track_time_interval") as timer:
+            await self.stop_while_startup_is_waiting(entered, gate)
+            timer.assert_not_called()
+        self.assertEqual(self.controller._adapter.calls, [])
+
+    async def test_normal_full_start_registers_one_timer_and_stop_cleans_every_listener(self):
+        self.controller.entry.options.update(active_control=False, dry_run=True)
+        timer_unsubscribe = Mock()
+        state_unsubscribe = Mock()
+        with patch.object(self.runtime, "async_track_time_interval", return_value=timer_unsubscribe) as timer, \
+                patch.object(self.runtime, "async_track_state_change_event", return_value=state_unsubscribe) as states:
+            await self.controller.async_start()
+            self.assertFalse(self.controller._stopped)
+            timer.assert_called_once()
+            states.assert_called_once()
+            self.assertIsNotNone(self.controller._l1_source)
+            await self.controller.async_stop()
+            timer_unsubscribe.assert_called_once_with()
+            state_unsubscribe.assert_called_once_with()
+        self.assertEqual((self.message_unsubscribed, self.connection_unsubscribed), (1, 1))
+
 
 @unittest.skipUnless(HAS_HA, "Real Home Assistant is installed in the CI job")
 class RealHAMqttApiTests(unittest.IsolatedAsyncioTestCase):

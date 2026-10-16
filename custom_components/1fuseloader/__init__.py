@@ -162,8 +162,12 @@ class OneFuseLoaderController:
                 except Exception:
                     self._budget_error = "overload_budget_restore_failed"
                 self._budget_loaded = True
+            if self._stopped:
+                return
             self._subscribe_source_entities()
             await self._async_configure_l1_source_locked()
+            if self._stopped:
+                return
             # Preserve the user's active/dry-run preferences across HA restarts.
             # Pause ownership is deliberately memory-only, so a restart cannot
             # resume a car which a person may have paused in the meantime.
@@ -175,7 +179,14 @@ class OneFuseLoaderController:
             except Exception as err:
                 self.control_block_reason = f"Easee adapter initialization failed ({type(err).__name__})."
                 _LOGGER.warning("1FuseLoader adapter initialization failed (%s)", type(err).__name__)
+            if self._stopped:
+                return
             await self._async_tick_locked()
+            # async_stop marks stopped before waiting for this lock. It may
+            # already have removed listeners while any startup await yielded;
+            # never install a new watchdog after that cleanup has run.
+            if self._stopped:
+                return
             interval = int((self.entry.options or DEFAULT_OPTIONS).get("poll_interval_seconds", 5))
 
             async def interval_tick(_now: datetime) -> None:
@@ -517,6 +528,8 @@ class OneFuseLoaderController:
         # Recheck public identity metadata as well as entry updates. A renamed,
         # rebound or removed source cannot leave an old MQTT subscription live.
         await self._async_configure_l1_source_locked()
+        if self._stopped:
+            return
         # BMW is optional advisory context. Failure cannot stop or delay the
         # local meter/Easee regulator and never causes a BMW API request.
         try:
@@ -535,6 +548,8 @@ class OneFuseLoaderController:
                 await asyncio.wait_for(self._budget_store.async_save(exposure), EXPOSURE_STORE_TIMEOUT_SECONDS)
             except Exception:
                 self._budget_error = "overload_budget_save_failed"
+        if self._stopped:
+            return
         if self.settings.overload_enabled and decision.current_p1 > 0 and (
             self._budget_error or (
                 decision.mode.removeprefix("dry_run_").startswith("overload")
