@@ -1,13 +1,13 @@
 {
   "domain": "1fuseloader",
   "name": "1FuseLoader",
-  "version": "0.4.0b4",
+  "version": "0.4.0b5",
   "codeowners": [
     "@haxxel1337"
   ],
   "config_flow": true,
   "single_config_entry": true,
-  "integration_type": "helper",
+  "integration_type": "service",
   "dependencies": [],
   "after_dependencies": [
     "easee"

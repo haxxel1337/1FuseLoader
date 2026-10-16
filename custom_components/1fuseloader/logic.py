@@ -18,6 +18,12 @@ ALLOWED_RESUME_STATUSES = {
 }
 IDLE_STATUSES = {"disconnected", "completed"}
 PAUSED_STATUSES = {"paused"}
+# These states must retain the charger's own authorization/schedule/pause policy.
+START_ALLOWED_STATUSES = {
+    "charging", "start_charging", "ready_to_charge", "awaiting_start",
+    "awaiting_load_balancing", "connected", "buffering",
+}
+START_RESPONSE_DIAGNOSTIC_SECONDS = 300
 
 
 def _valid_number(value: object, default: Optional[float] = None) -> Optional[float]:
@@ -36,6 +42,7 @@ class RegulatorSettings:
     buffer_amps: float = 2.0
     min_charge_amps: int = 6
     max_charge_amps: int = 16
+    startup_charge_amps: int = 7
     minimum_reserve_amps: float = 0.5
     increase_stable_seconds: int = 30
     increase_interval_seconds: int = 15
@@ -107,6 +114,9 @@ class RegulatorDecision:
     overload_remaining_seconds: float = 0.0
     overload_transition_remaining_seconds: Optional[float] = None
     overload_failure_latched: bool = False
+    startup_charge_amps: int = 7
+    waiting_for_vehicle_seconds: float = 0.0
+    measurement_alignment_remaining_seconds: Optional[float] = None
 
 
 class OneFuseRegulator:
@@ -125,6 +135,8 @@ class OneFuseRegulator:
     def update_settings(self, settings: RegulatorSettings) -> None:
         if settings.controlled_phase != "L1" or settings.unused_phase_current != 0:
             raise ValueError("Only L1 with unused phase currents of 0 A is supported")
+        if type(settings.startup_charge_amps) is not int or not 6 <= settings.startup_charge_amps <= 16:
+            raise ValueError("Startup current must be an integer from 6 to 16 A")
         overload_values = (
             settings.overload_margin_amps, settings.overload_budget_seconds,
             settings.overload_transition_limit_amps, settings.overload_response_seconds,
@@ -142,6 +154,8 @@ class OneFuseRegulator:
             raise ValueError("Enabled overload requires dynamic limiting and a separate transition ceiling")
         self.settings = settings
         self.reset_timers()
+        # An options change cannot extend an alignment deadline using old bounds.
+        self._clear_positive_alignment()
 
     def reset_timers(self) -> None:
         self.above_soft_since: Optional[float] = None
@@ -160,6 +174,7 @@ class OneFuseRegulator:
         self.paused_by_us = False
         self._pause_observed = False
         self._pause_submission_ts: Optional[float] = None
+        self._resume_submission_ts: Optional[float] = None
         self.last_action_ts: Optional[float] = None
         self.last_set_limit_ts: Optional[float] = None
         self.last_target: Optional[tuple[int, int, int, int]] = None
@@ -174,6 +189,114 @@ class OneFuseRegulator:
         self._reduction_grid_ts: Optional[float] = None
         self._reduction_charger_ts: Optional[float] = None
         self._settle_started: Optional[float] = None
+        self._waiting_for_vehicle_since: Optional[float] = None
+        self._last_input_status: Optional[str] = None
+        self._clear_positive_alignment()
+
+    @property
+    def startup_current(self) -> int:
+        """Keep an older installation's configured minimum/maximum authoritative."""
+        s = self.settings
+        return max(s.min_charge_amps, min(s.startup_charge_amps, s.max_charge_amps))
+
+    def _meaningfully_charging(self, status: str, current: float) -> bool:
+        # Idle leakage (around 0.01 A on the audited charger) is not charging.
+        # A vehicle can legitimately taper below the offered 6 A minimum;
+        # distinguish that measured draw from leakage without demanding 6 A.
+        return status == "charging" and current >= 1.0
+
+    def _start_allowed(self, status: str) -> bool:
+        return status in START_ALLOWED_STATUSES or (status == "paused" and self.paused_by_us)
+
+    def _clear_positive_alignment(self) -> None:
+        self._positive_cap: Optional[int] = None
+        self._positive_house: Optional[float] = None
+        self._positive_grid_ts: Optional[float] = None
+        self._positive_ev_ts: Optional[float] = None
+        self._positive_before_current: Optional[float] = None
+        self._positive_response_ts: Optional[float] = None
+        self._positive_response_current: Optional[float] = None
+        self._positive_skew_since: Optional[float] = None
+        self._positive_alignment_used_seconds = 0.0
+
+    def _positive_reports_advanced(self) -> bool:
+        return (self._last_input_grid_ts is not None and self._positive_grid_ts is not None
+                and self._last_input_grid_ts > self._positive_grid_ts
+                and self._last_input_charger_ts is not None and self._positive_ev_ts is not None
+                and self._last_input_charger_ts > self._positive_ev_ts)
+
+    def _positive_alignment(self, now: float, grid: float, current: float,
+                            house: float, status: str) -> Optional[str]:
+        """Align an observed response to our accepted positive cap, once only.
+
+        Receipt times are ordering evidence, not synchronized acquisition times.
+        A delayed EV response may start this short window long after submission.
+        Identical lease renewals never create a new window or move its deadline.
+        The caller must handle invalid data and experimental overload first.
+        """
+        cap = self._positive_cap
+        if cap is None:
+            return None
+        s = self.settings
+        # Resume acceptance relinquishes pause ownership immediately. A short
+        # unchanged paused-feedback interval may preserve only this already
+        # accepted cap's measurement context, never permission to resume again.
+        pending_resume_feedback = (status == "paused" and self._resume_submission_ts is not None
+                                   and 0 <= now - self._resume_submission_ts <= 30)
+        if (self.last_target is None or self.last_target[0] != cap
+                or not (self._start_allowed(status) or pending_resume_feedback)):
+            self._clear_positive_alignment()
+            return None
+        if current > cap + 0.5:
+            self._clear_positive_alignment()
+            return "excess_current"
+        # Never hide a fresh high grid reading behind a prior low-load anchor.
+        if grid > s.main_fuse_amps - s.buffer_amps:
+            self._clear_positive_alignment()
+            return None
+        anchor = self._positive_house
+        if anchor is None or anchor + cap > s.main_fuse_amps - s.buffer_amps:
+            self._clear_positive_alignment()
+            return None
+        ev_advanced = (self._last_input_charger_ts is not None and self._positive_ev_ts is not None
+                       and self._last_input_charger_ts > self._positive_ev_ts)
+        increased = current > (self._positive_before_current or 0.0) + 0.5
+        if (ev_advanced and increased and (self._positive_response_current is None
+                or current > self._positive_response_current + 0.5)):
+            self._positive_response_ts = self._last_input_charger_ts
+            self._positive_response_current = current
+        if self._positive_response_ts is None:
+            # Before the observed rise, a newer household load may reduce the
+            # safe target normally. It must never be subtracted away later.
+            self._positive_house = max(anchor, house)
+            return None
+        settle = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+        active_elapsed = (now - self._positive_skew_since
+                          if self._positive_skew_since is not None else 0.0)
+        if self._positive_alignment_used_seconds + active_elapsed >= settle:
+            self._clear_positive_alignment()
+            return "timeout"
+        grid_after_response = (self._last_input_grid_ts is not None
+                               and self._last_input_grid_ts > self._positive_response_ts)
+        if grid_after_response and current <= grid + 1:
+            if current >= cap - 0.5 and self._meaningfully_charging(status, current):
+                self._clear_positive_alignment()
+                self._increase_since = None
+            else:
+                # Stop this coherent partial-response episode's clock, but
+                # retain its spent budget and the EV response high-water mark.
+                # Only a distinct further EV rise can open another episode;
+                # identical reports and lease renewals refund no uncertainty.
+                self._positive_alignment_used_seconds += active_elapsed
+                self._positive_skew_since = None
+                self._positive_response_ts = None
+            # A coherent partial/tapered current is not a failed start and
+            # must not cause timed zero/start retries. Retain eligibility for
+            # the rest of this same accepted rise, without renewing any grace.
+            return None
+        if self._positive_skew_since is None:
+            self._positive_skew_since = now
+        return "hold"
 
     def reset_overload_budget(self) -> None:
         """Explicit new exposure state; never call for settings or HA reloads.
@@ -359,6 +482,20 @@ class OneFuseRegulator:
             changed = old_target != target
             if changed:
                 self._last_limit_change_ts = now_ts
+                self._clear_positive_alignment()
+                # Only a genuinely changed, accepted increase may establish
+                # alignment context. Failed calls and identical TTL renewals do
+                # not acknowledge physical response or reset the grace period.
+                if (target > 0 and (old_target is None or target > old_target)
+                        and target > decision.charger_current + 0.5
+                        and self._last_input_grid_ts is not None
+                        and self._last_input_charger_ts is not None
+                        and decision.house_load_l1 + target <= self.settings.main_fuse_amps - self.settings.buffer_amps):
+                    self._positive_cap = target
+                    self._positive_house = decision.house_load_l1
+                    self._positive_grid_ts = self._last_input_grid_ts
+                    self._positive_ev_ts = self._last_input_charger_ts
+                    self._positive_before_current = decision.charger_current
             if changed and (target < decision.charger_current or
                             (old_target is not None and target < old_target)):
                 # A submitted cap is not a measured current. Retain the last
@@ -373,6 +510,7 @@ class OneFuseRegulator:
                 self._last_increase_ts = now_ts
             if target == 0:
                 self._restart_required = True
+                self._waiting_for_vehicle_since = None
             elif self._restart_required:
                 self._restart_required = False
                 self._restart_ready_since = None
@@ -381,6 +519,8 @@ class OneFuseRegulator:
                 decision.current_p1, decision.current_p2, decision.current_p3, decision.ttl_seconds
             )
         elif decision.command == "pause":
+            self._clear_positive_alignment()
+            self._resume_submission_ts = None
             self.paused_by_us = True
             self._restart_required = True
             self._restart_ready_since = None
@@ -391,6 +531,7 @@ class OneFuseRegulator:
             self.paused_by_us = False
             self._pause_observed = False
             self._pause_submission_ts = None
+            self._resume_submission_ts = now_ts
             self.below_resume_since = None
 
     def calculate_available_l1(self, grid_l1: Optional[float], charger_current: float) -> tuple[int, float]:
@@ -411,7 +552,7 @@ class OneFuseRegulator:
         intentionally permits total estimated current above the fuse rating.
         """
         s = self.settings
-        physically_charging = status == "charging" and current > 0
+        physically_charging = self._meaningfully_charging(status, current)
         reserve = min(s.buffer_amps, max(0.0, s.minimum_reserve_amps))
         if (allow_minimum and desired < s.min_charge_amps and physically_charging
                 and house + s.min_charge_amps <= s.main_fuse_amps - reserve):
@@ -428,15 +569,16 @@ class OneFuseRegulator:
         # continuous observation period. Borrowing buffer is for continuity.
         if self.last_target is None and not physically_charging:
             self._restart_required = True
+        startup = self.startup_current if self._start_allowed(status) else s.min_charge_amps
         if self._restart_required:
             self._increase_since = None
             self._previous_desired = desired
             ready = self._timer_reached(
-                now, "_restart_ready_since", available >= s.min_charge_amps
+                now, "_restart_ready_since", available >= startup and desired >= startup
                 and self._awaiting_reduction_target is None,
                 s.restart_stable_seconds,
             )
-            return s.min_charge_amps if ready else 0
+            return startup if ready else 0
 
         if self.last_target is None:
             # On takeover, do not interpret unused headroom as permission for
@@ -447,6 +589,25 @@ class OneFuseRegulator:
             return min(desired, base)
 
         base = self.last_target[0]
+        if not physically_charging:
+            self._increase_since = None
+            self._previous_desired = desired
+            if not self._start_allowed(status):
+                # Setting a safe cap must not bypass a schedule, authorization,
+                # Equalizer hold or somebody else's manual pause.
+                self._restart_ready_since = None
+                return min(desired, base)
+            if base < startup:
+                ready = self._timer_reached(
+                    now, "_restart_ready_since", desired >= startup and available >= startup
+                    and self._awaiting_reduction_target is None,
+                    s.restart_stable_seconds,
+                )
+                return startup if ready else min(desired, base)
+            # Keep one stable startup offer. No timed 7->6 pulse and no ramp to
+            # maximum while the vehicle continues reporting a waiting state.
+            self._restart_ready_since = None
+            return min(desired, startup)
         if desired <= base:
             self._increase_since = None
             self._previous_desired = desired
@@ -454,7 +615,8 @@ class OneFuseRegulator:
 
         load_rose = self._previous_desired is not None and desired < self._previous_desired
         self._previous_desired = desired
-        if (not physically_charging or self._awaiting_reduction_target is not None
+        if (self._awaiting_reduction_target is not None
+                or (self._positive_cap is not None and not self._positive_reports_advanced())
                 or load_rose):
             self._increase_since = None
             return max(s.min_charge_amps, base)
@@ -490,6 +652,9 @@ class OneFuseRegulator:
         observed_now = _valid_number(inp.now_ts)
         now = observed_now if observed_now is not None else 0.0
         status = (inp.status or "").strip().lower()
+        self._last_input_status = status
+        if status != "paused":
+            self._resume_submission_ts = None
         grid = _valid_number(inp.grid_l1)
         current = _valid_number(inp.charger_current)
         self._last_input_grid_ts = _valid_number(inp.grid_report_ts)
@@ -524,6 +689,13 @@ class OneFuseRegulator:
                     max(0.0, s.overload_response_seconds - (now - self._overload_transition_started))
                     if self._overload_transition_started is not None else None),
                 overload_failure_latched=self._overload_failure_reason is not None,
+                startup_charge_amps=self.startup_current,
+                waiting_for_vehicle_seconds=(max(0.0, now - self._waiting_for_vehicle_since)
+                                             if self._waiting_for_vehicle_since is not None else 0.0),
+                measurement_alignment_remaining_seconds=(
+                    max(0.0, min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+                        - self._positive_alignment_used_seconds - (now - self._positive_skew_since))
+                    if self._positive_skew_since is not None else None),
             )
 
         error = inp.data_error
@@ -543,6 +715,9 @@ class OneFuseRegulator:
                 self._clear_overload_transition()
                 self._overload_hold_active = False
             self.reset_timers()
+            self._clear_positive_alignment()
+            self._resume_submission_ts = None
+            self._waiting_for_vehicle_since = None
             self._restart_required = True
             return decision("unavailable", f"{error} Requesting 0 A; cloud control is best effort.",
                             "set_limit", emergency=True)
@@ -555,10 +730,13 @@ class OneFuseRegulator:
             self.paused_by_us = False
             self._pause_observed = False
             self._pause_submission_ts = None
+            self._resume_submission_ts = None
             self.reset_timers()
             self._restart_required = True
             self._awaiting_reduction_target = None
             self._house_before_reduction = None
+            self._clear_positive_alignment()
+            self._waiting_for_vehicle_since = None
             return decision("idle", f"Status '{status}' does not require charge control.")
 
         assert grid is not None
@@ -569,6 +747,58 @@ class OneFuseRegulator:
             # Overload leases must be one minute. The controller additionally
             # refuses a positive lease too close to budget/deadline expiry.
             return decision(mode, reason, "set_limit", target, 60, emergency=True)
+        physically_charging = self._meaningfully_charging(status, current)
+        if physically_charging:
+            self._waiting_for_vehicle_since = None
+        elif (self.last_target is not None and self.last_target[0] > 0
+              and self._waiting_for_vehicle_since is None):
+            self._waiting_for_vehicle_since = now
+        # A retained positive EV value during a waiting state is not permission
+        # to subtract it from the household load and offer a higher start cap.
+        if not physically_charging:
+            available, house = self.calculate_available_l1(grid, 0.0)
+        alignment = self._positive_alignment(now, grid, current, house, status)
+        if alignment in {"timeout", "excess_current"}:
+            self.reset_timers()
+            self._restart_required = True
+            return decision("unavailable", f"Positive-current measurement alignment {alignment}; requesting 0 A.",
+                            "set_limit", emergency=True)
+        if alignment == "hold":
+            assert self._positive_cap is not None and self.last_target is not None
+            house = max(house, self._positive_house or 0.0)
+            raw_available = s.main_fuse_amps - house - s.buffer_amps
+            available = (int(floor(min(raw_available, s.max_charge_amps)))
+                         if raw_available >= s.min_charge_amps else 0)
+            if house + self._positive_cap > s.main_fuse_amps - s.buffer_amps:
+                self._clear_positive_alignment()
+                self.reset_timers()
+                self._restart_required = True
+                return decision("unavailable", "Positive-current alignment exceeds buffered headroom; requesting 0 A.",
+                                "set_limit", emergency=True)
+            # Still observe real grid guards during the hold. No resume or new
+            # rise is reachable until post-response source reports agree.
+            soft_during_alignment = self._timer_reached(
+                now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+            pause_during_alignment = self._timer_reached(
+                now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+            self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+            self._increase_since = None
+            if (s.enable_pause_resume and pause_during_alignment
+                    and status in {"charging", "start_charging"}):
+                return decision("pause", "L1 has exceeded the pause threshold for its full observation period.", "pause")
+            if s.enable_soft_guard and soft_during_alignment and s.soft_current_amps < self._positive_cap:
+                soft_target = max(0, s.soft_current_amps)
+                if soft_target < s.min_charge_amps:
+                    soft_target = 0
+                return decision("soft_limit", "Soft guard overrides positive-current alignment.",
+                                "set_limit", soft_target, s.soft_ttl_seconds, emergency=True)
+            return decision("settling", "Holding the accepted positive cap briefly while EV and grid reports align.",
+                            "set_limit", self._positive_cap, self.last_target[3])
+        if self._positive_cap is not None:
+            house = max(house, self._positive_house or 0.0)
+            raw_available = s.main_fuse_amps - house - s.buffer_amps
+            available = (int(floor(min(raw_available, s.max_charge_amps)))
+                         if raw_available >= s.min_charge_amps else 0)
         if current > grid + 1:
             # The grid can report the reduction before the EV source does.
             # Hold only our accepted lower cap, with enough headroom even if
@@ -687,9 +917,32 @@ class OneFuseRegulator:
             mode = "ramp_up"
             reason = f"Limiting recovery to {target} A while load stabilizes and current rises gradually."
 
-        if s.enable_pause_resume and self.paused_by_us and status in ALLOWED_RESUME_STATUSES and resume:
+        if not physically_charging:
+            startup = self.startup_current
+            if not self._start_allowed(status):
+                mode = "waiting_for_vehicle"
+                reason = f"Retaining a safe cap while charger status '{status}' controls authorization, schedule or pause."
+            elif available < startup or (0 < target < startup):
+                mode = "start_headroom_wait"
+                reason = f"Waiting for full buffered headroom for the configured {startup} A start; no stale EV current is subtracted."
+            elif target > 0:
+                stalled = (self._waiting_for_vehicle_since is not None
+                           and now - self._waiting_for_vehicle_since >= START_RESPONSE_DIAGNOSTIC_SECONDS)
+                mode = "waiting_for_vehicle_stalled" if stalled else (
+                    "starting" if self.last_target is None or self.last_target[0] != target else "waiting_for_vehicle")
+                reason = (f"Keeping a stable {target} A start offer; waiting for actual charging. "
+                          "No automatic start/stop retry is issued.")
+
+        if (s.enable_pause_resume and self.paused_by_us and status in ALLOWED_RESUME_STATUSES
+                and self._start_allowed(status) and resume):
             if target < s.min_charge_amps:
                 return decision("paused", "Resume inhibited: insufficient verified charging headroom.", "set_limit", 0, ttl)
+            if target < self.startup_current or available < self.startup_current:
+                return decision(
+                    "start_headroom_wait",
+                    f"Resume inhibited: the configured {self.startup_current} A startup requires full buffered headroom and a safe accepted start cap.",
+                    "set_limit", target, ttl,
+                )
             fresh_cap = (self.last_target == (target, 0, 0, ttl)
                          and self.last_set_limit_ts is not None
                          and now - self.last_set_limit_ts < ttl / 2)

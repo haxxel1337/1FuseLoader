@@ -20,6 +20,9 @@ SPEC.loader.exec_module(logic)
 
 class ContinuityTests(unittest.TestCase):
     def regulator(self, **options):
+        # Keep the original 6 A start policy scenarios explicit; the separate
+        # startup/alignment suite covers the new default and start/run split.
+        options.setdefault("startup_charge_amps", 6)
         return logic.OneFuseRegulator(logic.RegulatorSettings(
             active_control=True, dry_run=False, **options,
         ))

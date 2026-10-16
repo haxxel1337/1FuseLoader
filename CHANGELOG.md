@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0b5
+
+- Separate the default 7 A startup offer from the 6 A running minimum; require
+  full buffered startup headroom, respect configured bounds and do not ramp
+  indefinitely while the vehicle is waiting. Expose starting/waiting/stalled
+  diagnostics without adding explicit start or schedule-override commands.
+- Bound positive-start/increase report alignment as well as reduction alignment;
+  retain conservative house-load estimates and prevent further rises while
+  sources catch up. TTL renewals cannot extend the mismatch deadline.
+- Retain actual command attempt/acceptance receipts, expose explicit circuit P1
+  readback and source health, and distinguish these from physical EV current.
+- Classify the integration and logical device as a service so an existing entry
+  appears under Integrations rather than Helpers, preserving identifiers.
+- Add regression coverage for startup, report ordering, protections, diagnostics
+  and additive settings. Physical charging acceptance remains a supervised step;
+  the separate experimental overload policy is unchanged.
+
 ## 0.4.0b4
 
 - Add a disabled-by-default experimental timed-overload profile: request minimum

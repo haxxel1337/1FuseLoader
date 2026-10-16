@@ -86,7 +86,15 @@ For the default 25 A fuse and 2 A normal buffer:
 Decreases run as soon as a source state change is received, with a coalesced
 latest-snapshot worker and a 5-second watchdog. Increases wait for 30 seconds
 of stable headroom and then rise at most 1 A per 15 seconds. Recovery after a
-zero cap requires 60 seconds of stable buffered headroom and starts at 6 A.
+zero cap requires 60 seconds of stable buffered headroom. Starting a waiting
+vehicle uses the separate **Startup Charge** setting (default 7 A), bounded by
+the configured minimum and maximum. Continuing a session can still use 6 A.
+The full normal buffer must fit the startup offer; idle EV readings are not
+subtracted to manufacture spare capacity. A waiting vehicle receives no blind
+ramp to maximum and no short 7-to-6 A pulse. `starting`, `waiting_for_vehicle`,
+`start_headroom_wait` and `waiting_for_vehicle_stalled` distinguish the observed
+waiting conditions; the stalled state is diagnostic and does not trigger
+repeated stop/start commands.
 Takeover of an already charging session starts at its measured current rather
 than jumping to the maximum. A submitted reduction must be observed before a
 rise is allowed; renewing its TTL does not reset ramp timers.
@@ -96,7 +104,14 @@ briefly retain the already accepted lower cap while waiting for alignment
 (default 10 seconds, configurable). Any new grid report is evaluated immediately;
 invalid/stale telemetry still requests zero. This is a report-alignment window,
 not permission to overload a fuse. Verify real meter cadence and vehicle response
-before takeover. Experimental timed overload is a separate, disabled-by-default
+before takeover. Positive starts/increases also retain the preceding coherent
+house estimate while current reports catch up. Their alignment window starts
+at the first qualifying report mismatch. Coherent partial response pauses the
+cumulative mismatch budget; a later increase uses only the remaining time.
+Identical values and TTL submissions cannot replenish that budget. Alignment
+cannot permit another increase or a resume. Invalid data,
+an exceeded nominal budget or an expired window still requests zero.
+Experimental timed overload is a separate, disabled-by-default
 option described below; the report-alignment window alone does not enable it.
 
 The opposite report order can also briefly pair a newer low grid current with
@@ -228,10 +243,20 @@ It does not create, store or read a separate API token, or modify Easee files.
 An unknown version or missing expected object blocks control with a diagnostic
 reason. Dry Run remains available for observation.
 
-`Command Result` and `Last Command` distinguish a proposed action from an API
-accepted submission. API acceptance is not confirmation of physical charger
-current. Failed submissions remain eligible for retry; decisions and writes
-are serialized, and disabling control cancels queued decisions.
+`Command Result` describes the latest evaluation and may be `not_sent` while no
+write is needed. **Last Command Attempt Result** retains the last actual
+attempt, accepted-command and accepted-limit receipts for the current runtime,
+including their UTC times and sanitized error class. **Reported Circuit P1**
+reads explicit phase attributes from the selected Easee device; Easee's generic
+Dynamic Circuit Limit is the maximum across phases, not necessarily P1.
+**Source Health** exposes required-source validity and HA receipt times. Compute
+ages from these timestamps; a stable event-driven value can be older than the
+healthy stream pulse. BMW source time is separate and advisory.
+
+API acceptance, matching cached limit readback and measured EV current are
+different evidence. A matching report does not prove physical current response
+or device TTL renewal. Failed submissions remain eligible for retry; decisions
+and writes are serialized, and disabling control cancels queued decisions.
 
 This remains a cloud dependent soft regulator. If HA, the network or Easee is
 unreachable, a 0 A request may not reach the charger. A finite dynamic limit can
@@ -263,11 +288,26 @@ manually editing `.storage`.
 ## HACS prerelease installation
 
 Add `https://github.com/haxxel1337/1FuseLoader` as a custom **Integration**
-repository in HACS. For the experimental **v0.4.0b4** release, open the
+repository in HACS. For the **v0.4.0b5 prerelease**, open the
 repository's download/redownload dialog, enable beta/prerelease versions and
 select that exact version. Confirm HACS reports the installed version, then
 restart Home Assistant with the operator's approval. Existing UI configuration
-is retained. New overload settings remain off until explicitly enabled.
+is retained. The integration is classified as a **service**, so it appears in
+the normal Integrations list instead of Helpers. Downloaded files and loaded
+runtime can have different versions until restart. GitHub's stable **Latest**
+badge can still refer to v0.3.3 while b5 is available as a prerelease. Existing
+overload opt-in is preserved; this update never enables it automatically.
+
+The startup default addresses a possible Easee 6 A waiting condition; it is not
+proof of the cause of every vehicle stop. Easee recommends 7 A in certain phase
+allocation cases. A short phase-switch 7-to-6 A workaround elsewhere caused
+regressions and was reverted; this integration does not implement that pulse.
+Verify actual current, source alignment and vehicle warnings in supervised
+charging before treating this prerelease as physically validated.
+
+References: [Easee load balancing](https://developer.easee.com/docs/load-balancing),
+[reported short-pulse regression](https://github.com/evcc-io/evcc/issues/33963),
+[revert](https://github.com/evcc-io/evcc/pull/33964).
 
 For an upgrade from a manually copied pilot, back up the component folder first
 and let HACS replace the managed files. Confirm the loaded integration version

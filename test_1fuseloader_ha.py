@@ -48,6 +48,8 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
 
     async def test_all_platforms_import_and_entities_construct(self):
+        from homeassistant.helpers.device_registry import DeviceEntryType
+
         controller = self.component.OneFuseLoaderController(self.hass, self.entry)
         for platform, klass, descriptions in (
             ("sensor", "OneFuseSensor", "SENSOR_DESCRIPTIONS"),
@@ -63,6 +65,9 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
                 entity = getattr(module, klass)(controller, self.entry, description)
                 self.assertIsNotNone(entity.unique_id)
                 self.assertIsNotNone(entity.device_info)
+                self.assertEqual(entity.device_info["entry_type"], DeviceEntryType.SERVICE)
+                self.assertEqual(entity.device_info["identifiers"], {("1fuseloader", self.entry.entry_id)})
+                self.assertEqual(entity.unique_id, f"{self.entry.entry_id}_{description.key}")
 
     async def test_setup_form_uses_current_ha_selectors(self):
         flow = self.flow_module.OneFuseLoaderConfigFlow()
