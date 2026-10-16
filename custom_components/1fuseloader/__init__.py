@@ -275,6 +275,7 @@ class OneFuseLoaderController:
             data_error=" ".join(errors) or None,
             grid_report_ts=self._report_timestamp(grid_state),
             charger_report_ts=self._report_timestamp(current_state),
+            wall_now_ts=datetime.now(timezone.utc).timestamp(),
         )
 
     @staticmethod

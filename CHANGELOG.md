@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0b6
+
+- Default to fast recovery during actual charging: offer buffered available
+  capacity directly, up to the configured maximum, only after fresh and coherent
+  EV/grid reports with no pending limit response. Keep startup and restart
+  hysteresis, immediate reductions and the optional legacy gradual mode.
+- After positive report-alignment timeout, retain only the already accepted cap
+  when raw grid current plus the entire cap still fits the full nominal buffer.
+  This conservative hold permits neither increases nor resume and grants no new
+  mismatch budget. Invalid, stale, missing or excessive current still takes
+  precedence; an insufficient conservative budget still requests zero.
+- Cover the observed partial/full-response timeout sequence and direct recovery
+  with new protection, timestamp and compatibility regressions.
+
 ## 0.4.0b5
 
 - Separate the default 7 A startup offer from the 6 A running minimum; require

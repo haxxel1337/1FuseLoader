@@ -9,11 +9,13 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import os
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from pathlib import Path
 
 HAS_HA = importlib.util.find_spec("homeassistant") is not None
 if os.environ.get("ONEFUSE_REQUIRE_HOMEASSISTANT") and not HAS_HA:
@@ -94,6 +96,47 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(settings.active_control)
         self.assertTrue(settings.dry_run)
         self.assertFalse(settings.force_min_when_available_too_low)
+        self.assertTrue(settings.fast_recovery)
+
+    async def test_fast_recovery_options_field_is_a_validated_boolean(self):
+        self.hass.config_entries = SimpleNamespace(async_get_known_entry=lambda _: self.entry)
+        flow = self.flow_module.OneFuseLoaderOptionsFlow()
+        flow.hass = self.hass
+        flow.handler = self.entry.entry_id
+        result = await flow.async_step_init()
+        fields = result["data_schema"].schema
+        marker = next(key for key in fields if str(key.schema) == "fast_recovery")
+        self.assertTrue(marker.default())
+        self.assertIs(fields[marker], bool)
+        invalid = await flow.async_step_init({"fast_recovery": "false"})
+        self.assertEqual(invalid["type"], "form")
+        self.assertEqual(invalid["errors"].get("base"), "invalid_settings")
+        accepted = await flow.async_step_init({"fast_recovery": False})
+        self.assertEqual(accepted["type"], "create_entry")
+        self.assertIs(accepted["data"]["fast_recovery"], False)
+
+    async def test_fast_recovery_switch_keeps_stable_identity_and_routes_boolean_changes(self):
+        module = importlib.import_module("custom_components.1fuseloader.switch")
+        description = next(item for item in module.SWITCH_DESCRIPTIONS if item.key == "fast_recovery")
+        self.assertEqual(description.name, "Fast Headroom Recovery")
+        controller = SimpleNamespace(async_set_switch=AsyncMock())
+        entity = module.OneFuseSwitch(controller, self.entry, description)
+        self.assertEqual(entity.unique_id, f"{self.entry.entry_id}_fast_recovery")
+        self.assertTrue(entity.is_on)
+        await entity.async_turn_off()
+        controller.async_set_switch.assert_awaited_once_with("fast_recovery", False)
+        controller.async_set_switch.reset_mock()
+        await entity.async_turn_on()
+        controller.async_set_switch.assert_awaited_once_with("fast_recovery", True)
+
+    async def test_fast_recovery_option_is_named_in_all_shipped_languages(self):
+        component = Path(__file__).parent / "custom_components" / "1fuseloader"
+        for filename in ("strings.json", "translations/en.json", "translations/sv.json"):
+            with self.subTest(filename=filename):
+                content = json.loads((component / filename).read_text(encoding="utf-8"))
+                label = content["options"]["step"]["init"]["data"]["fast_recovery"]
+                self.assertIsInstance(label, str)
+                self.assertTrue(label.strip())
 
     async def test_start_timer_and_stop_use_the_ha_event_loop_without_writes(self):
         from homeassistant.core import HassJob, HassJobType
