@@ -40,6 +40,14 @@ class SettingsTests(unittest.TestCase):
     def test_legacy_forced_minimum_is_disabled_on_validation(self):
         self.assertFalse(const.validate_options({"force_min_when_available_too_low": True})["force_min_when_available_too_low"])
 
+    def test_fast_recovery_is_additive_and_boolean(self):
+        self.assertTrue(const.DEFAULT_OPTIONS["fast_recovery"])
+        self.assertTrue(const.validate_options({})["fast_recovery"])
+        self.assertFalse(const.validate_options({"fast_recovery": False})["fast_recovery"])
+        for value in ("true", 1, None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                const.validate_options({"fast_recovery": value})
+
     def test_startup_setting_keeps_legacy_minimum_and_maximum_editable(self):
         options = const.validate_options({})
         self.assertEqual(options["startup_charge_amps"], 7)

@@ -84,8 +84,18 @@ For the default 25 A fuse and 2 A normal buffer:
 | 20 A | 0 A; 6 A would exceed the budget | 20 A |
 
 Decreases run as soon as a source state change is received, with a coalesced
-latest-snapshot worker and a 5-second watchdog. Increases wait for 30 seconds
-of stable headroom and then rise at most 1 A per 15 seconds. Recovery after a
+latest-snapshot worker and a 5-second watchdog. **Fast Headroom Recovery** is
+on by default: during actual charging it can raise directly to buffered
+available current, capped by the configured car maximum. For example, 10 A EV
+draw within 14 A total L1 means an estimated 4 A house load; a 16 A offer would
+project 20 A total and fits a 25 A fuse with a 2 A buffer. The direct rise still
+requires fresh, mutually consistent grid/EV report times and no unobserved
+reduction or positive response. It cannot start a waiting vehicle at maximum.
+
+Turn Fast Headroom Recovery off for the previous gradual mode: increases wait
+for 30 seconds of stable headroom and then rise at most 1 A per 15 seconds.
+Physical/report response can make gradual recovery slower than this minimum
+interval. Recovery after a
 zero cap requires 60 seconds of stable buffered headroom. Starting a waiting
 vehicle uses the separate **Startup Charge** setting (default 7 A), bounded by
 the configured minimum and maximum. Continuing a session can still use 6 A.
@@ -109,8 +119,13 @@ house estimate while current reports catch up. Their alignment window starts
 at the first qualifying report mismatch. Coherent partial response pauses the
 cumulative mismatch budget; a later increase uses only the remaining time.
 Identical values and TTL submissions cannot replenish that budget. Alignment
-cannot permit another increase or a resume. Invalid data,
-an exceeded nominal budget or an expired window still requests zero.
+cannot permit another increase or a resume. Invalid data or an exceeded nominal
+budget still requests zero. After the window expires, one strictly conservative
+hold is possible: **raw grid current plus the entire accepted cap** must fit the
+full normal buffer, without subtracting any EV reading. This hold retains only
+that accepted cap and its spent budget; it permits no increase or resume. New
+coherent feedback releases the hold. If this conservative budget does not fit,
+timeout still requests zero.
 Experimental timed overload is a separate, disabled-by-default
 option described below; the report-alignment window alone does not enable it.
 
@@ -288,7 +303,7 @@ manually editing `.storage`.
 ## HACS prerelease installation
 
 Add `https://github.com/haxxel1337/1FuseLoader` as a custom **Integration**
-repository in HACS. For the **v0.4.0b5 prerelease**, open the
+repository in HACS. For the **v0.4.0b6 prerelease**, open the
 repository's download/redownload dialog, enable beta/prerelease versions and
 select that exact version. Confirm HACS reports the installed version, then
 restart Home Assistant with the operator's approval. Existing UI configuration

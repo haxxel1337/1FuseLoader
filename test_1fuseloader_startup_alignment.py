@@ -20,6 +20,7 @@ SPEC.loader.exec_module(logic)
 
 class StartupAlignmentTests(unittest.TestCase):
     def regulator(self, **settings):
+        settings.setdefault("fast_recovery", False)
         return logic.OneFuseRegulator(logic.RegulatorSettings(
             active_control=True, dry_run=False, **settings))
 
@@ -86,7 +87,7 @@ class StartupAlignmentTests(unittest.TestCase):
         r = self.regulator(startup_charge_amps=6)
         self.sample(r, 0, 2.6, 0.011, "awaiting_start", grid_ts=100, ev_ts=100)
         self.sample(r, 60, 2.6, 0.011, "ready_to_charge", grid_ts=160, ev_ts=160)
-        r.update_settings(logic.RegulatorSettings(active_control=True, dry_run=False, startup_charge_amps=7))
+        r.update_settings(logic.RegulatorSettings(active_control=True, dry_run=False, startup_charge_amps=7, fast_recovery=False))
         self.assertEqual(self.sample(r, 61, 2.6, 0.011, "awaiting_start", grid_ts=161, ev_ts=160).current_p1, 6)
         self.assertEqual(self.sample(r, 120, 2.6, 0.011, "ready_to_charge", grid_ts=220, ev_ts=160).current_p1, 6)
         self.assertEqual(self.sample(r, 121, 2.6, 0.011, "ready_to_charge", grid_ts=221, ev_ts=160).current_p1, 7)
@@ -100,7 +101,7 @@ class StartupAlignmentTests(unittest.TestCase):
         r = self.regulator(startup_charge_amps=6)
         self.sample(r, 0, 17, 0, "awaiting_start")
         self.sample(r, 60, 17, 0, "ready_to_charge")
-        r.update_settings(logic.RegulatorSettings(active_control=True, dry_run=False, startup_charge_amps=7))
+        r.update_settings(logic.RegulatorSettings(active_control=True, dry_run=False, startup_charge_amps=7, fast_recovery=False))
         for at in (61, 121, 600):
             d = self.sample(r, at, 17, 0, "ready_to_charge")
             self.assertEqual((d.mode, d.current_p1), ("start_headroom_wait", 6))
@@ -259,11 +260,11 @@ class StartupAlignmentTests(unittest.TestCase):
         r = self.started(max_charge_amps=7, resend_limit_every_seconds=5)
         self.sample(r, 74, 2.6, 3, grid_ts=173, ev_ts=174)
         self.sample(r, 78, 5.6, 3, grid_ts=178, ev_ts=174)
-        self.sample(r, 180, 5.6, 3, grid_ts=280, ev_ts=280)
-        second = self.sample(r, 181, 5.6, 6, grid_ts=280, ev_ts=281)
+        self.sample(r, 180, 17, 3, grid_ts=280, ev_ts=280)
+        second = self.sample(r, 181, 17, 6, grid_ts=280, ev_ts=281)
         self.assertEqual(second.measurement_alignment_remaining_seconds, 6)
-        self.sample(r, 184, 5.6, 6.6, grid_ts=280, ev_ts=284)
-        late = self.sample(r, 187, 5.6, 7, grid_ts=280, ev_ts=287)
+        self.sample(r, 184, 17, 6.6, grid_ts=280, ev_ts=284)
+        late = self.sample(r, 187, 17, 7, grid_ts=280, ev_ts=287)
         self.assertEqual((late.mode, late.current_p1), ("unavailable", 0))
         self.assertIn("timeout", late.reason)
 
@@ -278,9 +279,105 @@ class StartupAlignmentTests(unittest.TestCase):
     def test_first_grid_confirmation_after_expired_budget_does_not_refund_it(self):
         r = self.started(max_charge_amps=7)
         self.sample(r, 74, 2.6, 7, grid_ts=173, ev_ts=174)
-        late_grid = self.sample(r, 85, 9.6, 7, grid_ts=185, ev_ts=174)
+        late_grid = self.sample(r, 85, 17, 7, grid_ts=185, ev_ts=174)
         self.assertEqual((late_grid.mode, late_grid.current_p1), ("unavailable", 0))
         self.assertIn("timeout", late_grid.reason)
+
+    def slow_grid_start(self, **settings):
+        """Synthetic partial/full response with a later unchanged grid value."""
+        r = self.regulator(**settings)
+        self.sample(r, 0, 8.2, 0.013, "awaiting_start", grid_ts=1000, ev_ts=1000)
+        self.sample(r, 60, 8.2, 0.013, "ready_to_charge", grid_ts=1060, ev_ts=1060)
+        self.sample(r, 354.374, 5, 0.013, grid_ts=1354.374, ev_ts=1060)
+        self.sample(r, 357.343, 5, 5.678, grid_ts=1354.374, ev_ts=1357.343)
+        self.sample(r, 359.433, 9.3, 5.678, grid_ts=1359.433, ev_ts=1357.343)
+        self.sample(r, 363.204, 9.3, 6.937, grid_ts=1359.433, ev_ts=1363.204)
+        self.sample(r, 363.628, 9.3, 6.938, grid_ts=1359.433, ev_ts=1363.628)
+        return r
+
+    def test_partial_then_full_response_with_slow_unchanged_grid_avoids_false_stop(self):
+        r = self.slow_grid_start()
+        held = self.sample(r, 371.5, 9.3, 6.938, grid_ts=1359.433, ev_ts=1363.628)
+        self.assertEqual((held.mode, held.current_p1), ("waiting_for_aligned_sources", 7))
+        self.assertEqual(held.house_load_l1, 9.3)
+        self.assertEqual(held.measurement_alignment_remaining_seconds, 0)
+        coherent = self.sample(r, 374.140, 9.4, 6.938, grid_ts=1374.140, ev_ts=1363.628)
+        self.assertEqual(coherent.current_p1, 7)
+        self.assertNotEqual(coherent.mode, "unavailable")
+        self.assertIsNone(r._positive_cap)
+
+    def test_nominal_safe_hold_freezes_accepted_cap_and_renews_lease_without_new_grace(self):
+        r = self.slow_grid_start(resend_limit_every_seconds=5)
+        for at in (371.5, 376.5, 381.5, 391.5):
+            d = self.sample(r, at, 9.3, 6.938, grid_ts=1359.433, ev_ts=1363.628)
+            self.assertEqual((d.mode, d.command, d.current_p1),
+                             ("waiting_for_aligned_sources", "set_limit", 7))
+            self.assertTrue(d.should_call_service)
+            self.assertEqual(d.measurement_alignment_remaining_seconds, 0)
+            self.assertIsNotNone(r._positive_cap)
+
+    def test_nominal_safe_hold_never_resumes_owned_pause(self):
+        r = self.slow_grid_start(resume_for_seconds=0)
+        r.paused_by_us = True
+        r._pause_observed = True
+        d = self.sample(r, 371.5, 9.3, 6.938, "awaiting_start", grid_ts=1359.433, ev_ts=1363.628)
+        self.assertEqual((d.mode, d.command, d.current_p1),
+                         ("waiting_for_aligned_sources", "set_limit", 7))
+        self.assertTrue(r.paused_by_us)
+
+    def test_nominal_safe_hold_uses_raw_grid_plus_full_cap_at_buffered_boundary(self):
+        for grid, expected in ((16, 7), (16.001, 0), (17, 0)):
+            with self.subTest(grid=grid):
+                r = self.started()
+                self.sample(r, 74, grid, 7, grid_ts=173, ev_ts=174)
+                d = self.sample(r, 85, grid, 7, grid_ts=173, ev_ts=174)
+                self.assertEqual(d.current_p1, expected)
+                self.assertEqual(d.mode, "waiting_for_aligned_sources" if expected else "unavailable")
+
+    def test_missing_or_backward_receipts_cannot_enable_nominal_safe_hold(self):
+        for metadata in ({"grid_ts": None, "ev_ts": 1363.628},
+                         {"grid_ts": 1359.433, "ev_ts": None},
+                         {"grid_ts": 999, "ev_ts": 1363.628},
+                         {"grid_ts": 1359.433, "ev_ts": 999}):
+            with self.subTest(metadata=metadata):
+                r = self.slow_grid_start()
+                d = self.sample(r, 371.5, 9.3, 6.938, **metadata)
+                self.assertEqual((d.mode, d.current_p1), ("unavailable", 0))
+
+    def test_stale_invalid_fault_and_cap_exceedance_override_nominal_safe_hold(self):
+        for extra in ({"data_valid": False, "data_error": "stale"},
+                      {"status": "error"}, {"ev": 7.6}, {"grid": "unavailable"}):
+            with self.subTest(extra=extra):
+                r = self.slow_grid_start()
+                self.sample(r, 371.5, 9.3, 6.938, grid_ts=1359.433, ev_ts=1363.628)
+                args = {"grid": 9.3, "ev": 6.938, "status": "charging"}
+                args.update(extra)
+                d = self.sample(r, 372, grid_ts=1359.433, ev_ts=1372, **args)
+                self.assertEqual((d.mode, d.current_p1), ("unavailable", 0))
+
+    def test_new_high_raw_grid_sheds_immediately_from_nominal_safe_hold(self):
+        r = self.slow_grid_start()
+        self.sample(r, 371.5, 9.3, 6.938, grid_ts=1359.433, ev_ts=1363.628)
+        d = self.sample(r, 372, 24, 7, grid_ts=1372, ev_ts=1363.628)
+        self.assertEqual(d.current_p1, 6)
+        self.assertNotEqual(d.mode, "waiting_for_aligned_sources")
+
+    def test_nominal_safe_hold_does_not_bypass_soft_or_pause_guard(self):
+        for pause in (False, True):
+            with self.subTest(pause=pause):
+                r = self.slow_grid_start()
+                if pause:
+                    r.settings.pause_limit_amps = 9
+                    r.settings.pause_for_seconds = 0
+                else:
+                    r.settings.soft_limit_amps = 9
+                    r.settings.soft_for_seconds = 0
+                    r.settings.soft_current_amps = 0
+                d = self.sample(r, 371.5, 9.3, 6.938, grid_ts=1359.433, ev_ts=1363.628)
+                self.assertEqual(d.command, "pause" if pause else "set_limit")
+                self.assertEqual(d.mode, "pause" if pause else "soft_limit")
+                if not pause:
+                    self.assertEqual(d.current_p1, 0)
 
     def test_ev_first_below_grid_does_not_manufacture_headroom_or_allow_next_rise(self):
         r = self.accepted_twelve()
@@ -301,14 +398,14 @@ class StartupAlignmentTests(unittest.TestCase):
 
     def test_fixed_deadline_survives_ttl_renewals_and_new_same_value_ev_reports(self):
         r = self.accepted_twelve(resend_limit_every_seconds=5)
-        self.sample(r, 44.5, 10.9, 12.168, grid_ts=141, ev_ts=144.5)
-        renewed = self.sample(r, 49.5, 10.9, 12.168, grid_ts=141, ev_ts=149.5)
+        self.sample(r, 44.5, 11.5, 12.168, grid_ts=141, ev_ts=144.5)
+        renewed = self.sample(r, 49.5, 11.5, 12.168, grid_ts=141, ev_ts=149.5)
         self.assertTrue(renewed.should_call_service)
         self.assertAlmostEqual(renewed.measurement_alignment_remaining_seconds, 5)
-        expired = self.sample(r, 54.5, 10.9, 12.168, grid_ts=141, ev_ts=154.5)
+        expired = self.sample(r, 54.5, 11.5, 12.168, grid_ts=141, ev_ts=154.5)
         self.assertEqual((expired.mode, expired.current_p1), ("unavailable", 0))
         self.assertIn("timeout", expired.reason)
-        self.assertEqual(self.sample(r, 54.6, 10.9, 12.168, grid_ts=141, ev_ts=154.6).current_p1, 0)
+        self.assertEqual(self.sample(r, 54.6, 11.5, 12.168, grid_ts=141, ev_ts=154.6).current_p1, 0)
 
     def test_alignment_cannot_reenter_from_same_accepted_cap_after_completion(self):
         r = self.accepted_twelve()

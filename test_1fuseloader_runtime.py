@@ -233,6 +233,63 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
     def update_entry(self, entry, **kwargs):
         entry.options = kwargs["options"]
 
+    def test_runtime_wires_utc_wall_time_separately_from_monotonic_control_time(self):
+        self.hass.loop = SimpleNamespace(time=lambda: 1234.5)
+        before = datetime.now(timezone.utc).timestamp()
+        snapshot = self.controller._read_input()
+        after = datetime.now(timezone.utc).timestamp()
+        self.assertEqual(snapshot.now_ts, 1234.5)
+        self.assertGreater(snapshot.wall_now_ts, 1_000_000_000)
+        self.assertLessEqual(before, snapshot.wall_now_ts)
+        self.assertLessEqual(snapshot.wall_now_ts, after)
+        self.assertEqual(snapshot.grid_report_ts, self.states["sensor.grid"].last_reported.timestamp())
+        self.assertEqual(snapshot.charger_report_ts, self.states["sensor.car"].last_reported.timestamp())
+
+    def test_legacy_entry_gets_fast_default_without_enabling_control_modes(self):
+        self.assertNotIn("fast_recovery", self.entry.options)
+        self.assertTrue(self.controller.settings.fast_recovery)
+        legacy_observer = SimpleNamespace(
+            **{key: value for key, value in vars(self.entry).items() if key != "options"},
+            options={},
+        )
+        settings = runtime._settings_from_entry(legacy_observer)
+        self.assertTrue(settings.fast_recovery)
+        self.assertFalse(settings.active_control)
+        self.assertTrue(settings.dry_run)
+        self.assertFalse(settings.overload_enabled)
+
+    async def test_fast_switch_only_releases_fresh_coherent_headroom(self):
+        tick = [100.0]
+        self.hass.loop = SimpleNamespace(time=lambda: tick[0])
+        self.states["sensor.grid"].state = "12"
+        self.states["sensor.car"].state = "6"
+        # The adapter stream is healthy, but the EV report is two hours old.
+        # The runtime must wire absolute receipt ages, not just their presence.
+        await self.controller.async_tick()
+        self.assertEqual([decision.current_p1 for decision in self.adapter.calls], [6])
+        self.assertEqual(self.controller.last_decision.mode, "waiting_for_fresh_sources")
+        tick[0] = 110.0
+        reported = datetime.now(timezone.utc)
+        self.states["sensor.grid"].last_reported = reported
+        self.states["sensor.car"].last_reported = reported
+        await self.controller.async_set_switch("fast_recovery", False)
+        self.assertFalse(self.entry.options["fast_recovery"])
+        self.assertFalse(self.controller.settings.fast_recovery)
+        self.assertEqual(self.controller.last_decision.current_p1, 6)
+        await self.controller.async_set_switch("fast_recovery", True)
+        self.assertTrue(self.entry.options["fast_recovery"])
+        self.assertTrue(self.controller.settings.fast_recovery)
+        self.assertEqual([decision.current_p1 for decision in self.adapter.calls], [6, 16])
+        self.assertEqual(self.controller.last_command_attempt["result"], "submitted_unverified")
+        self.assertFalse(self.controller.diagnostic_attributes()["physical_current_verified"])
+
+    async def test_fast_option_rejects_string_without_mutating_entry(self):
+        previous = dict(self.entry.options)
+        with self.assertRaises(ValueError):
+            await self.controller.async_set_option("fast_recovery", "false")
+        self.assertEqual(self.entry.options, previous)
+        self.assertFalse(self.adapter.calls)
+
     async def test_accepted_submission_is_recorded_as_unverified(self):
         await self.controller.async_tick()
         self.assertEqual(len(self.adapter.calls), 1)
