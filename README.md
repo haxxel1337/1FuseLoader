@@ -197,6 +197,15 @@ does not grant another 30 minutes. There is no user budget-reset button in this
 release. Unknown elapsed exposure is handled conservatively. Diagnostic sensors
 show used/remaining time, the response window and any latched failure.
 
+Checkpoint writes are atomic, serialized and independently read back with a
+unique revision. Unchanged exposure state does not cause another disk write;
+running exposure and changed safety flags still require new checkpoints.
+An unresolved save failure blocks timed control and requests zero current.
+After a verified checkpoint of the latest conservative state, a later fresh
+evaluation may recover from that save failure without refunding exposure or
+resetting guard timers. Failed restores and overload safety latches remain
+blocked. Storage error type and verification time are available in diagnostics.
+
 Easee accepts dynamic current leases in whole minutes. The controller therefore
 ends an overload allowance early when less than 90 seconds remain for a further
 positive lease and its response reserve. The 1800-second value is a maximum
@@ -353,6 +362,6 @@ python -m compileall -q .\custom_components\1fuseloader
 ```
 
 The standalone suites use simulated inputs and adapters. CI additionally
-installs Home Assistant 2026.10.1 on Python 3.14 to test actual imports,
+installs Home Assistant 2026.10.1 and 2026.10.2 on Python 3.14 to test actual imports,
 selectors, entity construction and config/options flows. Passing these tests
 does not establish physical charging acceptance.

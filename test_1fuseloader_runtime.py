@@ -47,9 +47,22 @@ stubs["homeassistant.helpers.event"].async_call_later = lambda *args: lambda: No
 
 
 class FakeStore:
-    def __init__(self, *args):
-        self.data = None
+    def __init__(self, *args, **kwargs):
+        # Public Store instances with the same HA/key read the same backing
+        # file. Independent per-instance data would fake failed readback.
+        hass, _, self.key = args
+        if not hasattr(hass, "_test_store_disk"):
+            hass._test_store_disk = {}
+        self._disk = hass._test_store_disk
         self.failure = False
+
+    @property
+    def data(self):
+        return self._disk.get(self.key)
+
+    @data.setter
+    def data(self, value):
+        self._disk[self.key] = value
 
     async def async_load(self):
         return self.data
@@ -626,7 +639,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.last_decision.mode, "overload_control_blocked")
         self.assertEqual(controller.last_decision.reason, "overload_budget_save_failed")
         self.assertEqual(controller.regulator.last_target[0], 0)
-        # A later successful write must not silently clear the storage fault.
+        # No new verified checkpoint exists inside the bounded retry backoff.
         controller._budget_store.store.failure = False
         await controller.async_tick()
         self.assertTrue(all(decision.current_p1 == 0 for decision in self.adapter.calls))

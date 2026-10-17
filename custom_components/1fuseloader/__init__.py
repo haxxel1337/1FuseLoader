@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from math import isfinite
@@ -29,6 +31,8 @@ from .mqtt_freshness import MqttL1Config, MqttL1Source
 _LOGGER = logging.getLogger(__name__)
 ACTION_TIMEOUT_SECONDS = 20
 EXPOSURE_STORE_TIMEOUT_SECONDS = 2
+EXPOSURE_STORE_RETRY_SECONDS = 15
+_PENDING_BUDGET_WRITES_KEY = f"{DOMAIN}_pending_budget_writes"
 # One minute lease plus storage, request and scheduling allowances.
 OVERLOAD_LEASE_RESERVE_SECONDS = 90
 
@@ -77,9 +81,39 @@ class OneFuseLoaderController:
         self._bmw_context = BMWContext(hass, entry.data.get(CONF_BMW_DEVICE_ID))
         self.bmw_context: dict[str, Any] = {}
         self._adapter = command_adapter
-        self._budget_store = OverloadBudgetStore(Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.overload"))
+        storage_key = f"{DOMAIN}.{entry.entry_id}.overload"
+        writer = Store(hass, 1, storage_key, atomic_writes=True)
+        runtime_data = getattr(hass, "data", None)
+        pending_writes = (runtime_data.setdefault(_PENDING_BUDGET_WRITES_KEY, {})
+                          if runtime_data is not None else {})
+
+        async def read_budget_checkpoint() -> dict | None:
+            # A new read-only public Store cannot return this writer's pending
+            # in-memory _data. Completed Store writes invalidate HA's preload
+            # cache; exact unique-revision matching rejects deferred writes.
+            return await Store(hass, 1, storage_key, read_only=True).async_load()
+
+        async def budget_ledger_exists() -> bool | None:
+            path = getattr(writer, "path", None)
+            if path is None:
+                return None  # Pure test stores need not provide a filesystem.
+            def known_ledger() -> bool:
+                ledger = Path(path)
+                return (os.path.isfile(path)
+                        or next(ledger.parent.glob(f"{ledger.name}.corrupt.*"), None) is not None)
+            return await hass.async_add_executor_job(known_ledger)
+
+        self._budget_store = OverloadBudgetStore(
+            writer, read_back=read_budget_checkpoint, pending_writes=pending_writes,
+            pending_key=storage_key, create_task=hass.async_create_task,
+            write_allowed=lambda: (not self._stopped and
+                getattr(getattr(hass, "state", None), "name", None) != "stopping"),
+            ledger_exists=budget_ledger_exists,
+        )
         self._budget_loaded = False
         self._budget_error: str | None = None
+        self._budget_error_type: str | None = None
+        self._budget_retry_at = 0.0
         self._overload_restore_receipt_floor: float | None = None
         self._unsub_deadline = None
         if command_adapter is not None:
@@ -159,8 +193,14 @@ class OneFuseLoaderController:
                             raise ValueError("Invalid restored exposure")
                         if saved.get("minimum_held"):
                             self._overload_restore_receipt_floor = datetime.now(timezone.utc).timestamp()
-                except Exception:
+                except Exception as err:
                     self._budget_error = "overload_budget_restore_failed"
+                    self._budget_error_type = type(err).__name__
+                    # An unknown older ledger must never be overwritten by a
+                    # newly initialized zero allowance after a failed load.
+                    self.regulator.import_overload_state(None)
+                    _LOGGER.warning("1FuseLoader exposure restore failed (%s)",
+                                    self._budget_error_type, exc_info=True)
                 self._budget_loaded = True
             if self._stopped:
                 return
@@ -307,6 +347,12 @@ class OneFuseLoaderController:
             self._unsub_deadline = None
         async with self._lock:
             pass
+        try:
+            await asyncio.wait_for(self._budget_store.async_wait_pending(), EXPOSURE_STORE_TIMEOUT_SECONDS)
+        except Exception:
+            # The per-entry hass.data gate retains the shielded transaction.
+            # A new controller must await it before reading or writing ledger.
+            _LOGGER.warning("1FuseLoader exposure transaction remains pending or failed during unload")
         pending = self._refresh_task
         if pending is not None and pending is not asyncio.current_task():
             await pending
@@ -511,6 +557,13 @@ class OneFuseLoaderController:
             "readback_scope": "cached_circuit_cap_only",
             "physical_current_verified": False,
             "device_ttl_verified": False,
+            "budget_storage_error": self._budget_error,
+            "budget_storage_error_type": self._budget_error_type,
+            "budget_checkpoint_verified_at_utc": (
+                datetime.fromtimestamp(self._budget_store.last_verified_at, timezone.utc).isoformat()
+                if self._budget_store.last_verified_at is not None else None),
+            "budget_latest_state_durable": self._budget_store.state_is_durable(
+                self.regulator.export_overload_state()),
         }
 
     async def async_tick(self) -> None:
@@ -543,11 +596,29 @@ class OneFuseLoaderController:
                 inp = replace(inp, data_valid=False, data_error=self._budget_error or offline_problem)
         decision = self.regulator.evaluate(inp)
         exposure = self.regulator.export_overload_state()
-        if self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"]:
+        if (self._budget_error != "overload_budget_restore_failed"
+                and (self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"])
+                and self.hass.loop.time() >= self._budget_retry_at):
             try:
                 await asyncio.wait_for(self._budget_store.async_save(exposure), EXPOSURE_STORE_TIMEOUT_SECONDS)
-            except Exception:
-                self._budget_error = "overload_budget_save_failed"
+                if not self._budget_store.state_is_durable(self.regulator.export_overload_state()):
+                    raise RuntimeError("Latest conservative exposure checkpoint is not verified")
+            except Exception as err:
+                if self._budget_error != "overload_budget_restore_failed":
+                    self._budget_error = "overload_budget_save_failed"
+                self._budget_error_type = type(err).__name__
+                self._budget_retry_at = self.hass.loop.time() + EXPOSURE_STORE_RETRY_SECONDS
+                _LOGGER.warning("1FuseLoader exposure save failed (%s); timed overload remains blocked",
+                                self._budget_error_type, exc_info=True)
+            else:
+                if self._budget_error == "overload_budget_save_failed":
+                    # This tick was already evaluated conservatively with the
+                    # storage fault. Only a subsequent fresh evaluation can
+                    # offer current; no timers, exposure or safety latch reset.
+                    self._budget_error = None
+                    self._budget_error_type = None
+                    _LOGGER.info("1FuseLoader latest exposure checkpoint verified; storage fault recovered")
+                self._budget_retry_at = 0.0
         if self._stopped:
             return
         if self.settings.overload_enabled and decision.current_p1 > 0 and (

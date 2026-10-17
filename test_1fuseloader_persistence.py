@@ -90,7 +90,10 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         exhausted = state(used_seconds=1800, exposure_active=False,
                           transition_pending=True, failure_reason="response_timeout")
         await store.async_save(exhausted)
-        self.assertEqual(raw.data, envelope(regulator=exhausted))
+        self.assertEqual(raw.data["regulator"], exhausted)
+        self.assertEqual(raw.data["version"], 1)
+        self.assertEqual(raw.data["saved_at"], 1000)
+        self.assertRegex(raw.data["checkpoint_revision"], r"^[0-9a-f]{32}$")
         clock[0] += 3600
         self.assertEqual(await store.async_load(), exhausted)
         # Saving and reloading it again is not an implicit new test allowance.
