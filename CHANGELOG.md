@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0b8
+
+- Recover a transient exposure-storage fault only after the latest conservative
+  checkpoint has been written and independently read back. Re-evaluate fresh
+  charging inputs on a later tick; preserve consumed budget, restart waits and
+  all overload safety latches.
+- Skip unchanged exposure checkpoints and serialize shielded writes across
+  controller reloads. A caller timeout cannot leave an untracked disk write
+  which later overwrites a newer checkpoint.
+- Verify unique checkpoint revisions through Home Assistant's public Store API,
+  including storage errors which its save method may log without raising.
+  Keep unknown or failed restores blocked and preserve the older ledger.
+- Expose storage error type and checkpoint verification diagnostics, and log
+  failures for investigation. Test the storage contract against real Home
+  Assistant 2026.10.1 and 2026.10.2, including delayed and failed writes.
+
 ## 0.4.0b7
 
 - Recognize the verified Currently One MQTT source and validate its actual L1
