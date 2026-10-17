@@ -111,11 +111,12 @@ class RealStoreContractTests(unittest.IsolatedAsyncioTestCase):
     async def ledger_exists(self):
         return await self.hass.async_add_executor_job(Path(self.wrapper.store.path).exists)
 
-    def make_wrapper(self, *, read_back=None, write_allowed=None):
+    def make_wrapper(self, *, read_back=None, write_allowed=None, pending_writes=None):
         wrapper = self.persistence.OverloadBudgetStore(
             self.writer(), clock=lambda: self.now,
             read_back=read_back or self.fresh_read,
-            pending_writes=self.pending, pending_key=self.key,
+            pending_writes=self.pending if pending_writes is None else pending_writes,
+            pending_key=self.key,
             write_allowed=write_allowed or (lambda: self.hass.state is not self.CoreState.stopping),
             ledger_exists=self.ledger_exists,
         )
@@ -166,7 +167,9 @@ class RealStoreContractTests(unittest.IsolatedAsyncioTestCase):
         state = exposure()
         await self.wrapper.async_save(state)
         previous = await self.fresh_read()
-        reloaded = self.make_wrapper()
+        # A new process has a fresh gate; a same-process reload correctly
+        # deduplicates this unchanged checkpoint instead of attempting I/O.
+        reloaded = self.make_wrapper(pending_writes={})
         with patch.object(self.storage, "write_utf8_file_atomic", side_effect=self.storage.WriteError("injected write failure")), \
                 self.assertLogs("homeassistant.helpers.storage", level="ERROR") as logs:
             with self.assertRaises(self.persistence.CheckpointVerificationError):
@@ -215,7 +218,7 @@ class RealStoreContractTests(unittest.IsolatedAsyncioTestCase):
         previous = await self.fresh_read()
         # Deliberately bypass the wrapper's normal stopping guard to exercise
         # Store's actual deferred-return contract and independent nonce check.
-        reloaded = self.make_wrapper(write_allowed=lambda: True)
+        reloaded = self.make_wrapper(write_allowed=lambda: True, pending_writes={})
         self.hass.set_state(self.CoreState.stopping)
         try:
             with patch.object(self.storage, "write_utf8_file_atomic") as write:
@@ -240,7 +243,8 @@ class RealStoreContractTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(TimeoutError):
                     await asyncio.wait_for(first, 0.01)
                 self.assertEqual(len(self.pending), 1)
-                pending = self.pending[self.key]
+                pending = self.pending[self.key].pending
+                self.assertIsNotNone(pending)
                 self.assertFalse(pending.cancelled())
                 reloaded = self.make_wrapper()
                 latest = exposure(used_seconds=240)
@@ -269,7 +273,8 @@ class RealStoreContractTests(unittest.IsolatedAsyncioTestCase):
                 reloaded = self.make_wrapper()
                 with self.assertRaises(TimeoutError):
                     await asyncio.wait_for(reloaded.async_load(), 0.01)
-                self.assertFalse(self.pending[self.key].cancelled())
+                self.assertIsNotNone(self.pending[self.key].pending)
+                self.assertFalse(self.pending[self.key].pending.cancelled())
                 self.assertFalse(first.done())
                 self.assertEqual(blocked.calls, 1)
                 blocked.release.set()
