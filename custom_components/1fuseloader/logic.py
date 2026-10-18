@@ -198,6 +198,7 @@ class OneFuseRegulator:
         self._last_input_grid_ts: Optional[float] = None
         self._last_input_charger_ts: Optional[float] = None
         self._last_input_wall_now_ts: Optional[float] = None
+        self._last_input_now_ts: Optional[float] = None
         self._fast_recovery_wait: Optional[str] = None
         self._snapshot_aligned = False
         self._reduction_grid_ts: Optional[float] = None
@@ -590,6 +591,9 @@ class OneFuseRegulator:
         self._overload_entry_charger_ts: Optional[float] = None
         self._overload_anchor_house: Optional[float] = None
         self._overload_minimum_response_ts: Optional[float] = None
+        self._overload_minimum_accepted_at: Optional[float] = None
+        self._overload_minimum_ev_floor: Optional[float] = None
+        self._overload_minimum_attempted_at: Optional[float] = None
 
     def _fail_overload(self, reason: str) -> None:
         self._overload_failure_reason = self._overload_failure_reason or reason
@@ -698,9 +702,12 @@ class OneFuseRegulator:
                 return stop("response_timeout")
             grid_advanced = (self._last_input_grid_ts is not None and self._overload_entry_grid_ts is not None
                              and self._last_input_grid_ts > self._overload_entry_grid_ts)
-            ev_advanced = (self._last_input_charger_ts is not None and self._overload_entry_charger_ts is not None
-                           and self._last_input_charger_ts > self._overload_entry_charger_ts)
-            if current <= s.min_charge_amps + 0.5 and ev_advanced:
+            ev_advanced = (self._overload_minimum_accepted_at is not None
+                           and self._last_input_charger_ts is not None
+                           and self._overload_minimum_ev_floor is not None
+                           and self._last_input_charger_ts > self._overload_minimum_ev_floor)
+            if (self._meaningfully_charging(status, current)
+                    and current <= s.min_charge_amps + 0.5 and ev_advanced):
                 if self._overload_minimum_response_ts is None:
                     self._overload_minimum_response_ts = self._last_input_charger_ts
             else:
@@ -711,11 +718,17 @@ class OneFuseRegulator:
             # not move this first minimum-response timestamp or refund time.
             grid_after_minimum = (self._overload_minimum_response_ts is not None
                                   and self._last_input_grid_ts is not None
-                                  and self._last_input_grid_ts >= self._overload_minimum_response_ts)
+                                  and self._last_input_grid_ts > self._overload_minimum_response_ts)
+            # A simultaneous high observation is enough to stop; success is
+            # intentionally stricter and requires the grid AFTER minimum EV.
+            grid_at_or_after_minimum = (self._overload_minimum_response_ts is not None
+                                        and self._last_input_grid_ts is not None
+                                        and self._last_input_grid_ts >= self._overload_minimum_response_ts)
             if (current <= s.min_charge_amps + 0.5 and grid_advanced and ev_advanced
-                    and grid_after_minimum and grid > ceiling):
+                    and grid_at_or_after_minimum and grid > ceiling):
                 return stop("minimum_observed_above_ceiling")
-            if current <= s.min_charge_amps + 0.5 and grid <= ceiling and grid_advanced and ev_advanced:
+            if (current <= s.min_charge_amps + 0.5 and grid <= ceiling
+                    and grid_advanced and ev_advanced and grid_after_minimum):
                 if current > grid + 1 or house + s.min_charge_amps > ceiling:
                     return stop("minimum_response_outside_ceiling")
                 self._clear_overload_transition()
@@ -740,7 +753,12 @@ class OneFuseRegulator:
             return stop("inconsistent_current_observations")
         if house + s.min_charge_amps > ceiling:
             return stop("minimum_projection_exceeds_ceiling")
-        if current <= s.min_charge_amps + 0.5:
+        # A low observation can predate a higher offer that the API has already
+        # accepted. It cannot prove that a NEW reduction to minimum responded.
+        # Keep the same bounded shedding path until the accepted minimum has
+        # both a later EV receipt and a still later coherent grid receipt.
+        higher_offer = self.last_target is not None and self.last_target[0] > s.min_charge_amps
+        if current <= s.min_charge_amps + 0.5 and not higher_offer:
             if grid > ceiling:
                 return stop("minimum_observed_above_ceiling")
             self._overload_hold_active = True
@@ -870,6 +888,30 @@ class OneFuseRegulator:
                 self._clear_partial_reduction_alignment()
             if changed and (old_target is None or target > old_target):
                 self._last_increase_ts = now_ts
+            if (target == self.settings.min_charge_amps
+                    and self._overload_transition_started is not None
+                    and self._overload_minimum_accepted_at is None):
+                self._overload_minimum_accepted_at = now_ts
+                self._overload_minimum_ev_floor = None
+                # Include API latency in the receipt ordering floor as well as
+                # in the original monotonic response deadline. A report that
+                # arrived while the command was pending is not its response.
+                accepted_now = None if isinstance(now_ts, bool) else _valid_number(now_ts)
+                if (self._last_input_wall_now_ts is not None and self._last_input_now_ts is not None
+                        and accepted_now is not None and accepted_now >= self._last_input_now_ts):
+                    accepted_wall = _valid_number(
+                        self._last_input_wall_now_ts + accepted_now - self._last_input_now_ts)
+                    if accepted_wall is not None and self._last_input_charger_ts is not None:
+                        self._overload_minimum_ev_floor = max(self._last_input_charger_ts, accepted_wall)
+                if self._awaiting_reduction_target == target:
+                    deadline = self._overload_transition_started + self.settings.overload_response_seconds
+                    self._partial_reduction_budget = min(
+                        self._partial_reduction_budget if self._partial_reduction_budget is not None
+                        else self.settings.overload_response_seconds,
+                        self.settings.overload_response_seconds)
+                    self._reduction_guard_deadline = min(
+                        self._reduction_guard_deadline if self._reduction_guard_deadline is not None
+                        else deadline, deadline)
             if target == 0:
                 self._restart_required = True
                 self._waiting_for_vehicle_since = None
@@ -1019,6 +1061,21 @@ class OneFuseRegulator:
         return self.last_action_ts is None or now - self.last_action_ts >= self.settings.min_seconds_between_actions
 
     def _should_send_limit(self, now: float, current: int, ttl: int) -> bool:
+        if (current == self.settings.min_charge_amps
+                and self._overload_transition_started is not None
+                and self._overload_minimum_accepted_at is None):
+            # A still-valid identical lease may have been accepted BEFORE the
+            # overload transition. Submit its minimum once more so the new
+            # response has an explicit acceptance floor. A failed or blocked
+            # proposal proves nothing; retry only at the normal action rate,
+            # inside the SAME original transition deadline.
+            if not self.settings.active_control or self.settings.dry_run:
+                return False
+            if (self._overload_minimum_attempted_at is not None
+                    and now - self._overload_minimum_attempted_at < self.settings.min_seconds_between_actions):
+                return False
+            self._overload_minimum_attempted_at = now
+            return True
         if self.last_target != (current, 0, 0, ttl) or self.last_set_limit_ts is None:
             return True
         resend = min(self.settings.resend_limit_every_seconds, ttl / 2)
@@ -1028,6 +1085,7 @@ class OneFuseRegulator:
         s = self.settings
         observed_now = _valid_number(inp.now_ts)
         now = observed_now if observed_now is not None else 0.0
+        self._last_input_now_ts = None if isinstance(inp.now_ts, bool) else observed_now
         status = (inp.status or "").strip().lower()
         self._fast_recovery_wait = None
         self._snapshot_aligned = False

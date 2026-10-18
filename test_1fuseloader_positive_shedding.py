@@ -174,8 +174,8 @@ class PositiveSheddingTests(unittest.TestCase):
 
     def test_experimental_minimum_envelope_keeps_its_existing_policy(self):
         d = self.shedding(self.pending(),grid=26)
-        self.assertEqual((d.mode,d.current_p1),("overload_minimum",6))
-        self.assertIsNone(d.overload_transition_remaining_seconds)
+        self.assertEqual((d.mode,d.current_p1),("overload_shedding",6))
+        self.assertEqual(d.overload_transition_remaining_seconds,10)
 
     def test_excess_current_is_not_reinterpreted_as_safe_shedding(self):
         d = self.shedding(self.pending(),ev=16.50001)

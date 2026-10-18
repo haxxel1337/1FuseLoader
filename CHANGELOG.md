@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0b14
+
+- When a higher accepted offer is reduced to the experimental minimum, an
+  earlier low EV report cannot count as a completed minimum-current response.
+  Keep the existing bounded shedding transition active across mixed reports
+  instead of handing an unconfirmed reduction to ordinary headroom logic.
+- Require an accepted minimum offer, a later minimum-current EV report and
+  subsequent coherent grid feedback before completing that transition. API
+  latency, lease renewals and report-order changes do not extend its original
+  deadline or replenish cumulative exposure.
+- Obtain a fresh minimum-offer acknowledgement when an existing identical
+  lease would otherwise suppress the first transition submission. Failed
+  attempts remain unconfirmed and bounded by the same response deadline.
+- Preserve existing safety latches and the response timeout. This update does
+  not reset an earlier timeout or prove that slow current reporting meets the
+  configured response window.
+
 ## 0.4.0b13
 
 - When fresh but misaligned feedback makes an accepted positive offer exceed

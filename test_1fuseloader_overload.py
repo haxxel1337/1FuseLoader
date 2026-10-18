@@ -66,7 +66,9 @@ class OverloadTests(unittest.TestCase):
         final = self.sample(regulator, 7, grid=28, ev=6, grid_report_ts=1003)
         self.assertEqual(pending.mode, "overload_shedding")
         self.assertEqual(pending.house_load_l1, 22)
-        self.assertEqual((final.mode, final.current_p1), ("overload_minimum", 6))
+        self.assertEqual((final.mode, final.current_p1), ("overload_shedding", 6))
+        confirmed = self.sample(regulator, 8, grid=28, ev=6, charger_report_ts=1007)
+        self.assertEqual((confirmed.mode, confirmed.current_p1), ("overload_minimum", 6))
 
     def test_fresh_minimum_and_fresh_high_grid_stop_before_response_timeout(self):
         regulator = self.regulator()
@@ -96,7 +98,10 @@ class OverloadTests(unittest.TestCase):
     def test_response_strictly_before_deadline_is_accepted(self):
         regulator = self.regulator()
         self.sample(regulator, 0, grid=38, ev=16)
-        self.assertEqual(self.sample(regulator, 9.999, grid=28, ev=6).mode, "overload_minimum")
+        minimum = self.sample(regulator, 9.998, grid=38, ev=6, grid_report_ts=1000)
+        self.assertEqual(minimum.mode, "overload_shedding")
+        self.assertEqual(self.sample(regulator, 9.999, grid=28, ev=6,
+                                     charger_report_ts=1009.998).mode, "overload_minimum")
 
     def test_raw_30_with_ordinary_nine_amp_headroom_still_uses_bounded_transition(self):
         decision = self.sample(self.regulator(), 0, grid=30, ev=16)
