@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0b13
+
+- When fresh but misaligned feedback makes an accepted positive offer exceed
+  buffered headroom, an actually charging vehicle may receive a lower cap
+  calculated from raw grid current alone. The entire reduced cap must fit the
+  full normal buffer; no uncertain EV current is subtracted.
+- Keep the original alignment deadline across the accepted reduction. A
+  proposal, failed submission or lease renewal cannot grant more response time.
+  Faults, stale data, excessive EV current, timeout and overload/soft/pause
+  protections retain priority. This fallback cannot start or resume a car.
+- Allow up to 10 seconds for the initial exposure-ledger read during setup,
+  while retaining the 2-second runtime write deadline. Validation and
+  fail-closed handling remain unchanged; this avoids treating every startup
+  read slower than 2 seconds as a permanently failed restore.
+
 ## 0.4.0b12
 
 - Preserve an accepted lower current cap while delayed EV/grid reports catch

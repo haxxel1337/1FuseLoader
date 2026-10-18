@@ -158,6 +158,18 @@ why a newer read is needed and which current/status pair was used.
 Experimental timed overload is a separate, disabled-by-default
 option described below; the report-alignment window alone does not enable it.
 
+During that positive-response wait, a newer grid report and a delayed low EV
+report can make the accepted offer exceed the buffered estimate. If the car
+is actually charging and source receipts are fresh, the regulator can first
+lower the cap using **raw grid current plus the entire new cap** within the
+full normal buffer. It never subtracts the uncertain EV reading for this
+fallback. With a 25 A fuse, 2 A buffer and 15.5 A raw grid current, at most 7 A
+fits this conservative check. If even the configured minimum cannot fit, it
+still requests zero. This path permits only a reduction, never a start,
+increase or resume, and an accepted reduction carries only the original
+alignment time that remains. It cannot bypass faults, stale data, excessive EV
+current, alignment timeout or overload/soft/pause protection.
+
 The opposite report order can briefly pair a lower grid current with the EV
 current from before an accepted reduction. The established unchanged-EV path
 requires **grid current plus the entire accepted cap** to fit the nominal
@@ -248,6 +260,13 @@ After a verified checkpoint of the latest conservative state, a later fresh
 evaluation may recover from that save failure without refunding exposure or
 resetting guard timers. Failed restores and overload safety latches remain
 blocked. Storage error type and verification time are available in diagnostics.
+
+The initial ledger read has a separate 10-second deadline to accommodate busy
+startup I/O; runtime checkpoint writes retain their 2-second deadline. A slow
+initial read delays controller setup and its first command. A read that still
+times out or fails validation remains blocked, and is never replaced by a new
+empty allowance. This does not add automatic retries or change how saved
+exposure and interrupted transitions are restored.
 
 Easee accepts dynamic current leases in whole minutes. The controller therefore
 ends an overload allowance early when less than 90 seconds remain for a further

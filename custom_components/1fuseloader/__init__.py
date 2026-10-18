@@ -30,6 +30,7 @@ from .mqtt_freshness import MqttL1Config, MqttL1Source
 
 _LOGGER = logging.getLogger(__name__)
 ACTION_TIMEOUT_SECONDS = 20
+INITIAL_EXPOSURE_LOAD_TIMEOUT_SECONDS = 10
 EXPOSURE_STORE_TIMEOUT_SECONDS = 2
 EXPOSURE_STORE_RETRY_SECONDS = 15
 CURRENT_SNAPSHOT_INTERVAL_SECONDS = 30
@@ -210,7 +211,7 @@ class OneFuseLoaderController:
             self._reload_settings_locked()
             if not self._budget_loaded:
                 try:
-                    saved = await asyncio.wait_for(self._budget_store.async_load(), EXPOSURE_STORE_TIMEOUT_SECONDS)
+                    saved = await asyncio.wait_for(self._budget_store.async_load(), INITIAL_EXPOSURE_LOAD_TIMEOUT_SECONDS)
                     if saved is not None:
                         if not self.regulator.import_overload_state(saved):
                             raise ValueError("Invalid restored exposure")
