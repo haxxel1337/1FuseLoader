@@ -39,6 +39,13 @@ SNAPSHOT_ERROR_CODES = frozenset({
     "easee_snapshot_invalid_current", "easee_snapshot_invalid_operation_mode",
     "easee_snapshot_failed", "easee_runtime_changed_during_request",
 })
+SNAPSHOT_FAILURE_TYPES = frozenset({
+    "KeyError", "TypeError", "ValueError", "RuntimeError", "TimeoutError", "OSError",
+    "ClientError", "ClientResponseError", "ClientConnectionError", "ClientConnectorError",
+    "ForbiddenServiceException", "NotFoundException", "TooManyRequestsException",
+    "ServerFailureException", "AuthorizationFailedException", "BadRequestException",
+    "JSONDecodeError", "ClientPayloadError", "ServerDisconnectedError",
+})
 _PENDING_BUDGET_WRITES_KEY = f"{DOMAIN}_pending_budget_writes"
 # One minute lease plus storage, request and scheduling allowances.
 OVERLOAD_LEASE_RESERVE_SECONDS = 90
@@ -78,6 +85,7 @@ class OneFuseLoaderController:
         self._charger_snapshot_next_request = 0.0
         self._charger_snapshot_error: str | None = None
         self._charger_snapshot_error_reason: str | None = None
+        self._charger_snapshot_failure_type: str | None = None
         self.control_block_reason: str | None = "Easee adapter has not been initialized."
         self.unsub_timer = None
         self.unsub_states = None
@@ -424,18 +432,21 @@ class OneFuseLoaderController:
                     if not 0 <= age <= CURRENT_SNAPSHOT_MAX_AGE_SECONDS:
                         self._charger_snapshot_error = "snapshot_receipt_invalid"
                         self._charger_snapshot_error_reason = "snapshot_receipt_invalid"
+                        self._charger_snapshot_failure_type = None
                         self._charger_snapshot = None
                         return
                     report_times = [revision[3], revision[6]]
                     if any(stamp is None or stamp >= received.timestamp() for stamp in report_times):
                         self._charger_snapshot_error = "snapshot_not_newer_than_entity_reports"
                         self._charger_snapshot_error_reason = "snapshot_not_newer_than_entity_reports"
+                        self._charger_snapshot_failure_type = None
                         self._charger_snapshot = None
                         return
                     self._charger_snapshot = snapshot
                     self._charger_snapshot_selection = revision
                     self._charger_snapshot_error = None
                     self._charger_snapshot_error_reason = None
+                    self._charger_snapshot_failure_type = None
                 # Always evaluate the newest grid after completion; the GET
                 # result is never a precomputed command or direct submission.
                 self._handle_source_change(None)
@@ -446,10 +457,16 @@ class OneFuseLoaderController:
                 self._charger_snapshot_error = type(err).__name__
                 # Only our fixed vocabulary may enter diagnostics/logs. Never
                 # expose arbitrary exception text, response bodies or URLs.
-                candidate = str(err).split(":", 1)[0]
+                parts = str(err).split(":")
+                candidate = parts[0]
                 self._charger_snapshot_error_reason = candidate if candidate in SNAPSHOT_ERROR_CODES else None
-                _LOGGER.warning("1FuseLoader current snapshot failed (%s; %s)", type(err).__name__,
-                                self._charger_snapshot_error_reason or "unclassified")
+                self._charger_snapshot_failure_type = (
+                    parts[1] if candidate == "easee_snapshot_failed" and len(parts) == 2
+                    and parts[1] in SNAPSHOT_FAILURE_TYPES else None
+                )
+                _LOGGER.warning("1FuseLoader current snapshot failed (%s; %s; %s)", type(err).__name__,
+                                self._charger_snapshot_error_reason or "unclassified",
+                                self._charger_snapshot_failure_type or "unspecified")
             finally:
                 self._charger_snapshot_task = None
 
@@ -549,6 +566,7 @@ class OneFuseLoaderController:
             "charger_snapshot_used": snapshot_used,
             "charger_snapshot_error_type": self._charger_snapshot_error,
             "charger_snapshot_error_reason": self._charger_snapshot_error_reason,
+            "charger_snapshot_failure_type": self._charger_snapshot_failure_type,
             "charger_snapshot_scope": "cloud_state_read_receipt_not_physical_acquisition",
             "effective_charger_current": current_value,
             "effective_charger_status": status_value,

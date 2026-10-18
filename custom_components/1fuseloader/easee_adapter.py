@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from math import ceil, isfinite
+import re
 import sys
 from typing import Any
 
@@ -20,8 +21,9 @@ SUPPORTED_EASEE_VERSION = "0.9.74"
 SUPPORTED_PYEASEE_VERSION = "0.8.17"
 REQUEST_TIMEOUT_SECONDS = 10
 MAX_TELEMETRY_AGE_SECONDS = 120
+SNAPSHOT_OBSERVATION_IDS = (109, 182, 183, 184, 185)
 
-# Raw numeric modes in the audited pyeasee 0.8.17 ChargerState contract.
+# Raw numeric modes in the audited pyeasee 0.8.17 operation-mode enum.
 # Keep terminal, fault and schedule states distinct from start-ready states.
 CHARGER_OPERATION_MODES = {
     0: "offline",
@@ -183,11 +185,11 @@ class EaseeCommandAdapter:
             return False
 
     async def async_read_current_snapshot(self) -> ChargerCurrentSnapshot:
-        """Read the selected charger's public state API without issuing commands.
+        """Read selected native observations without issuing charger commands.
 
         Stream health is required before and after the bounded GET. The receipt
-        time only records when this request returned locally: the server does
-        not provide a verified physical sample timestamp for these values.
+        time only records when this request returned locally: the server
+        returns last-reported observations, not a new physical sample.
         Callers must separately reject results superseded by concurrent events.
         """
         try:
@@ -196,34 +198,50 @@ class EaseeCommandAdapter:
                 raise EaseeAdapterError(problem)
             identity = self._runtime_identity()
             charger = self._charger
-            if not callable(getattr(charger, "get_state", None)):
+            if not callable(getattr(charger, "get_observations", None)):
                 raise EaseeAdapterError("easee_snapshot_api_unavailable")
             async with asyncio.timeout(min(REQUEST_TIMEOUT_SECONDS, 10)):
-                state = await charger.get_state(raw=True)
+                state = await charger.get_observations(*SNAPSHOT_OBSERVATION_IDS)
             received_at = datetime.now(timezone.utc)
             self._require_same_runtime(identity, healthy=True)
             if not isinstance(state, Mapping):
                 raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
-            # Match Easee 0.9.74's current sensor: the largest measured input
-            # terminal current. REST has no guaranteed totalCurrent field;
-            # outputCurrent is the offered pilot limit, not measured EV draw.
-            # Every terminal must validate so max() cannot hide a bad sample.
+            observations = state.get("observations")
+            if type(observations) is not list or len(observations) < 5:
+                raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
+            values = {}
+            for observation in observations:
+                if not isinstance(observation, Mapping):
+                    raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
+                observation_id = observation.get("id")
+                data_type = observation.get("dataType")
+                if (type(observation_id) is not int or observation_id <= 0
+                        or type(data_type) is not int or "value" not in observation):
+                    raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
+                if observation_id not in SNAPSHOT_OBSERVATION_IDS:
+                    # Some servers may return extra observations despite the
+                    # requested filter. Never use offered or unrelated values.
+                    continue
+                if observation_id in values:
+                    raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
+                # Pinned pyeasee: dataType3 is Double, dataType4 is Integer.
+                if data_type != (4 if observation_id == 109 else 3):
+                    raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
+                values[observation_id] = observation.get("value")
+            if set(values) != set(SNAPSHOT_OBSERVATION_IDS):
+                raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
+            # Match Easee 0.9.74's current sensor: max of all input terminals.
+            # Offered pilot current (observation114) is deliberately absent.
             terminal_currents = []
-            for terminal in ("inCurrentT2", "inCurrentT3", "inCurrentT4", "inCurrentT5"):
-                value = state.get(terminal)
-                if type(value) not in (int, float):
-                    raise EaseeAdapterError("easee_snapshot_invalid_current")
-                try:
-                    number = float(value)
-                except (ValueError, OverflowError):
-                    raise EaseeAdapterError("easee_snapshot_invalid_current") from None
-                if not isfinite(number) or not 0 <= number <= 1000:
+            for observation_id in SNAPSHOT_OBSERVATION_IDS[1:]:
+                number = self._snapshot_number(values[observation_id], "easee_snapshot_invalid_current")
+                if not 0 <= number <= 1000:
                     raise EaseeAdapterError("easee_snapshot_invalid_current")
                 terminal_currents.append(number)
             current = max(terminal_currents)
-            mode = state.get("chargerOpMode")
-            if type(mode) not in (int, float) or not isfinite(mode):
-                raise EaseeAdapterError("easee_snapshot_invalid_operation_mode")
+            mode = self._snapshot_number(
+                values[109], "easee_snapshot_invalid_operation_mode", integer=True
+            )
             status = CHARGER_OPERATION_MODES.get(mode)
             if status is None:
                 raise EaseeAdapterError("easee_snapshot_invalid_operation_mode")
@@ -234,6 +252,24 @@ class EaseeCommandAdapter:
             raise
         except Exception as err:
             raise EaseeAdapterError(f"easee_snapshot_failed:{type(err).__name__}") from None
+
+    @staticmethod
+    def _snapshot_number(value: Any, error_code: str, *, integer: bool = False) -> float:
+        """Parse declared observation types without bool/default/coercion leaks."""
+        if type(value) is str:
+            pattern = (r"[+-]?[0-9]+" if integer else
+                       r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+            if re.fullmatch(pattern, value) is None:
+                raise EaseeAdapterError(error_code)
+        elif type(value) not in (int, float):
+            raise EaseeAdapterError(error_code)
+        try:
+            number = float(value)
+        except (ValueError, OverflowError):
+            raise EaseeAdapterError(error_code) from None
+        if not isfinite(number) or (integer and not number.is_integer()):
+            raise EaseeAdapterError(error_code)
+        return number
 
     @property
     def overload_block_reason(self) -> str | None:

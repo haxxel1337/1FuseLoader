@@ -38,11 +38,19 @@ class PublicState(Mapping):
 
 
 def snapshot_state(current=0.012, mode=6):
-    """REST input-terminal readings, not the offered pilot current."""
+    """Contract fixture from native polling, not a captured device response.
+
+    Easee 0.9.74 controller.py:275-302 consumes this wrapper; the pinned
+    pyeasee enum assigns these IDs and utils.py assigns type3/type4.
+    """
     return PublicState({
-        "inCurrentT2": current, "inCurrentT3": 0.0,
-        "inCurrentT4": 0.0, "inCurrentT5": 0.0,
-        "chargerOpMode": mode, "reasonForNoCurrent": 0,
+        "observations": [
+            {"id": 109, "dataType": 4, "value": mode},
+            {"id": 182, "dataType": 3, "value": current},
+            {"id": 183, "dataType": 3, "value": 0.0},
+            {"id": 184, "dataType": 3, "value": 0.0},
+            {"id": 185, "dataType": 3, "value": 0.0},
+        ],
     })
 
 
@@ -89,7 +97,8 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             id="selected-charger",
             circuit=circuit,
-            get_state=AsyncMock(return_value=snapshot_state()),
+            get_observations=AsyncMock(return_value=snapshot_state()),
+            get_state=AsyncMock(side_effect=AssertionError("Legacy state endpoint must not be used")),
             pause=AsyncMock(return_value=self.response),
             resume=AsyncMock(return_value=self.response),
             start=AsyncMock(),
@@ -100,6 +109,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.circuit.set_dynamic_current.assert_not_awaited()
         for name in ("pause", "resume", "start", "force_update"):
             getattr(self.charger, name).assert_not_awaited()
+        self.charger.get_state.assert_not_awaited()
 
     async def test_snapshot_uses_raw_public_get_and_has_immutable_utc_receipt(self):
         before = datetime.now(timezone.utc)
@@ -118,40 +128,112 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.client.snapshot_is_current(snapshot))
         with self.assertRaises(FrozenInstanceError):
             snapshot.current = 12
-        self.charger.get_state.assert_awaited_once_with(raw=True)
+        self.charger.get_observations.assert_awaited_once_with(109, 182, 183, 184, 185)
         self.assert_no_commands()
 
     async def test_api_zero_and_status_do_not_reuse_old_product_values(self):
         self.product.state.update(inCurrentT2=16, chargerOpMode="charging")
-        self.charger.get_state.return_value = snapshot_state(0, 4)
+        self.charger.get_observations.return_value = snapshot_state(0, 4)
         snapshot = await self.client.async_read_current_snapshot()
         self.assertEqual((snapshot.current, snapshot.status), (0.0, "completed"))
         self.assert_no_commands()
 
-    async def test_public_sdk_rest_schema_without_total_current_uses_max_terminal_current(self):
+    async def test_legacy_sdk_state_schema_is_rejected_instead_of_silently_reused(self):
         # Minimal non-identifying numeric subset of the public SDK fixture:
         # https://github.com/nordicopen/pyeasee/blob/30d1cdca5074fbfc19757948b8ad7ab74d16d316/tests/fixtures/charger-state.json
-        # b9 incorrectly required totalCurrent, which this schema does not have.
+        # b11 must use the native observations response, not this legacy schema.
         state = {
             "inCurrentT2": 0.01899999938905239, "inCurrentT3": 0.009999999776482582,
             "inCurrentT4": 0.009999999776482582, "inCurrentT5": 0.014000000432133675,
             "chargerOpMode": 2, "reasonForNoCurrent": 0,
         }
         self.assertNotIn("totalCurrent", state)
-        self.charger.get_state.return_value = PublicState(state)
-        snapshot = await self.client.async_read_current_snapshot()
-        self.assertEqual((snapshot.current, snapshot.status), (0.01899999938905239, "awaiting_start"))
+        self.charger.get_observations.return_value = PublicState(state)
+        with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
+            await self.client.async_read_current_snapshot()
         self.assert_no_commands()
 
     async def test_maximum_uses_each_terminal_and_ignores_offered_or_total_current(self):
-        for terminal in ("inCurrentT2", "inCurrentT3", "inCurrentT4", "inCurrentT5"):
+        for terminal in (182, 183, 184, 185):
             with self.subTest(terminal=terminal):
                 state = dict(snapshot_state(0.01))
                 state.update(totalCurrent=99, outputCurrent=16)
-                state[terminal] = 6.125
-                self.charger.get_state.return_value = PublicState(state)
+                for observation in state["observations"]:
+                    if observation["id"] == terminal:
+                        observation["value"] = 6.125
+                self.charger.get_observations.return_value = PublicState(state)
                 snapshot = await self.client.async_read_current_snapshot()
                 self.assertEqual(snapshot.current, 6.125)
+        self.assert_no_commands()
+
+    async def test_extra_offered_observation_cannot_replace_measured_terminal_values(self):
+        state = dict(snapshot_state(0.011))
+        for observation in state["observations"][1:]:
+            observation["value"] = 0.011
+        state["observations"].append({"id": 114, "dataType": 3, "value": 16})
+        self.charger.get_observations.return_value = state
+        self.assertEqual((await self.client.async_read_current_snapshot()).current, 0.011)
+        self.charger.get_observations.assert_awaited_once_with(109, 182, 183, 184, 185)
+        self.assert_no_commands()
+
+    async def test_declared_numeric_text_is_parsed_without_defaulting_or_truncating(self):
+        state = dict(snapshot_state("1.2e1", "3"))
+        state["observations"].reverse()
+        self.charger.get_observations.return_value = state
+        snapshot = await self.client.async_read_current_snapshot()
+        self.assertEqual((snapshot.current, snapshot.status), (12.0, "charging"))
+        self.assert_no_commands()
+
+    async def test_every_required_id_must_be_present_once_even_with_extra_observations(self):
+        for observation_id in (109, 182, 183, 184, 185):
+            for malformed in ("duplicate", "missing"):
+                with self.subTest(observation_id=observation_id, malformed=malformed):
+                    state = dict(snapshot_state())
+                    rows = state["observations"]
+                    selected = next(row for row in rows if row["id"] == observation_id)
+                    if malformed == "duplicate":
+                        rows.append(dict(selected))
+                    else:
+                        rows.remove(selected)
+                        rows.append({"id": 114, "dataType": 3, "value": 16})
+                    self.charger.get_observations.return_value = state
+                    with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
+                        await self.client.async_read_current_snapshot()
+        self.assert_no_commands()
+
+    async def test_every_required_observation_has_its_exact_numeric_data_type(self):
+        for observation_id in (109, 182, 183, 184, 185):
+            expected = 4 if observation_id == 109 else 3
+            for wrong in (None, True, str(expected), float(expected), 2, 3 if expected == 4 else 4):
+                with self.subTest(observation_id=observation_id, wrong=wrong):
+                    state = dict(snapshot_state())
+                    row = next(row for row in state["observations"] if row["id"] == observation_id)
+                    row["dataType"] = wrong
+                    self.charger.get_observations.return_value = state
+                    with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
+                        await self.client.async_read_current_snapshot()
+        self.assert_no_commands()
+
+    async def test_malformed_observation_wrapper_ids_and_rows_are_rejected(self):
+        for value in (None, {}, (), "observations", [None] * 5):
+            with self.subTest(wrapper=value):
+                self.charger.get_observations.return_value = {"observations": value}
+                with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
+                    await self.client.async_read_current_snapshot()
+        for key, bad in (("id", None), ("id", True), ("id", "109"), ("id", 109.0), ("id", -1)):
+            with self.subTest(key=key, bad=bad):
+                state = dict(snapshot_state())
+                state["observations"][0][key] = bad
+                self.charger.get_observations.return_value = state
+                with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
+                    await self.client.async_read_current_snapshot()
+        for missing in ("id", "dataType", "value"):
+            with self.subTest(missing=missing):
+                state = dict(snapshot_state())
+                del state["observations"][0][missing]
+                self.charger.get_observations.return_value = state
+                with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
+                    await self.client.async_read_current_snapshot()
         self.assert_no_commands()
 
     async def test_cached_snapshot_is_rejected_after_each_runtime_object_reloads(self):
@@ -198,57 +280,59 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
         }
         for mode, status in expected.items():
             with self.subTest(mode=mode):
-                self.charger.get_state.return_value = snapshot_state(0, mode)
+                self.charger.get_observations.return_value = snapshot_state(0, mode)
                 self.assertEqual((await self.client.async_read_current_snapshot()).status, status)
         self.assert_no_commands()
 
     async def test_missing_or_nonmapping_response_is_rejected(self):
         for state in (None, [], "state", SimpleNamespace(totalCurrent=0, chargerOpMode=6)):
             with self.subTest(state=state):
-                self.charger.get_state.return_value = state
+                self.charger.get_observations.return_value = state
                 with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
                     await self.client.async_read_current_snapshot()
         self.assert_no_commands()
 
     async def test_invalid_or_missing_current_is_rejected(self):
-        for terminal in ("inCurrentT2", "inCurrentT3", "inCurrentT4", "inCurrentT5"):
-            for value in (None, True, False, float("nan"), float("inf"), -0.001, 1000.001, "bad", "6", object()):
+        for terminal in (182, 183, 184, 185):
+            for value in (None, True, False, float("nan"), float("inf"), -0.001, 1000.001, "bad", "NaN", "Inf", "1_0", " 6 ", object()):
                 with self.subTest(terminal=terminal, value=value):
                     state = dict(snapshot_state(16))
-                    state[terminal] = value
-                    self.charger.get_state.return_value = PublicState(state)
+                    for observation in state["observations"]:
+                        if observation["id"] == terminal:
+                            observation["value"] = value
+                    self.charger.get_observations.return_value = PublicState(state)
                     with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_invalid_current"):
                         await self.client.async_read_current_snapshot()
             with self.subTest(missing=terminal):
                 state = dict(snapshot_state(16))
-                del state[terminal]
+                state["observations"] = [observation for observation in state["observations"] if observation["id"] != terminal]
                 # Plausible alternative keys cannot fill in an absent terminal.
                 state.update(totalCurrent=16, outputCurrent=16)
-                self.charger.get_state.return_value = PublicState(state)
-                with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_invalid_current"):
+                self.charger.get_observations.return_value = PublicState(state)
+                with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
                     await self.client.async_read_current_snapshot()
-        self.charger.get_state.return_value = PublicState({"chargerOpMode": 6})
-        with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_invalid_current"):
+        self.charger.get_observations.return_value = PublicState({"chargerOpMode": 6})
+        with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
             await self.client.async_read_current_snapshot()
         self.assert_no_commands()
 
     async def test_numeric_current_boundaries_and_integral_float_mode(self):
         for value in (0, 1000, 6.125):
             with self.subTest(value=value):
-                self.charger.get_state.return_value = snapshot_state(value, 3.0)
+                self.charger.get_observations.return_value = snapshot_state(value, 3.0)
                 snapshot = await self.client.async_read_current_snapshot()
                 self.assertEqual((snapshot.current, snapshot.status), (float(value), "charging"))
 
     async def test_non_numeric_unknown_and_missing_operation_modes_are_rejected(self):
-        for value in (None, True, False, "3", "charging", float("nan"), float("inf"), 3.5, -1, 999):
+        for value in (None, True, False, "3.0", "3e0", "charging", float("nan"), float("inf"), 3.5, -1, 999):
             with self.subTest(mode=value):
-                self.charger.get_state.return_value = snapshot_state(0, value)
+                self.charger.get_observations.return_value = snapshot_state(0, value)
                 with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_invalid_operation_mode"):
                     await self.client.async_read_current_snapshot()
         state = dict(snapshot_state(0))
-        del state["chargerOpMode"]
-        self.charger.get_state.return_value = PublicState(state)
-        with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_invalid_operation_mode"):
+        state["observations"] = state["observations"][1:]
+        self.charger.get_observations.return_value = PublicState(state)
+        with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_missing_or_invalid"):
             await self.client.async_read_current_snapshot()
         self.assert_no_commands()
 
@@ -259,7 +343,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.product.state[key] = value
                 with self.assertRaises(adapter.EaseeAdapterError):
                     await self.client.async_read_current_snapshot()
-        self.charger.get_state.assert_not_awaited()
+        self.charger.get_observations.assert_not_awaited()
         self.assert_no_commands()
 
     async def test_health_loss_during_request_discards_returned_state(self):
@@ -267,11 +351,11 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(key=key):
                 self.product.state = self.health()
 
-                async def read(*, raw):
+                async def read(*observation_ids):
                     self.product.state[key] = value
                     return snapshot_state(0)
 
-                self.charger.get_state.side_effect = read
+                self.charger.get_observations.side_effect = read
                 with self.assertRaises(adapter.EaseeAdapterError):
                     await self.client.async_read_current_snapshot()
         self.assert_no_commands()
@@ -279,38 +363,38 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_charger_reload_during_request_discards_result(self):
         replacement = self.make_charger(self.circuit)
 
-        async def read(*, raw):
+        async def read(*observation_ids):
             self.controller.get_chargers.return_value = [replacement]
             self.controller.chargers_data = [SimpleNamespace(product=replacement, state=self.health())]
             # Simulate a concurrent command/property resolving the replacement.
             self.assertIsNone(self.client.telemetry_block_reason)
             return snapshot_state(0)
 
-        self.charger.get_state.side_effect = read
+        self.charger.get_observations.side_effect = read
         with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_runtime_changed_during_request"):
             await self.client.async_read_current_snapshot()
-        replacement.get_state.assert_not_awaited()
+        replacement.get_observations.assert_not_awaited()
         replacement.resume.assert_not_awaited()
         self.assert_no_commands()
 
     async def test_product_reload_during_request_discards_result(self):
-        async def read(*, raw):
+        async def read(*observation_ids):
             self.controller.chargers_data = [SimpleNamespace(product=self.charger, state=self.health())]
             return snapshot_state(0)
 
-        self.charger.get_state.side_effect = read
+        self.charger.get_observations.side_effect = read
         with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_runtime_changed_during_request"):
             await self.client.async_read_current_snapshot()
         self.assert_no_commands()
 
     async def test_controller_reload_with_same_child_objects_discards_result(self):
-        async def read(*, raw):
+        async def read(*observation_ids):
             self.hass.data["easee"]["controller"] = SimpleNamespace(
                 get_chargers=Mock(return_value=[self.charger]), chargers_data=[self.product]
             )
             return snapshot_state(0)
 
-        self.charger.get_state.side_effect = read
+        self.charger.get_observations.side_effect = read
         with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_runtime_changed_during_request"):
             await self.client.async_read_current_snapshot()
         self.assert_no_commands()
@@ -321,7 +405,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.registry.async_get.return_value = self.device
                 self.client.device_id = "ha-device-id"
 
-                async def read(*, raw):
+                async def read(*observation_ids):
                     if mutation == "missing":
                         self.registry.async_get.return_value = None
                     elif mutation == "selection":
@@ -330,19 +414,19 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
                         self.registry.async_get.return_value = SimpleNamespace(identifiers=self.device.identifiers.copy())
                     return snapshot_state(0)
 
-                self.charger.get_state.side_effect = read
+                self.charger.get_observations.side_effect = read
                 with self.assertRaises(adapter.EaseeAdapterError):
                     await self.client.async_read_current_snapshot()
         self.assert_no_commands()
 
     async def test_missing_public_state_method_is_rejected_without_commands(self):
-        self.charger.get_state = None
+        self.charger.get_observations = None
         with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_api_unavailable"):
             await self.client.async_read_current_snapshot()
         self.assert_no_commands()
 
     async def test_request_exception_text_is_never_exposed(self):
-        self.charger.get_state.side_effect = RuntimeError("private token remote URL")
+        self.charger.get_observations.side_effect = RuntimeError("private token remote URL")
         with self.assertRaises(adapter.EaseeAdapterError) as raised:
             await self.client.async_read_current_snapshot()
         self.assertEqual(str(raised.exception), "easee_snapshot_failed:RuntimeError")
@@ -350,22 +434,22 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_commands()
 
     async def test_timeout_is_credential_free_and_bounded_to_ten_seconds(self):
-        async def blocked(*, raw):
+        async def blocked(*observation_ids):
             await asyncio.sleep(60)
 
-        self.charger.get_state.side_effect = blocked
+        self.charger.get_observations.side_effect = blocked
         with patch.object(adapter, "REQUEST_TIMEOUT_SECONDS", 0.001):
             with self.assertRaisesRegex(adapter.EaseeAdapterError, "^easee_snapshot_failed:TimeoutError$"):
                 await self.client.async_read_current_snapshot()
         real_timeout = asyncio.timeout
-        self.charger.get_state.side_effect = None
+        self.charger.get_observations.side_effect = None
         with patch.object(adapter, "REQUEST_TIMEOUT_SECONDS", 60), patch.object(adapter.asyncio, "timeout", wraps=real_timeout) as timeout:
             await self.client.async_read_current_snapshot()
             timeout.assert_called_once_with(10)
         self.assert_no_commands()
 
     async def test_cancellation_propagates_without_commands(self):
-        self.charger.get_state.side_effect = asyncio.CancelledError()
+        self.charger.get_observations.side_effect = asyncio.CancelledError()
         with self.assertRaises(asyncio.CancelledError):
             await self.client.async_read_current_snapshot()
         self.assert_no_commands()

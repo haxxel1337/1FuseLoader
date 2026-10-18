@@ -162,6 +162,36 @@ class SnapshotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.fetch()
         self.assertEqual(self.adapter.async_read_current_snapshot.await_count, 2)
 
+    async def test_safe_underlying_failure_types_are_visible_and_clear_after_success(self):
+        for failure in ("KeyError", "ForbiddenServiceException", "TimeoutError"):
+            with self.subTest(failure=failure):
+                self.controller._charger_snapshot_next_request = 0
+                self.adapter.async_read_current_snapshot.side_effect = RuntimeError(
+                    "easee_snapshot_failed:" + failure)
+                with self.assertLogs(fixtures.runtime._LOGGER, level="WARNING") as logs:
+                    await self.fetch()
+                self.controller._read_input()
+                self.assertEqual(self.controller.source_diagnostics["charger_snapshot_failure_type"], failure)
+                self.assertIn(failure, str(logs.output))
+        self.controller._charger_snapshot_next_request = 0
+        self.adapter.async_read_current_snapshot.side_effect = self.snapshot
+        await self.fetch()
+        self.assertIsNone(self.controller._charger_snapshot_failure_type)
+
+    async def test_unrecognized_or_extended_failure_types_never_expose_private_text(self):
+        for text in ("easee_snapshot_failed:private-token-and-url",
+                     "easee_snapshot_failed:KeyError:private-token-and-url",
+                     "private-token-and-url:KeyError"):
+            with self.subTest(text=text):
+                self.controller._charger_snapshot_next_request = 0
+                self.adapter.async_read_current_snapshot.side_effect = RuntimeError(text)
+                with self.assertLogs(fixtures.runtime._LOGGER, level="WARNING") as logs:
+                    await self.fetch()
+                self.controller._read_input()
+                self.assertIsNone(self.controller._charger_snapshot_failure_type)
+                self.assertNotIn("private-token-and-url", str(logs.output))
+                self.assertNotIn("private-token-and-url", str(self.controller.source_diagnostics))
+
     async def test_slow_get_does_not_block_immediate_protective_tick(self):
         entered, release = asyncio.Event(), asyncio.Event()
         async def read():
