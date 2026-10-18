@@ -45,7 +45,9 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.response = SimpleNamespace(status=202)
         self.state_response = SimpleNamespace(json=AsyncMock(return_value={
-            "totalCurrent": 0.012, "chargerOpMode": 6, "reasonForNoCurrent": 0
+            "inCurrentT2": 0.012, "inCurrentT3": 0.0,
+            "inCurrentT4": 0.0, "inCurrentT5": 0.0,
+            "chargerOpMode": 6, "reasonForNoCurrent": 0,
         }))
         self.transport = SimpleNamespace(
             post=AsyncMock(return_value=self.response),
@@ -153,7 +155,9 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_raw_state_get_uses_public_endpoint_and_mapping_contract(self):
         state = await self.charger.get_state(raw=True)
         self.assertIsInstance(state, Mapping)
-        self.assertEqual(state.get("totalCurrent"), 0.012)
+        self.assertEqual(state.get("inCurrentT2"), 0.012)
+        self.assertEqual(tuple(state.get(f"inCurrentT{n}") for n in (3, 4, 5)), (0.0, 0.0, 0.0))
+        self.assertIsNone(state.get("totalCurrent"))
         self.assertEqual(state["chargerOpMode"], 6)
         self.assertIsNone(state.get("missing"))
         self.assertEqual(state.get("missing", "fallback"), "fallback")
@@ -163,11 +167,37 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         self.state_response.json.assert_awaited_once_with()
         self.transport.post.assert_not_awaited()
 
+    async def test_adapter_reads_public_sdk_terminal_schema_through_real_get_state(self):
+        # The environment is a stub; Charger.get_state and ChargerState are
+        # real pinned pyeasee code, with only the HTTP transport substituted.
+        import test_1fuseloader_snapshot_adapter as adapter_tests
+
+        fixture = adapter_tests.SnapshotAdapterTests(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.product.product = self.charger
+        fixture.controller.get_chargers.return_value = [self.charger]
+        fixture.device.identifiers = {("easee", self.charger.id)}
+        self.state_response.json.return_value = {
+            # Numeric subset from SDK fixture commit 30d1cdca5074fbfc19757948b8ad7ab74d16d316.
+            "inCurrentT2": 0.01899999938905239, "inCurrentT3": 0.009999999776482582,
+            "inCurrentT4": 0.009999999776482582, "inCurrentT5": 0.014000000432133675,
+            "chargerOpMode": 2, "reasonForNoCurrent": 0,
+        }
+        snapshot = await fixture.client.async_read_current_snapshot()
+        self.assertEqual((snapshot.current, snapshot.status), (0.01899999938905239, "awaiting_start"))
+        self.transport.get.assert_awaited_once_with(
+            "/api/chargers/CONTRACT_TEST_CHARGER/state"
+        )
+        self.transport.post.assert_not_awaited()
+
     async def test_default_state_converts_mode_while_raw_preserves_numeric_mode(self):
         for mode, expected in ((0, "OFFLINE"), (4, "COMPLETED"), (5, "ERROR"), (106, "AWAITING_SCHEDULED_START"), (160, "ERROR_OVERCURRENT")):
             with self.subTest(mode=mode):
                 self.state_response.json.return_value = {
-                    "totalCurrent": 0, "chargerOpMode": mode, "reasonForNoCurrent": None
+                    "inCurrentT2": 0, "inCurrentT3": 0,
+                    "inCurrentT4": 0, "inCurrentT5": 0,
+                    "chargerOpMode": mode, "reasonForNoCurrent": None,
                 }
                 self.assertEqual((await self.charger.get_state()).get("chargerOpMode"), expected)
                 self.assertEqual((await self.charger.get_state(raw=True)).get("chargerOpMode"), mode)

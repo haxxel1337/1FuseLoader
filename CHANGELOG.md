@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0b10
+
+- Correct the read-only charger snapshot schema: derive measured current from
+  all four required `inCurrentT2`–`inCurrentT5` fields, matching Easee 0.9.74's
+  Current sensor. Never substitute offered current or a synthetic total field.
+- Add public-schema regression coverage and expose only fixed, credential-free
+  snapshot error codes, preserving conservative fallback when a read fails.
+
 ## 0.4.0b9
 
 - Treat Startup Charge as the minimum fully buffered start threshold. After

@@ -204,15 +204,23 @@ class EaseeCommandAdapter:
             self._require_same_runtime(identity, healthy=True)
             if not isinstance(state, Mapping):
                 raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
-            value = state.get("totalCurrent")
-            if isinstance(value, bool):
-                raise EaseeAdapterError("easee_snapshot_invalid_current")
-            try:
-                current = float(value)
-            except (TypeError, ValueError, OverflowError):
-                raise EaseeAdapterError("easee_snapshot_invalid_current") from None
-            if not isfinite(current) or not 0 <= current <= 1000:
-                raise EaseeAdapterError("easee_snapshot_invalid_current")
+            # Match Easee 0.9.74's current sensor: the largest measured input
+            # terminal current. REST has no guaranteed totalCurrent field;
+            # outputCurrent is the offered pilot limit, not measured EV draw.
+            # Every terminal must validate so max() cannot hide a bad sample.
+            terminal_currents = []
+            for terminal in ("inCurrentT2", "inCurrentT3", "inCurrentT4", "inCurrentT5"):
+                value = state.get(terminal)
+                if type(value) not in (int, float):
+                    raise EaseeAdapterError("easee_snapshot_invalid_current")
+                try:
+                    number = float(value)
+                except (ValueError, OverflowError):
+                    raise EaseeAdapterError("easee_snapshot_invalid_current") from None
+                if not isfinite(number) or not 0 <= number <= 1000:
+                    raise EaseeAdapterError("easee_snapshot_invalid_current")
+                terminal_currents.append(number)
+            current = max(terminal_currents)
             mode = state.get("chargerOpMode")
             if type(mode) not in (int, float) or not isfinite(mode):
                 raise EaseeAdapterError("easee_snapshot_invalid_operation_mode")

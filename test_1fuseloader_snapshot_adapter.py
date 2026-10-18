@@ -37,6 +37,15 @@ class PublicState(Mapping):
         return len(self.values)
 
 
+def snapshot_state(current=0.012, mode=6):
+    """REST input-terminal readings, not the offered pilot current."""
+    return PublicState({
+        "inCurrentT2": current, "inCurrentT3": 0.0,
+        "inCurrentT4": 0.0, "inCurrentT5": 0.0,
+        "chargerOpMode": mode, "reasonForNoCurrent": 0,
+    })
+
+
 class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.response = SimpleNamespace(status=202, release=Mock())
@@ -80,7 +89,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(
             id="selected-charger",
             circuit=circuit,
-            get_state=AsyncMock(return_value=PublicState({"totalCurrent": 0.012, "chargerOpMode": 6})),
+            get_state=AsyncMock(return_value=snapshot_state()),
             pause=AsyncMock(return_value=self.response),
             resume=AsyncMock(return_value=self.response),
             start=AsyncMock(),
@@ -113,10 +122,36 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_commands()
 
     async def test_api_zero_and_status_do_not_reuse_old_product_values(self):
-        self.product.state.update(totalCurrent=16, chargerOpMode="charging")
-        self.charger.get_state.return_value = PublicState({"totalCurrent": 0, "chargerOpMode": 4})
+        self.product.state.update(inCurrentT2=16, chargerOpMode="charging")
+        self.charger.get_state.return_value = snapshot_state(0, 4)
         snapshot = await self.client.async_read_current_snapshot()
         self.assertEqual((snapshot.current, snapshot.status), (0.0, "completed"))
+        self.assert_no_commands()
+
+    async def test_public_sdk_rest_schema_without_total_current_uses_max_terminal_current(self):
+        # Minimal non-identifying numeric subset of the public SDK fixture:
+        # https://github.com/nordicopen/pyeasee/blob/30d1cdca5074fbfc19757948b8ad7ab74d16d316/tests/fixtures/charger-state.json
+        # b9 incorrectly required totalCurrent, which this schema does not have.
+        state = {
+            "inCurrentT2": 0.01899999938905239, "inCurrentT3": 0.009999999776482582,
+            "inCurrentT4": 0.009999999776482582, "inCurrentT5": 0.014000000432133675,
+            "chargerOpMode": 2, "reasonForNoCurrent": 0,
+        }
+        self.assertNotIn("totalCurrent", state)
+        self.charger.get_state.return_value = PublicState(state)
+        snapshot = await self.client.async_read_current_snapshot()
+        self.assertEqual((snapshot.current, snapshot.status), (0.01899999938905239, "awaiting_start"))
+        self.assert_no_commands()
+
+    async def test_maximum_uses_each_terminal_and_ignores_offered_or_total_current(self):
+        for terminal in ("inCurrentT2", "inCurrentT3", "inCurrentT4", "inCurrentT5"):
+            with self.subTest(terminal=terminal):
+                state = dict(snapshot_state(0.01))
+                state.update(totalCurrent=99, outputCurrent=16)
+                state[terminal] = 6.125
+                self.charger.get_state.return_value = PublicState(state)
+                snapshot = await self.client.async_read_current_snapshot()
+                self.assertEqual(snapshot.current, 6.125)
         self.assert_no_commands()
 
     async def test_cached_snapshot_is_rejected_after_each_runtime_object_reloads(self):
@@ -163,7 +198,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
         }
         for mode, status in expected.items():
             with self.subTest(mode=mode):
-                self.charger.get_state.return_value = PublicState({"totalCurrent": 0, "chargerOpMode": mode})
+                self.charger.get_state.return_value = snapshot_state(0, mode)
                 self.assertEqual((await self.client.async_read_current_snapshot()).status, status)
         self.assert_no_commands()
 
@@ -176,9 +211,20 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assert_no_commands()
 
     async def test_invalid_or_missing_current_is_rejected(self):
-        for value in (None, True, False, float("nan"), float("inf"), -0.001, 1000.001, "bad", object()):
-            with self.subTest(value=value):
-                self.charger.get_state.return_value = PublicState({"totalCurrent": value, "chargerOpMode": 6})
+        for terminal in ("inCurrentT2", "inCurrentT3", "inCurrentT4", "inCurrentT5"):
+            for value in (None, True, False, float("nan"), float("inf"), -0.001, 1000.001, "bad", "6", object()):
+                with self.subTest(terminal=terminal, value=value):
+                    state = dict(snapshot_state(16))
+                    state[terminal] = value
+                    self.charger.get_state.return_value = PublicState(state)
+                    with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_invalid_current"):
+                        await self.client.async_read_current_snapshot()
+            with self.subTest(missing=terminal):
+                state = dict(snapshot_state(16))
+                del state[terminal]
+                # Plausible alternative keys cannot fill in an absent terminal.
+                state.update(totalCurrent=16, outputCurrent=16)
+                self.charger.get_state.return_value = PublicState(state)
                 with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_invalid_current"):
                     await self.client.async_read_current_snapshot()
         self.charger.get_state.return_value = PublicState({"chargerOpMode": 6})
@@ -189,17 +235,19 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_numeric_current_boundaries_and_integral_float_mode(self):
         for value in (0, 1000, 6.125):
             with self.subTest(value=value):
-                self.charger.get_state.return_value = PublicState({"totalCurrent": value, "chargerOpMode": 3.0})
+                self.charger.get_state.return_value = snapshot_state(value, 3.0)
                 snapshot = await self.client.async_read_current_snapshot()
                 self.assertEqual((snapshot.current, snapshot.status), (float(value), "charging"))
 
     async def test_non_numeric_unknown_and_missing_operation_modes_are_rejected(self):
         for value in (None, True, False, "3", "charging", float("nan"), float("inf"), 3.5, -1, 999):
             with self.subTest(mode=value):
-                self.charger.get_state.return_value = PublicState({"totalCurrent": 0, "chargerOpMode": value})
+                self.charger.get_state.return_value = snapshot_state(0, value)
                 with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_invalid_operation_mode"):
                     await self.client.async_read_current_snapshot()
-        self.charger.get_state.return_value = PublicState({"totalCurrent": 0})
+        state = dict(snapshot_state(0))
+        del state["chargerOpMode"]
+        self.charger.get_state.return_value = PublicState(state)
         with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_snapshot_invalid_operation_mode"):
             await self.client.async_read_current_snapshot()
         self.assert_no_commands()
@@ -221,7 +269,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
 
                 async def read(*, raw):
                     self.product.state[key] = value
-                    return PublicState({"totalCurrent": 0, "chargerOpMode": 6})
+                    return snapshot_state(0)
 
                 self.charger.get_state.side_effect = read
                 with self.assertRaises(adapter.EaseeAdapterError):
@@ -236,7 +284,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.controller.chargers_data = [SimpleNamespace(product=replacement, state=self.health())]
             # Simulate a concurrent command/property resolving the replacement.
             self.assertIsNone(self.client.telemetry_block_reason)
-            return PublicState({"totalCurrent": 0, "chargerOpMode": 6})
+            return snapshot_state(0)
 
         self.charger.get_state.side_effect = read
         with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_runtime_changed_during_request"):
@@ -248,7 +296,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def test_product_reload_during_request_discards_result(self):
         async def read(*, raw):
             self.controller.chargers_data = [SimpleNamespace(product=self.charger, state=self.health())]
-            return PublicState({"totalCurrent": 0, "chargerOpMode": 6})
+            return snapshot_state(0)
 
         self.charger.get_state.side_effect = read
         with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_runtime_changed_during_request"):
@@ -260,7 +308,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.hass.data["easee"]["controller"] = SimpleNamespace(
                 get_chargers=Mock(return_value=[self.charger]), chargers_data=[self.product]
             )
-            return PublicState({"totalCurrent": 0, "chargerOpMode": 6})
+            return snapshot_state(0)
 
         self.charger.get_state.side_effect = read
         with self.assertRaisesRegex(adapter.EaseeAdapterError, "easee_runtime_changed_during_request"):
@@ -280,7 +328,7 @@ class SnapshotAdapterTests(unittest.IsolatedAsyncioTestCase):
                         self.client.device_id = "different-device-id"
                     else:
                         self.registry.async_get.return_value = SimpleNamespace(identifiers=self.device.identifiers.copy())
-                    return PublicState({"totalCurrent": 0, "chargerOpMode": 6})
+                    return snapshot_state(0)
 
                 self.charger.get_state.side_effect = read
                 with self.assertRaises(adapter.EaseeAdapterError):
