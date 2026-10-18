@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0b11
+
+- Read the selected charger's measured terminal currents and operation mode
+  through the same observation API used by Easee 0.9.74, in one bounded GET.
+  Validate every required observation ID and declared data type; reject missing,
+  duplicated or invalid measurements without substituting offered current.
+- Expose a fixed allowlist of underlying failure types without logging private
+  exception text. Keep recovery policy, request throttling, race checks and
+  cumulative exposure unchanged.
+
 ## 0.4.0b10
 
 - Correct the read-only charger snapshot schema: derive measured current from

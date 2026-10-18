@@ -105,6 +105,10 @@ matching the supported Easee integration's Current sensor. All four measured
 values must be present, numeric and valid; `outputCurrent` is offered pilot
 current and is never used as a measured-current fallback. The snapshot error
 reason diagnostic contains only fixed codes, without raw API responses.
+The GET uses the supported integration's `get_observations` API for operation
+mode and the four terminal currents. Every required ID must occur exactly once
+with its expected declared data type. Underlying read failures expose only a
+fixed allowlist of exception classes, never response bodies or private text.
 
 Turn Fast Headroom Recovery off for the previous gradual mode: increases wait
 for 30 seconds of stable headroom and then rise at most 1 A per 15 seconds.

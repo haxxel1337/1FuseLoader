@@ -167,9 +167,9 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         self.state_response.json.assert_awaited_once_with()
         self.transport.post.assert_not_awaited()
 
-    async def test_adapter_reads_public_sdk_terminal_schema_through_real_get_state(self):
-        # The environment is a stub; Charger.get_state and ChargerState are
-        # real pinned pyeasee code, with only the HTTP transport substituted.
+    async def test_adapter_reads_native_observations_through_real_sdk_getter(self):
+        # The environment is a stub; Charger.get_observations is real pinned
+        # pyeasee code. This schema follows native polling, not a device capture.
         import test_1fuseloader_snapshot_adapter as adapter_tests
 
         fixture = adapter_tests.SnapshotAdapterTests(methodName="runTest")
@@ -178,17 +178,52 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         fixture.product.product = self.charger
         fixture.controller.get_chargers.return_value = [self.charger]
         fixture.device.identifiers = {("easee", self.charger.id)}
-        self.state_response.json.return_value = {
-            # Numeric subset from SDK fixture commit 30d1cdca5074fbfc19757948b8ad7ab74d16d316.
-            "inCurrentT2": 0.01899999938905239, "inCurrentT3": 0.009999999776482582,
-            "inCurrentT4": 0.009999999776482582, "inCurrentT5": 0.014000000432133675,
-            "chargerOpMode": 2, "reasonForNoCurrent": 0,
-        }
+        self.state_response.json.return_value = dict(adapter_tests.snapshot_state("0.011", "2"))
         snapshot = await fixture.client.async_read_current_snapshot()
-        self.assertEqual((snapshot.current, snapshot.status), (0.01899999938905239, "awaiting_start"))
+        self.assertEqual((snapshot.current, snapshot.status), (0.011, "awaiting_start"))
         self.transport.get.assert_awaited_once_with(
-            "/api/chargers/CONTRACT_TEST_CHARGER/state"
+            "/state/CONTRACT_TEST_CHARGER/observations?ids=109,182,183,184,185"
         )
+        self.transport.post.assert_not_awaited()
+
+    async def test_native_observation_ids_and_numeric_data_types_match_pinned_sdk(self):
+        from pyeasee.const import ChargerStreamData
+        from pyeasee.utils import convert_stream_data
+
+        self.assertEqual((
+            ChargerStreamData.state_chargerOpMode.value,
+            ChargerStreamData.state_inCurrentT2.value,
+            ChargerStreamData.state_inCurrentT3.value,
+            ChargerStreamData.state_inCurrentT4.value,
+            ChargerStreamData.state_inCurrentT5.value,
+        ), (109, 182, 183, 184, 185))
+        self.assertEqual(convert_stream_data(3, "0.011"), 0.011)
+        self.assertIsInstance(convert_stream_data(3, "0.011"), float)
+        self.assertEqual(convert_stream_data(4, "2"), 2)
+        self.assertIsInstance(convert_stream_data(4, "2"), int)
+        self.transport.post.assert_not_awaited()
+        self.transport.get.assert_not_awaited()
+
+    async def test_observation_get_returns_wrapper_without_legacy_state_constructor(self):
+        response = {"observations": [{"id": 109, "dataType": 4, "value": 2}]}
+        self.state_response.json.return_value = response
+        result = await self.charger.get_observations(109, 182, 183, 184, 185)
+        self.assertIs(result, response)
+        self.assertNotIn("reasonForNoCurrent", result)
+        self.transport.get.assert_awaited_once_with(
+            "/state/CONTRACT_TEST_CHARGER/observations?ids=109,182,183,184,185"
+        )
+        self.transport.post.assert_not_awaited()
+
+    async def test_observation_get_server_failure_returns_none_other_failures_propagate(self):
+        self.transport.get.side_effect = ServerFailureException("offline test")
+        self.assertIsNone(await self.charger.get_observations(109, 182, 183, 184, 185))
+        for error in (ForbiddenServiceException({"title": "Offline failure"}), asyncio.CancelledError()):
+            with self.subTest(error=type(error).__name__):
+                self.transport.get.side_effect = error
+                with self.assertRaises(type(error)) as raised:
+                    await self.charger.get_observations(109, 182, 183, 184, 185)
+                self.assertIs(raised.exception, error)
         self.transport.post.assert_not_awaited()
 
     async def test_default_state_converts_mode_while_raw_preserves_numeric_mode(self):
