@@ -136,7 +136,23 @@ class SnapshotRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await self.fetch()
         self.assertIsNone(self.controller._charger_snapshot)
         self.assertEqual(self.controller._charger_snapshot_error, "RuntimeError")
+        self.assertIsNone(self.controller._charger_snapshot_error_reason)
         self.assertNotIn("private-token-and-url", str(logs.output))
+
+    async def test_only_fixed_snapshot_error_code_is_exposed_then_cleared_on_success(self):
+        self.adapter.async_read_current_snapshot.side_effect = RuntimeError(
+            "easee_snapshot_invalid_current:private-token-and-url")
+        with self.assertLogs(fixtures.runtime._LOGGER, level="WARNING") as logs:
+            await self.fetch()
+        self.controller._read_input()
+        self.assertEqual(self.controller.source_diagnostics["charger_snapshot_error_reason"],
+                         "easee_snapshot_invalid_current")
+        self.assertNotIn("private-token-and-url", str(logs.output))
+        self.assertNotIn("private-token-and-url", str(self.controller.source_diagnostics))
+        self.controller._charger_snapshot_next_request = 0
+        self.adapter.async_read_current_snapshot.side_effect = self.snapshot
+        await self.fetch()
+        self.assertIsNone(self.controller._charger_snapshot_error_reason)
 
     async def test_requests_are_throttled_and_single_flight(self):
         await self.fetch()

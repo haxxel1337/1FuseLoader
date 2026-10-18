@@ -100,6 +100,12 @@ cache expiry discard the pair. A heartbeat alone never refreshes a current
 measurement. An unavailable read retains conservative limits and retries only
 after the cooldown.
 
+The read uses `max(inCurrentT2, inCurrentT3, inCurrentT4, inCurrentT5)`,
+matching the supported Easee integration's Current sensor. All four measured
+values must be present, numeric and valid; `outputCurrent` is offered pilot
+current and is never used as a measured-current fallback. The snapshot error
+reason diagnostic contains only fixed codes, without raw API responses.
+
 Turn Fast Headroom Recovery off for the previous gradual mode: increases wait
 for 30 seconds of stable headroom and then rise at most 1 A per 15 seconds.
 Physical/report response can make gradual recovery slower than this minimum
