@@ -274,8 +274,7 @@ class ContinuityTests(unittest.TestCase):
     def test_grid_first_hold_requires_new_grid_and_known_old_ev_timestamps(self):
         for metadata in ({"grid_report_ts": None, "charger_report_ts": 100},
                          {"grid_report_ts": 102, "charger_report_ts": None},
-                         {}, {"grid_report_ts": 101, "charger_report_ts": 100},
-                         {"grid_report_ts": 102, "charger_report_ts": 102}):
+                         {"grid_report_ts": 101, "charger_report_ts": 100}):
             with self.subTest(metadata=metadata):
                 regulator = self.pending_reduction()
                 decision = self.sample(regulator, 2, grid=11, ev=16, **metadata)

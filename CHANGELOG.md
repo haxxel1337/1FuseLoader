@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0b12
+
+- Preserve an accepted lower current cap while delayed EV/grid reports catch
+  up after a reduction during startup. An unchanged EV value well below the
+  new cap cannot prove that the vehicle has responded to the reduction.
+- Bound delayed high EV reports by the preceding accepted offer, and retain
+  only the lower accepted cap within conservative raw-grid headroom. Do not
+  propose an increase or resume while this response remains unverified.
+- Share a nonrenewable alignment budget across report-order changes and lease
+  renewals. Retain lower-cap protection after near-cap confirmation without
+  pinning a stable vehicle at its previous cap. Distinguish further reductions
+  in the same response chain from a new reduction after confirmed recovery.
+  Keep telemetry faults, timeout and overload protection in control. Preserve
+  configuration, cumulative exposure and the charger API.
+
 ## 0.4.0b11
 
 - Read the selected charger's measured terminal currents and operation mode
