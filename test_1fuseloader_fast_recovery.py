@@ -33,8 +33,9 @@ class FastRecoveryTests(unittest.TestCase):
 
     def waiting_start(self, **settings):
         r = self.regulator(**settings)
-        self.sample(r, 0, 2.6, 0.013, "awaiting_start")
-        offered = self.sample(r, 60, 2.6, 0.013, "ready_to_charge")
+        # Seven amps of headroom creates the seven-amp accepted-cap fixture.
+        self.sample(r, 0, 16, 0.013, "awaiting_start")
+        offered = self.sample(r, 60, 16, 0.013, "ready_to_charge")
         self.assertEqual(offered.current_p1, 7)
         return r
 
@@ -98,37 +99,45 @@ class FastRecoveryTests(unittest.TestCase):
         for wall in (None, True, float("nan"), float("inf")):
             with self.subTest(wall=wall):
                 d = self.sample(self.regulator(), 0, 14, 10, wall_now_ts=wall)
-                self.assertEqual((d.mode, d.current_p1), ("waiting_for_fresh_sources", 10))
+                self.assertEqual(d.current_p1, 9)
+                self.assertTrue(d.current_refresh_required)
 
     def test_missing_or_invalid_report_timestamps_never_open_fast_gate(self):
         for extra in ({"grid_report_ts": None}, {"charger_report_ts": None},
                       {"grid_report_ts": True}, {"charger_report_ts": float("nan")}):
             with self.subTest(extra=extra):
                 d = self.sample(self.regulator(), 0, 14, 10, **extra)
-                self.assertEqual((d.mode, d.current_p1), ("waiting_for_fresh_sources", 10))
+                self.assertEqual(d.current_p1, 9)
+                self.assertTrue(d.current_refresh_required)
 
     def test_old_ev_receipt_is_not_made_fresh_by_grid_or_stream_health(self):
         d = self.sample(self.regulator(), 0, 14, 10, wall_now_ts=2000,
                         grid_report_ts=2000, charger_report_ts=1000)
-        self.assertEqual((d.mode, d.current_p1), ("waiting_for_fresh_sources", 10))
+        self.assertEqual(d.current_p1, 9)
+        self.assertTrue(d.current_refresh_required)
 
     def test_two_equally_old_reports_fail_absolute_age_check_even_with_zero_skew(self):
         d = self.sample(self.regulator(), 0, 14, 10, wall_now_ts=2000,
                         grid_report_ts=1000, charger_report_ts=1000)
-        self.assertEqual((d.mode, d.current_p1), ("waiting_for_fresh_sources", 10))
+        self.assertEqual(d.current_p1, 9)
+        self.assertTrue(d.current_refresh_required)
 
     def test_future_reports_outside_clock_tolerance_never_open_fast_gate(self):
         d = self.sample(self.regulator(), 0, 14, 10, grid_report_ts=1006, charger_report_ts=1006)
-        self.assertEqual((d.mode, d.current_p1), ("waiting_for_fresh_sources", 10))
+        self.assertEqual(d.current_p1, 9)
+        self.assertTrue(d.current_refresh_required)
 
     def test_report_skew_beyond_alignment_window_waits_at_current_cap(self):
         d = self.sample(self.regulator(), 0, 14, 10, grid_report_ts=1000, charger_report_ts=989)
-        self.assertEqual((d.mode, d.current_p1), ("waiting_for_fresh_sources", 10))
+        self.assertEqual(d.current_p1, 9)
+        self.assertTrue(d.current_refresh_required)
 
     def test_explicit_fresh_report_after_freshness_wait_can_recover_directly(self):
         r = self.regulator()
         self.sample(r, 0, 14, 10, charger_report_ts=800)
-        d = self.sample(r, 5, 14, 10)
+        # Observe the conservative nine-amp takeover before recovering.
+        self.sample(r, 1, 13, 9)
+        d = self.sample(r, 5, 13, 9)
         self.assertEqual(d.current_p1, 16)
         self.assertTrue(d.should_call_service)
 
@@ -146,7 +155,8 @@ class FastRecoveryTests(unittest.TestCase):
         partial = self.sample(r, 67, 5.6, 3, grid_report_ts=1067, charger_report_ts=1066)
         self.assertTrue(r._positive_reports_advanced())
         self.assertIsNotNone(r._positive_cap)
-        self.assertEqual((partial.mode, partial.current_p1), ("waiting_for_aligned_sources", 7))
+        self.assertEqual(partial.current_p1, 7)
+        self.assertIsNotNone(r._positive_cap)
 
     def test_full_coherent_start_response_can_recover_directly_to_sixteen(self):
         r = self.waiting_start()
@@ -156,13 +166,13 @@ class FastRecoveryTests(unittest.TestCase):
         self.assertTrue(complete.should_call_service)
         self.assertEqual(r._positive_cap, 16)
 
-    def test_idle_and_leakage_never_jump_to_maximum(self):
+    def test_idle_and_leakage_can_offer_maximum_without_issuing_resume(self):
         for status, ev in (("ready_to_charge", 0.013), ("awaiting_start", 0.013), ("charging", 0.181)):
             with self.subTest(status=status):
                 r = self.regulator()
                 for at in (0, 60, 120, 600):
                     d = self.sample(r, at, 2.6, ev, status)
-                    self.assertLessEqual(d.current_p1, 7)
+                    self.assertEqual(d.current_p1, 0 if at == 0 else 16)
                     self.assertNotEqual(d.command, "resume")
 
     def test_manual_and_scheduled_waits_remain_protected(self):

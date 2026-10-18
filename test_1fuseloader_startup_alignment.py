@@ -26,6 +26,7 @@ class StartupAlignmentTests(unittest.TestCase):
 
     def sample(self, r, now, grid, ev, status="charging", *, grid_ts=None,
                ev_ts=None, accept=True, **extra):
+        extra.setdefault("wall_now_ts", max(100 + now, grid_ts or 0, ev_ts or 0))
         d = r.evaluate(logic.RegulatorInput(
             now_ts=now, status=status, grid_l1=grid, charger_current=ev,
             grid_report_ts=grid_ts, charger_report_ts=ev_ts, **extra))
@@ -35,9 +36,11 @@ class StartupAlignmentTests(unittest.TestCase):
 
     def started(self, **settings):
         r = self.regulator(**settings)
-        self.assertEqual(self.sample(r, 0, 2.6, 0.011, "awaiting_start",
+        # Exactly seven amps of initial headroom establishes the accepted cap
+        # used by these alignment regressions; b9 covers a full initial offer.
+        self.assertEqual(self.sample(r, 0, 16, 0.011, "awaiting_start",
                                     grid_ts=100, ev_ts=100).current_p1, 0)
-        d = self.sample(r, 60, 2.6, 0.011, "ready_to_charge", grid_ts=160, ev_ts=160)
+        d = self.sample(r, 60, 16, 0.011, "ready_to_charge", grid_ts=160, ev_ts=160)
         self.assertEqual(d.current_p1, r.startup_current)
         self.assertEqual(d.mode, "starting")
         return r
@@ -84,10 +87,11 @@ class StartupAlignmentTests(unittest.TestCase):
             self.assertEqual((d.current_p1, d.available_l1, d.house_load_l1), (0, 0, 20))
 
     def test_existing_six_offer_upgrades_once_after_full_buffered_capacity_is_stable(self):
-        r = self.regulator(startup_charge_amps=6)
+        r = self.regulator(startup_charge_amps=6, max_charge_amps=6)
         self.sample(r, 0, 2.6, 0.011, "awaiting_start", grid_ts=100, ev_ts=100)
         self.sample(r, 60, 2.6, 0.011, "ready_to_charge", grid_ts=160, ev_ts=160)
-        r.update_settings(logic.RegulatorSettings(active_control=True, dry_run=False, startup_charge_amps=7, fast_recovery=False))
+        r.update_settings(logic.RegulatorSettings(active_control=True, dry_run=False, startup_charge_amps=7,
+                                                max_charge_amps=7, fast_recovery=False))
         self.assertEqual(self.sample(r, 61, 2.6, 0.011, "awaiting_start", grid_ts=161, ev_ts=160).current_p1, 6)
         self.assertEqual(self.sample(r, 120, 2.6, 0.011, "ready_to_charge", grid_ts=220, ev_ts=160).current_p1, 6)
         self.assertEqual(self.sample(r, 121, 2.6, 0.011, "ready_to_charge", grid_ts=221, ev_ts=160).current_p1, 7)
@@ -143,7 +147,7 @@ class StartupAlignmentTests(unittest.TestCase):
             self.assertNotEqual(d.command, "resume")
 
     def owned_paused_offer(self):
-        r = self.regulator()
+        r = self.regulator(max_charge_amps=7)
         r.paused_by_us = True
         r._pause_observed = True
         self.sample(r, 0, 2.6, 0, "paused", grid_ts=1000, ev_ts=1000)
@@ -179,7 +183,7 @@ class StartupAlignmentTests(unittest.TestCase):
             self.assertNotEqual(d.command, "resume")
 
     def test_owned_pause_losing_seven_amp_headroom_cannot_resume_with_renewed_six_cap(self):
-        r = self.regulator()
+        r = self.regulator(max_charge_amps=7)
         r.paused_by_us = True
         r._pause_observed = True
         self.sample(r, 0, 2.6, 0, "paused", grid_ts=1000, ev_ts=1000)
@@ -285,6 +289,7 @@ class StartupAlignmentTests(unittest.TestCase):
 
     def slow_grid_start(self, **settings):
         """Synthetic partial/full response with a later unchanged grid value."""
+        settings.setdefault("max_charge_amps", 7)
         r = self.regulator(**settings)
         self.sample(r, 0, 8.2, 0.013, "awaiting_start", grid_ts=1000, ev_ts=1000)
         self.sample(r, 60, 8.2, 0.013, "ready_to_charge", grid_ts=1060, ev_ts=1060)

@@ -89,25 +89,36 @@ on by default: during actual charging it can raise directly to buffered
 available current, capped by the configured car maximum. For example, 10 A EV
 draw within 14 A total L1 means an estimated 4 A house load; a 16 A offer would
 project 20 A total and fits a 25 A fuse with a 2 A buffer. The direct rise still
-requires fresh, mutually consistent grid/EV report times and no unobserved
-reduction or positive response. It cannot start a waiting vehicle at maximum.
+requires fresh, mutually consistent grid/EV report times and no active response
+mismatch or unobserved reduction. When unchanged event-driven values are too
+old for an increase, a bounded read-only GET obtains a coherent current/status
+pair from the selected charger. This runs outside the control lock, at most
+once per 30 seconds, without delaying a meter-triggered protective reduction.
+The GET receipt is not a physical sample time; original HA report times remain
+visible. New relevant HA events, reconfiguration, health loss and a 30-second
+cache expiry discard the pair. A heartbeat alone never refreshes a current
+measurement. An unavailable read retains conservative limits and retries only
+after the cooldown.
 
 Turn Fast Headroom Recovery off for the previous gradual mode: increases wait
 for 30 seconds of stable headroom and then rise at most 1 A per 15 seconds.
 Physical/report response can make gradual recovery slower than this minimum
 interval. Recovery after a
 zero cap requires 60 seconds of stable buffered headroom. Starting a waiting
-vehicle uses the separate **Startup Charge** setting (default 7 A), bounded by
-the configured minimum and maximum. Continuing a session can still use 6 A.
-The full normal buffer must fit the startup offer; idle EV readings are not
-subtracted to manufacture spare capacity. A waiting vehicle receives no blind
-ramp to maximum and no short 7-to-6 A pulse. `starting`, `waiting_for_vehicle`,
+vehicle uses **Startup Charge** (default 7 A) as the minimum buffered headroom
+required to start, bounded by the configured minimum and maximum. After the
+stable observation period, the offer can use the safe available headroom up
+to the configured maximum even while the vehicle is waiting. Continuing a
+session can still use 6 A. The full normal buffer must fit a startup offer;
+idle or unverified old EV readings are not subtracted to manufacture spare
+capacity. There is no short 7-to-6 A pulse. `starting`, `waiting_for_vehicle`,
 `start_headroom_wait` and `waiting_for_vehicle_stalled` distinguish the observed
 waiting conditions; the stalled state is diagnostic and does not trigger
 repeated stop/start commands.
-Takeover of an already charging session starts at its measured current rather
-than jumping to the maximum. A submitted reduction must be observed before a
-rise is allowed; renewing its TTL does not reset ramp timers.
+Takeover of an already charging session can use the verified current and
+buffered headroom; an old EV report without current evidence receives no
+subtraction credit for a new increase. A submitted reduction must be observed
+before a rise is allowed; renewing its TTL does not reset ramp timers.
 
 When observed EV reduction, including a partial response that has not yet reached
 the requested cap, arrives before a new grid report, the regulator can
@@ -127,6 +138,13 @@ full normal buffer, without subtracting any EV reading. This hold retains only
 that accepted cap and its spent budget; it permits no increase or resume. New
 coherent feedback releases the hold. If this conservative budget does not fit,
 timeout still requests zero.
+An obsolete positive house anchor may be replaced after a verified charger
+snapshot and a subsequent coherent grid report. This preserves the accepted
+cap and delayed-start context, including any spent alignment time. Receipt
+renewals alone never release an anchor. `house_load_basis` and
+`house_load_anchor_l1` distinguish the control estimate from raw readings;
+`current_refresh_required` and the Source Health snapshot attributes expose
+why a newer read is needed and which current/status pair was used.
 Experimental timed overload is a separate, disabled-by-default
 option described below; the report-alignment window alone does not enable it.
 

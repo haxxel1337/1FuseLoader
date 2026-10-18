@@ -30,6 +30,9 @@ class ContinuityTests(unittest.TestCase):
 
     def sample(self, regulator, now, house=8, ev=16, status="charging", *,
                accept=True, grid=None, **metadata):
+        metadata.setdefault("grid_report_ts", 100 + now)
+        metadata.setdefault("charger_report_ts", 100 + now)
+        metadata.setdefault("wall_now_ts", 100 + now)
         decision = regulator.evaluate(logic.RegulatorInput(
             now_ts=now, status=status,
             grid_l1=house + ev if grid is None else grid,
@@ -94,8 +97,8 @@ class ContinuityTests(unittest.TestCase):
         self.assertEqual(self.sample(regulator, 34, house=5, ev=8).current_p1, 8)
         self.assertEqual(self.sample(regulator, 35, house=5, ev=8).current_p1, 9)
         self.assertEqual(self.sample(regulator, 49, house=5, ev=9).current_p1, 9)
-        self.assertEqual(self.sample(regulator, 50, house=5, ev=9).current_p1, 10)
-        self.assertEqual(self.sample(regulator, 65, house=5, ev=10).current_p1, 11)
+        self.assertEqual(self.sample(regulator, 50, house=5, ev=9).current_p1, 9)
+        self.assertEqual(self.sample(regulator, 80, house=5, ev=9).current_p1, 10)
 
     def test_ttl_refresh_does_not_reset_rise_stability(self):
         regulator = self.regulator(increase_stable_seconds=60)
@@ -123,24 +126,27 @@ class ContinuityTests(unittest.TestCase):
         self.assertEqual(decision.current_p1, 7)
         self.assertTrue(decision.should_call_service)
 
-    def test_recovery_from_zero_waits_then_starts_at_six(self):
+    def test_recovery_from_zero_waits_then_offers_full_safe_current(self):
         regulator = self.regulator()
         self.sample(regulator, 0, house=5)
         self.assertEqual(self.sample(regulator, 1, house=20).current_p1, 0)
         self.assertEqual(self.sample(regulator, 5, house=5, ev=0, status="awaiting_start").current_p1, 0)
         self.assertEqual(self.sample(regulator, 64, house=5, ev=0, status="awaiting_start").current_p1, 0)
         first = self.sample(regulator, 65, house=5, ev=0, status="awaiting_start")
-        self.assertEqual(first.current_p1, 6)
+        self.assertEqual(first.current_p1, 16)
         self.assertNotEqual(first.command, "resume")
-        self.assertEqual(self.sample(regulator, 70, house=5, ev=6).current_p1, 6)
-        self.assertEqual(self.sample(regulator, 100, house=5, ev=6).current_p1, 7)
+        self.assertEqual(self.sample(regulator, 70, house=5, ev=6).current_p1, 16)
+        # A later grid report confirms this partial vehicle response before
+        # the bounded alignment interval expires.
+        self.assertEqual(self.sample(regulator, 71, house=5, ev=6).current_p1, 16)
+        self.assertEqual(self.sample(regulator, 100, house=5, ev=6).current_p1, 16)
 
     def test_zero_ttl_refresh_does_not_reset_restart_observation(self):
         regulator = self.regulator()
         self.sample(regulator, 0, house=20, ev=0)
         self.sample(regulator, 5, house=5, ev=0, status="awaiting_start")
         self.assertEqual(self.sample(regulator, 35, house=5, ev=0, status="awaiting_start").current_p1, 0)
-        self.assertEqual(self.sample(regulator, 65, house=5, ev=0, status="awaiting_start").current_p1, 6)
+        self.assertEqual(self.sample(regulator, 65, house=5, ev=0, status="awaiting_start").current_p1, 16)
 
     def test_unstable_restart_capacity_resets_sixty_second_observation(self):
         regulator = self.regulator()
@@ -148,7 +154,7 @@ class ContinuityTests(unittest.TestCase):
         self.sample(regulator, 55, house=18, ev=0, status="awaiting_start")
         self.sample(regulator, 56, house=5, ev=0, status="awaiting_start")
         self.assertEqual(self.sample(regulator, 115, house=5, ev=0, status="awaiting_start").current_p1, 0)
-        self.assertEqual(self.sample(regulator, 116, house=5, ev=0, status="awaiting_start").current_p1, 6)
+        self.assertEqual(self.sample(regulator, 116, house=5, ev=0, status="awaiting_start").current_p1, 16)
 
     def test_zero_limit_must_be_physically_observed_before_restarting(self):
         regulator = self.regulator()
@@ -156,7 +162,7 @@ class ContinuityTests(unittest.TestCase):
         self.sample(regulator, 1, house=20)
         self.assertEqual(self.sample(regulator, 70, house=5, ev=16).current_p1, 0)
         self.assertEqual(self.sample(regulator, 71, house=5, ev=0, status="awaiting_start").current_p1, 0)
-        self.assertEqual(self.sample(regulator, 131, house=5, ev=0, status="awaiting_start").current_p1, 6)
+        self.assertEqual(self.sample(regulator, 131, house=5, ev=0, status="awaiting_start").current_p1, 16)
 
     def test_no_rise_until_accepted_decrease_is_observed(self):
         regulator = self.regulator()
@@ -246,7 +252,7 @@ class ContinuityTests(unittest.TestCase):
         self.assertEqual(coherent.current_p1, 6)
         self.assertNotEqual(coherent.mode, "unavailable")
         self.assertEqual(self.sample(regulator, 33, house=5, ev=6,
-                                     grid_report_ts=133, charger_report_ts=103).current_p1, 7)
+                                      grid_report_ts=133, charger_report_ts=133).current_p1, 7)
 
     def test_grid_first_hold_requires_conservative_grid_plus_cap_budget(self):
         for grid, expected in ((14.5, 10), (14.6, 0)):
@@ -363,9 +369,9 @@ class ContinuityTests(unittest.TestCase):
         self.sample(regulator, 125, house=5, ev=0, status="awaiting_start")
         self.sample(regulator, 185, house=5, ev=0, status="awaiting_start")
         refresh = self.sample(regulator, 246, house=5, ev=0, status="awaiting_start")
-        self.assertEqual((refresh.command, refresh.current_p1), ("set_limit", 6))
+        self.assertEqual((refresh.command, refresh.current_p1), ("set_limit", 16))
         resume = self.sample(regulator, 251, house=5, ev=0, status="awaiting_start")
-        self.assertEqual((resume.command, resume.current_p1), ("resume", 6))
+        self.assertEqual((resume.command, resume.current_p1), ("resume", 16))
 
     def test_soft_zero_is_not_undone_by_minimum_continuity(self):
         regulator = self.regulator(soft_limit_amps=20, soft_for_seconds=0, soft_current_amps=0)
@@ -376,7 +382,7 @@ class ContinuityTests(unittest.TestCase):
         self.sample(regulator, 0, house=5)
         self.sample(regulator, 1, house=5, ev=0, status="disconnected")
         self.assertEqual(self.sample(regulator, 5, house=5, ev=0, status="awaiting_start").current_p1, 0)
-        self.assertEqual(self.sample(regulator, 65, house=5, ev=0, status="awaiting_start").current_p1, 6)
+        self.assertEqual(self.sample(regulator, 65, house=5, ev=0, status="awaiting_start").current_p1, 16)
 
 
 if __name__ == "__main__":

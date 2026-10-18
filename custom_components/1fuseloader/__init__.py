@@ -32,6 +32,8 @@ _LOGGER = logging.getLogger(__name__)
 ACTION_TIMEOUT_SECONDS = 20
 EXPOSURE_STORE_TIMEOUT_SECONDS = 2
 EXPOSURE_STORE_RETRY_SECONDS = 15
+CURRENT_SNAPSHOT_INTERVAL_SECONDS = 30
+CURRENT_SNAPSHOT_MAX_AGE_SECONDS = 30
 _PENDING_BUDGET_WRITES_KEY = f"{DOMAIN}_pending_budget_writes"
 # One minute lease plus storage, request and scheduling allowances.
 OVERLOAD_LEASE_RESERVE_SECONDS = 90
@@ -65,6 +67,11 @@ class OneFuseLoaderController:
         self.last_accepted_command: dict[str, Any] | None = None
         self.last_accepted_limit: dict[str, Any] | None = None
         self.source_diagnostics: dict[str, Any] = {}
+        self._charger_snapshot: Any = None
+        self._charger_snapshot_selection: tuple | None = None
+        self._charger_snapshot_task: asyncio.Task | None = None
+        self._charger_snapshot_next_request = 0.0
+        self._charger_snapshot_error: str | None = None
         self.control_block_reason: str | None = "Easee adapter has not been initialized."
         self.unsub_timer = None
         self.unsub_states = None
@@ -148,6 +155,8 @@ class OneFuseLoaderController:
         if settings == self.settings:
             return False
         self.regulator.update_settings(settings)
+        self._charger_snapshot = None
+        self._charger_snapshot_selection = None
         return True
 
     async def async_set_option(self, key: str, value: Any) -> None:
@@ -330,6 +339,11 @@ class OneFuseLoaderController:
         self._stopped = True
         self._generation += 1
         self._pending_refresh = False
+        snapshot_task = self._charger_snapshot_task
+        if snapshot_task is not None:
+            snapshot_task.cancel()
+        self._charger_snapshot = None
+        self._charger_snapshot_selection = None
         if self._l1_source is not None:
             self._l1_source.stop()
             self._l1_source = None
@@ -356,6 +370,76 @@ class OneFuseLoaderController:
         pending = self._refresh_task
         if pending is not None and pending is not asyncio.current_task():
             await pending
+        if snapshot_task is not None and snapshot_task is not asyncio.current_task():
+            try:
+                await snapshot_task
+            except asyncio.CancelledError:
+                pass
+
+    def _charger_source_revision(self) -> tuple:
+        """Identify relevant HA events, including unchanged-value new reports."""
+        data = self.entry.data
+        result: list[Any] = [data.get(CONF_DEVICE_ID)]
+        for key in (CONF_STATUS_ENTITY, CONF_CHARGER_CURRENT_ENTITY):
+            entity_id = data.get(key)
+            state = self.hass.states.get(entity_id)
+            result.extend((entity_id, getattr(state, "state", None), self._report_timestamp(state)))
+        return tuple(result)
+
+    def _request_current_snapshot(self) -> None:
+        """Read only on demand, outside the control lock and never in a loop."""
+        read_snapshot = getattr(self._adapter, "async_read_current_snapshot", None)
+        snapshot_is_current = getattr(self._adapter, "snapshot_is_current", None)
+        if (self._stopped or not callable(read_snapshot) or not callable(snapshot_is_current)
+                or self.hass.loop.time() < self._charger_snapshot_next_request
+                or (self._charger_snapshot_task is not None and not self._charger_snapshot_task.done())):
+            return
+        if self._adapter.telemetry_block_reason:
+            self._charger_snapshot = None
+            return
+        generation = self._generation
+        revision = self._charger_source_revision()
+        adapter = self._adapter
+        self._charger_snapshot_next_request = self.hass.loop.time() + CURRENT_SNAPSHOT_INTERVAL_SECONDS
+
+        async def fetch() -> None:
+            try:
+                # Adapter uses a bounded GET. A slow network cannot hold the
+                # regulator lock and delay a meter-triggered reduction.
+                snapshot = await read_snapshot()
+                async with self._lock:
+                    if (self._stopped or generation != self._generation or adapter is not self._adapter
+                            or revision != self._charger_source_revision()
+                            or self._adapter.telemetry_block_reason or not snapshot_is_current(snapshot)):
+                        return
+                    received = self._utc_time(getattr(snapshot, "received_at", None))
+                    age = ((datetime.now(timezone.utc) - received).total_seconds()
+                           if received is not None else float("inf"))
+                    if not 0 <= age <= CURRENT_SNAPSHOT_MAX_AGE_SECONDS:
+                        self._charger_snapshot_error = "snapshot_receipt_invalid"
+                        self._charger_snapshot = None
+                        return
+                    report_times = [revision[3], revision[6]]
+                    if any(stamp is None or stamp >= received.timestamp() for stamp in report_times):
+                        self._charger_snapshot_error = "snapshot_not_newer_than_entity_reports"
+                        self._charger_snapshot = None
+                        return
+                    self._charger_snapshot = snapshot
+                    self._charger_snapshot_selection = revision
+                    self._charger_snapshot_error = None
+                # Always evaluate the newest grid after completion; the GET
+                # result is never a precomputed command or direct submission.
+                self._handle_source_change(None)
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                self._charger_snapshot = None
+                self._charger_snapshot_error = type(err).__name__
+                _LOGGER.warning("1FuseLoader current snapshot failed (%s)", type(err).__name__)
+            finally:
+                self._charger_snapshot_task = None
+
+        self._charger_snapshot_task = self.hass.async_create_task(fetch())
 
     def _read_input(self) -> RegulatorInput:
         data = self.entry.data
@@ -418,20 +502,59 @@ class OneFuseLoaderController:
             "grid_mqtt_sample_at_utc": (datetime.fromtimestamp(mqtt_snapshot.sample_ts, timezone.utc).isoformat()
                                         if mqtt_snapshot and mqtt_snapshot.sample_ts is not None else None),
         })
+        current_value = current_state.state if current_state is not None else None
+        status_value = str(status_state.state if status_state is not None else "unknown")
+        current_report_ts = self._report_timestamp(current_state)
+        snapshot = self._charger_snapshot
+        received = self._utc_time(getattr(snapshot, "received_at", None))
+        snapshot_age = ((datetime.now(timezone.utc) - received).total_seconds()
+                        if received is not None else float("inf"))
+        snapshot_is_current = getattr(self._adapter, "snapshot_is_current", None)
+        entity_report_times = (self._report_timestamp(current_state), self._report_timestamp(status_state))
+        # A new HA status/current event supersedes the whole REST pair. Never
+        # combine a new current with an old authorization/schedule status.
+        snapshot_used = bool(snapshot is not None and not errors and not health_error
+            and self._charger_snapshot_selection == self._charger_source_revision()
+            and 0 <= snapshot_age <= CURRENT_SNAPSHOT_MAX_AGE_SECONDS
+            and all(stamp is not None and stamp < received.timestamp() for stamp in entity_report_times)
+            and callable(snapshot_is_current) and snapshot_is_current(snapshot))
+        if snapshot_used:
+            current_value = snapshot.current
+            status_value = snapshot.status
+            current_report_ts = received.timestamp()
+        elif snapshot is not None:
+            self._charger_snapshot = None
+            self._charger_snapshot_selection = None
+        self.source_diagnostics.update({
+            "charger_current_entity_reported_at_utc": (self._utc_time(getattr(current_state, "last_reported", None)).isoformat()
+                if self._utc_time(getattr(current_state, "last_reported", None)) else None),
+            "charger_status_entity_reported_at_utc": (self._utc_time(getattr(status_state, "last_reported", None)).isoformat()
+                if self._utc_time(getattr(status_state, "last_reported", None)) else None),
+            "charger_current_source": "selected_charger_rest_snapshot" if snapshot_used else "ha_entity",
+            "charger_snapshot_received_at_utc": received.isoformat() if received else None,
+            "charger_snapshot_used": snapshot_used,
+            "charger_snapshot_error_type": self._charger_snapshot_error,
+            "charger_snapshot_scope": "cloud_state_read_receipt_not_physical_acquisition",
+            "effective_charger_current": current_value,
+            "effective_charger_status": status_value,
+            "effective_charger_reported_at_utc": (datetime.fromtimestamp(current_report_ts, timezone.utc).isoformat()
+                if current_report_ts is not None else None),
+        })
         if self._l1_source_config or self._l1_source_error:
             self.source_diagnostics["report_time_scope"] = "grid_validated_mqtt_sample_and_receipt;easee_ha_receipt_not_physical_acquisition"
         return RegulatorInput(
             now_ts=self.hass.loop.time(),
-            status=str(status_state.state if status_state is not None else "unknown"),
+            status=status_value,
             grid_l1=grid_value,
             grid_l2=_get_state_value(self.hass, data.get(CONF_L2_ENTITY)),
             grid_l3=_get_state_value(self.hass, data.get(CONF_L3_ENTITY)),
-            charger_current=current_state.state if current_state is not None else None,
+            charger_current=current_value,
             data_valid=not errors,
             data_error=" ".join(errors) or None,
             grid_report_ts=grid_report_ts,
-            charger_report_ts=self._report_timestamp(current_state),
+            charger_report_ts=current_report_ts,
             wall_now_ts=datetime.now(timezone.utc).timestamp(),
+            charger_snapshot_verified=snapshot_used,
         )
 
     @staticmethod
@@ -577,11 +700,17 @@ class OneFuseLoaderController:
                 return
             await self._async_tick_locked()
 
+    @staticmethod
+    def _input_revision(inp: RegulatorInput) -> tuple:
+        return (inp.status, inp.grid_l1, inp.charger_current, inp.data_valid, inp.data_error,
+                inp.grid_report_ts, inp.charger_report_ts, inp.charger_snapshot_verified)
+
     async def _async_tick_locked(self) -> None:
+        generation = self._generation
         # Recheck public identity metadata as well as entry updates. A renamed,
         # rebound or removed source cannot leave an old MQTT subscription live.
         await self._async_configure_l1_source_locked()
-        if self._stopped:
+        if self._stopped or generation != self._generation:
             return
         # BMW is optional advisory context. Failure cannot stop or delay the
         # local meter/Easee regulator and never causes a BMW API request.
@@ -595,6 +724,8 @@ class OneFuseLoaderController:
             if offline_problem or self._budget_error:
                 inp = replace(inp, data_valid=False, data_error=self._budget_error or offline_problem)
         decision = self.regulator.evaluate(inp)
+        if decision.current_refresh_required:
+            self._request_current_snapshot()
         exposure = self.regulator.export_overload_state()
         if (self._budget_error != "overload_budget_restore_failed"
                 and (self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"])
@@ -619,7 +750,7 @@ class OneFuseLoaderController:
                     self._budget_error_type = None
                     _LOGGER.info("1FuseLoader latest exposure checkpoint verified; storage fault recovered")
                 self._budget_retry_at = 0.0
-        if self._stopped:
+        if self._stopped or generation != self._generation:
             return
         if self.settings.overload_enabled and decision.current_p1 > 0 and (
             self._budget_error or (
@@ -660,6 +791,27 @@ class OneFuseLoaderController:
             )
             self.notify()
             return
+        previous_cap = self.regulator.last_target
+        increasing = (decision.current_p1 > 0 and (decision.command == "resume"
+                      or previous_cap is None or decision.current_p1 > previous_cap[0]))
+        if increasing:
+            # A checkpoint write above can yield to newer telemetry. Never
+            # execute the stale increase; a fresh tick plans from latest grid.
+            latest = self._read_input()
+            if self.settings.overload_enabled:
+                problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
+                if problem or self._budget_error:
+                    latest = replace(latest, data_valid=False, data_error=self._budget_error or problem)
+            if self._input_revision(latest) != self._input_revision(inp):
+                self.last_service_result = "not_sent"
+                self.last_decision = replace(
+                    decision, mode="waiting_for_latest_sources",
+                    reason="New telemetry arrived during checkpoint verification; recalculating before an increase.",
+                    should_call_service=False,
+                )
+                self._handle_source_change(None)
+                self.notify()
+                return
         attempt = {
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
             "completed_at_utc": None, "command": decision.command,

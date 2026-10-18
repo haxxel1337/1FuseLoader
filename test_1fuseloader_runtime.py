@@ -84,6 +84,12 @@ class SafetyTests(unittest.TestCase):
         return logic.OneFuseRegulator(logic.RegulatorSettings(active_control=True, dry_run=False, **settings))
 
     def evaluate(self, regulator, now, status="charging", grid=16, current=8, **kwargs):
+        # These synthetic safety scenarios assume a fresh coherent receipt
+        # pair. Keep explicit overrides available for missing/stale-data cases.
+        wall = 1000 + now
+        kwargs.setdefault("wall_now_ts", wall)
+        kwargs.setdefault("grid_report_ts", wall)
+        kwargs.setdefault("charger_report_ts", wall)
         return regulator.evaluate(logic.RegulatorInput(now, status, grid, charger_current=current, **kwargs))
 
     def test_insufficient_headroom_never_forces_minimum(self):
@@ -118,12 +124,14 @@ class SafetyTests(unittest.TestCase):
 
     def test_planning_does_not_claim_submission_or_pause_ownership(self):
         regulator = self.regulator()
-        decision = self.evaluate(regulator, 0)
+        # An exact 8 A buffered allowance isolates acknowledgement ownership
+        # from fast recovery's separate ability to use greater fresh headroom.
+        decision = self.evaluate(regulator, 0, grid=23)
         self.assertIsNone(regulator.last_target)
         self.assertIsNone(regulator.last_command)
         regulator.acknowledge(decision, 0)
         self.assertEqual(regulator.last_target, (8, 0, 0, 60))
-        self.assertFalse(self.evaluate(regulator, 1).should_call_service)
+        self.assertFalse(self.evaluate(regulator, 1, grid=23).should_call_service)
         regulator = self.regulator()
         self.evaluate(regulator, 0, grid=29, current=6)
         pause = self.evaluate(regulator, 121, grid=29, current=6)
@@ -246,6 +254,12 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
     def update_entry(self, entry, **kwargs):
         entry.options = kwargs["options"]
 
+    def fresh_control_reports(self):
+        """Publish a coherent fixture pair without refreshing cached cap data."""
+        reported = datetime.now(timezone.utc)
+        for entity_id in ("sensor.grid", "sensor.car", "sensor.status"):
+            self.states[entity_id].last_reported = reported
+
     def test_runtime_wires_utc_wall_time_separately_from_monotonic_control_time(self):
         self.hass.loop = SimpleNamespace(time=lambda: 1234.5)
         before = datetime.now(timezone.utc).timestamp()
@@ -333,10 +347,13 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private detail", str(self.controller.diagnostic_attributes()))
 
     async def test_failed_reduction_does_not_replace_last_accepted_limit(self):
+        self.states["sensor.grid"].state = "23"
+        self.fresh_control_reports()
         await self.controller.async_tick()
         accepted = dict(self.controller.last_accepted_limit)
         self.assertEqual(accepted["target_p1"], 8)
         self.states["sensor.grid"].state = "25"
+        self.fresh_control_reports()
         self.adapter.failure = OSError("private remote endpoint")
         await self.controller.async_tick()
         self.assertEqual(self.controller.last_command_attempt["target_p1"], 6)
@@ -395,6 +412,8 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("site.siteKey", str(diagnostics))
 
     async def test_matching_old_report_is_not_physical_or_ttl_confirmation(self):
+        self.states["sensor.grid"].state = "23"
+        self.fresh_control_reports()
         circuit = self.circuit_source(state_dynamicCircuitCurrentP2=0)
         with patch.object(runtime, "er", self.cached_registry([circuit])):
             await self.controller.async_tick()
@@ -407,6 +426,8 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(diagnostics["device_ttl_verified"])
 
     async def test_matching_new_report_and_idle_tick_keep_submission_unverified(self):
+        self.states["sensor.grid"].state = "23"
+        self.fresh_control_reports()
         circuit = self.circuit_source(state_dynamicCircuitCurrentP2=0)
         with patch.object(runtime, "er", self.cached_registry([circuit])):
             await self.controller.async_tick()
@@ -628,6 +649,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         self.entry.options["overload_enabled"] = True
         self.states["sensor.grid"].state = "28"
         self.states["sensor.car"].state = "6"
+        self.fresh_control_reports()
         self.controller = runtime.OneFuseLoaderController(self.hass, self.entry, self.adapter)
         return self.controller
 
@@ -747,7 +769,7 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         controller = self.overload_controller()
         decision = controller.regulator.evaluate(logic.RegulatorInput(
             0, "charging", 38, charger_current=16,
-            grid_report_ts=1000, charger_report_ts=1000,
+            grid_report_ts=1000, charger_report_ts=1000, wall_now_ts=1000,
         ))
         self.assertEqual(decision.overload_transition_remaining_seconds, 10)
         for elapsed, expected_delay in ((2, 8), (12, 0.05)):

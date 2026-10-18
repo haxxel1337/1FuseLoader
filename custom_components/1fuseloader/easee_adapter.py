@@ -9,6 +9,8 @@ An HTTP acceptance is submission to the cloud, not physical charger feedback.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from math import ceil, isfinite
 import sys
@@ -19,9 +21,48 @@ SUPPORTED_PYEASEE_VERSION = "0.8.17"
 REQUEST_TIMEOUT_SECONDS = 10
 MAX_TELEMETRY_AGE_SECONDS = 120
 
+# Raw numeric modes in the audited pyeasee 0.8.17 ChargerState contract.
+# Keep terminal, fault and schedule states distinct from start-ready states.
+CHARGER_OPERATION_MODES = {
+    0: "offline",
+    1: "disconnected",
+    2: "awaiting_start",
+    3: "charging",
+    4: "completed",
+    5: "error",
+    6: "ready_to_charge",
+    7: "awaiting_authorization",
+    8: "de_authorizing",
+    100: "start_charging",
+    101: "stop_charging",
+    102: "offline",
+    103: "awaiting_load_balancing",
+    104: "awaiting_authorization",
+    105: "awaiting_smart_start",
+    106: "awaiting_scheduled_start",
+    107: "authenticating",
+    108: "paused_due_to_equalizer",
+    109: "searching_for_master",
+    157: "erratic_ev",
+    158: "error_temperature_too_high",
+    159: "error_dead_powerboard",
+    160: "error_overcurrent",
+    161: "error_pen_fault",
+}
+
 
 class EaseeAdapterError(RuntimeError):
     """A safe, credential-free failure reported by the adapter."""
+
+
+@dataclass(frozen=True, slots=True)
+class ChargerCurrentSnapshot:
+    """API values and local UTC receipt, without a physical sample timestamp."""
+
+    current: float
+    status: str
+    received_at: datetime
+    source_identity: tuple[int, ...] = field(repr=False)
 
 
 class EaseeCommandAdapter:
@@ -33,6 +74,8 @@ class EaseeCommandAdapter:
         self._charger: Any = None
         self._circuit: Any = None
         self._product_data: Any = None
+        self._controller: Any = None
+        self._registry_device: Any = None
 
     async def async_initialize(self) -> None:
         """Validate already loaded objects without making any network request."""
@@ -45,6 +88,7 @@ class EaseeCommandAdapter:
 
     def _resolve_runtime(self) -> str | None:
         self._charger = self._circuit = self._product_data = None
+        self._controller = self._registry_device = None
         # Do not import/start Easee or pyeasee ourselves. after_dependencies
         # ensures normal setup order; a missing integration stays blocked.
         easee_const = sys.modules.get("custom_components.easee.const")
@@ -93,10 +137,95 @@ class EaseeCommandAdapter:
             if len(products) != 1:
                 return "easee_telemetry_source_not_unique"
             self._charger, self._circuit, self._product_data = charger, circuit, products[0]
+            self._controller, self._registry_device = controller, device
         except Exception:
             # Exception text can include a remote URL or private account data.
             return "easee_runtime_incompatible"
         return None
+
+    def _runtime_identity(self) -> tuple[Any, ...]:
+        """Capture selection values and object identities before an await."""
+        return (
+            self.device_id,
+            self._charger.id,
+            self._registry_device,
+            self._controller,
+            self._charger,
+            self._circuit,
+            self._product_data,
+        )
+
+    def _require_same_runtime(self, identity: tuple[Any, ...], *, healthy: bool) -> None:
+        """Reject results or follow-up commands across an integration reload."""
+        problem = self.telemetry_block_reason if healthy else self._resolve_runtime()
+        if problem:
+            raise EaseeAdapterError(problem)
+        current = self._runtime_identity()
+        if current[:2] != identity[:2] or any(
+            old is not new for old, new in zip(identity[2:], current[2:])
+        ):
+            raise EaseeAdapterError("easee_runtime_changed_during_request")
+
+    def _snapshot_source_identity(self) -> tuple[int, ...]:
+        """Opaque process-local identity; never expose objects or credentials."""
+        return tuple(id(value) for value in (
+            self._controller, self._charger, self._circuit, self._product_data
+        ))
+
+    def snapshot_is_current(self, snapshot: ChargerCurrentSnapshot) -> bool:
+        """Revalidate a cached receipt against healthy, currently loaded objects."""
+        try:
+            return (
+                self.telemetry_block_reason is None
+                and snapshot.source_identity == self._snapshot_source_identity()
+            )
+        except Exception:
+            return False
+
+    async def async_read_current_snapshot(self) -> ChargerCurrentSnapshot:
+        """Read the selected charger's public state API without issuing commands.
+
+        Stream health is required before and after the bounded GET. The receipt
+        time only records when this request returned locally: the server does
+        not provide a verified physical sample timestamp for these values.
+        Callers must separately reject results superseded by concurrent events.
+        """
+        try:
+            problem = self.telemetry_block_reason
+            if problem:
+                raise EaseeAdapterError(problem)
+            identity = self._runtime_identity()
+            charger = self._charger
+            if not callable(getattr(charger, "get_state", None)):
+                raise EaseeAdapterError("easee_snapshot_api_unavailable")
+            async with asyncio.timeout(min(REQUEST_TIMEOUT_SECONDS, 10)):
+                state = await charger.get_state(raw=True)
+            received_at = datetime.now(timezone.utc)
+            self._require_same_runtime(identity, healthy=True)
+            if not isinstance(state, Mapping):
+                raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
+            value = state.get("totalCurrent")
+            if isinstance(value, bool):
+                raise EaseeAdapterError("easee_snapshot_invalid_current")
+            try:
+                current = float(value)
+            except (TypeError, ValueError, OverflowError):
+                raise EaseeAdapterError("easee_snapshot_invalid_current") from None
+            if not isfinite(current) or not 0 <= current <= 1000:
+                raise EaseeAdapterError("easee_snapshot_invalid_current")
+            mode = state.get("chargerOpMode")
+            if type(mode) not in (int, float) or not isfinite(mode):
+                raise EaseeAdapterError("easee_snapshot_invalid_operation_mode")
+            status = CHARGER_OPERATION_MODES.get(mode)
+            if status is None:
+                raise EaseeAdapterError("easee_snapshot_invalid_operation_mode")
+            return ChargerCurrentSnapshot(
+                current, status, received_at, self._snapshot_source_identity()
+            )
+        except EaseeAdapterError:
+            raise
+        except Exception as err:
+            raise EaseeAdapterError(f"easee_snapshot_failed:{type(err).__name__}") from None
 
     @property
     def overload_block_reason(self) -> str | None:
@@ -177,16 +306,24 @@ class EaseeCommandAdapter:
         elif command != "pause":
             raise EaseeAdapterError("unsupported_easee_command")
 
+        # A concurrent state read can resolve replacement objects while this
+        # command awaits the cloud. Keep the whole sequence on its original
+        # charger and never resume a replacement after capping the old circuit.
+        identity = self._runtime_identity()
+        charger, circuit = self._charger, self._circuit
+
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
                 if command in {"set_limit", "resume"}:
-                    result = await self._circuit.set_dynamic_current(*currents, ttl_minutes)
+                    result = await circuit.set_dynamic_current(*currents, ttl_minutes)
                     self._require_accepted(result)
                 if command in {"pause", "resume"}:
                     # Reapply a safe finite cap immediately before resume. A
                     # failed/unknown cap submission must never be followed by
                     # resume, even if an earlier tick submitted a cap.
-                    result = await getattr(self._charger, command)()
+                    if command == "resume":
+                        self._require_same_runtime(identity, healthy=True)
+                    result = await getattr(charger, command)()
                     self._require_accepted(result)
         except EaseeAdapterError:
             raise
