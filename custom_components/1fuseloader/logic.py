@@ -767,6 +767,15 @@ class OneFuseRegulator:
             old_target = self.last_target[0] if self.last_target is not None else None
             target = decision.current_p1
             changed = old_target != target
+            positive_shedding_budget = None
+            if (changed and target > 0 and old_target is not None and target < old_target
+                    and self._positive_cap == old_target and self._positive_skew_since is not None):
+                budget = min(self.settings.measurement_settle_seconds, self.settings.max_sensor_age_seconds)
+                positive_shedding_budget = (
+                    budget,
+                    self._positive_alignment_used_seconds + max(0.0, now_ts - self._positive_skew_since),
+                    self._positive_skew_since + budget - self._positive_alignment_used_seconds,
+                )
             if changed:
                 self._last_limit_change_ts = now_ts
                 waiting_offer_reduction = (
@@ -843,6 +852,16 @@ class OneFuseRegulator:
                 self._partial_reduction_budget = budget
                 self._partial_reduction_used_seconds = spent
                 self._reduction_guard_deadline = deadline
+                if positive_shedding_budget is not None:
+                    # The lower cap is a response inside the ORIGINAL positive
+                    # alignment, not permission for a fresh response window.
+                    # Capture before clearing the positive context above and
+                    # charge the API's elapsed time before this acknowledgement.
+                    source_budget, source_spent, source_deadline = positive_shedding_budget
+                    self._partial_reduction_budget = min(budget, source_budget)
+                    self._partial_reduction_used_seconds = max(spent, source_spent)
+                    self._reduction_guard_deadline = (
+                        min(deadline, source_deadline) if deadline is not None else source_deadline)
                 self._increase_since = None
             elif changed:
                 self._awaiting_reduction_target = None
@@ -1041,7 +1060,7 @@ class OneFuseRegulator:
                                   now - self._last_limit_change_ts >= s.min_seconds_between_actions)
                 should_call = should_call and (emergency or reduction or change_allowed)
             else:
-                should_call = should_call and self._action_allowed(now)
+                should_call = should_call and ((emergency and command == "pause") or self._action_allowed(now))
             return RegulatorDecision(
                 mode=f"dry_run_{mode}" if s.dry_run and mode not in {"idle", "unavailable"} else mode,
                 reason=reason, command=command,
@@ -1184,12 +1203,7 @@ class OneFuseRegulator:
             raw_available = s.main_fuse_amps - house - s.buffer_amps
             available = (int(floor(min(raw_available, s.max_charge_amps)))
                          if raw_available >= s.min_charge_amps else 0)
-            if house + self._positive_cap > s.main_fuse_amps - s.buffer_amps:
-                self._clear_positive_alignment()
-                self.reset_timers()
-                self._restart_required = True
-                return decision("unavailable", "Positive-current alignment exceeds buffered headroom; requesting 0 A.",
-                                "set_limit", emergency=True)
+            headroom_exceeded = house + self._positive_cap > s.main_fuse_amps - s.buffer_amps
             # Still observe real grid guards during the hold. No resume or new
             # rise is reachable until post-response source reports agree.
             soft_during_alignment = self._timer_reached(
@@ -1200,11 +1214,50 @@ class OneFuseRegulator:
             self._increase_since = None
             if (s.enable_pause_resume and pause_during_alignment
                     and status in {"charging", "start_charging"}):
-                return decision("pause", "L1 has exceeded the pause threshold for its full observation period.", "pause")
+                return decision("pause", "L1 has exceeded the pause threshold for its full observation period.",
+                                "pause", emergency=headroom_exceeded)
+            soft_target = None
             if s.enable_soft_guard and soft_during_alignment and s.soft_current_amps < self._positive_cap:
                 soft_target = max(0, s.soft_current_amps)
                 if soft_target < s.min_charge_amps:
                     soft_target = 0
+                if soft_target == 0:
+                    return decision("soft_limit", "Soft guard overrides positive-current alignment.",
+                                    "set_limit", 0, s.soft_ttl_seconds, emergency=True)
+            if headroom_exceeded:
+                # Do not subtract an unaligned EV value to grant this lower
+                # cap. Even if the entire measured grid were household load,
+                # the reduced offer must fit the full normal operating buffer.
+                raw_target = int(floor(min(s.max_charge_amps,
+                    s.main_fuse_amps - s.buffer_amps - grid)))
+                target = min(raw_target, soft_target) if soft_target is not None else raw_target
+                receipts_valid = (
+                    self._last_input_grid_ts is not None and self._positive_grid_ts is not None
+                    and self._last_input_grid_ts >= self._positive_grid_ts
+                    and self._last_input_charger_ts is not None and self._positive_ev_ts is not None
+                    and self._last_input_charger_ts >= self._positive_ev_ts
+                    and self._fast_sources_fresh())
+                remaining = min(s.measurement_settle_seconds, s.max_sensor_age_seconds) - (
+                    self._positive_alignment_used_seconds + max(0.0, now - self._positive_skew_since))
+                if (self._meaningfully_charging(status, current) and receipts_valid and remaining > 0
+                        and s.min_charge_amps <= target < self.last_target[0]
+                        and self.last_target[0] == self._positive_cap):
+                    house = grid
+                    house_basis = "raw_grid_positive_reduction"
+                    available = max(0, raw_target)
+                    soft_wins = soft_target is not None and soft_target <= raw_target
+                    return decision(
+                        "soft_limit" if soft_wins else "alignment_shedding",
+                        f"Reducing the accepted offer to {target} A while sources align; raw L1 plus the full lower cap "
+                        "fits the normal buffered budget. No increase, resume or extra alignment time.",
+                        "set_limit", target, s.soft_ttl_seconds if soft_wins else self.last_target[3],
+                        emergency=True)
+                self._clear_positive_alignment()
+                self.reset_timers()
+                self._restart_required = True
+                return decision("unavailable", "Positive-current alignment exceeds buffered headroom; requesting 0 A.",
+                                "set_limit", emergency=True)
+            if soft_target is not None:
                 return decision("soft_limit", "Soft guard overrides positive-current alignment.",
                                 "set_limit", soft_target, s.soft_ttl_seconds, emergency=True)
             return decision("settling", "Holding the accepted positive cap briefly while EV and grid reports align.",
