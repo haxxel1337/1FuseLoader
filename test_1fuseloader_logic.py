@@ -17,7 +17,9 @@ RegulatorSettings = logic.RegulatorSettings
 
 
 def run_case(name, regulator, now, status, l1, charger_current=0):
-    d = regulator.evaluate(RegulatorInput(now_ts=now, status=status, grid_l1=l1, charger_current=charger_current))
+    d = regulator.evaluate(RegulatorInput(now_ts=now, status=status, grid_l1=l1, charger_current=charger_current,
+                                          grid_report_ts=100+now, charger_report_ts=100+now,
+                                          wall_now_ts=100+now))
     print(f"{name:34s} mode={d.mode:18s} command={str(d.command):9s} call={str(d.should_call_service):5s} p1={d.current_p1:2d} avail={d.available_l1:2d} house={d.house_load_l1:5.1f} reason={d.reason}")
     # This script simulates a successful API submission; evaluating a proposal
     # alone must never record a limit, pause ownership, or a completed command.
@@ -34,7 +36,7 @@ def main():
     print("1FuseLoader logic test\n")
 
     # Dry run off here so we can test whether it WOULD call services.
-    settings = RegulatorSettings(active_control=True, dry_run=False)
+    settings = RegulatorSettings(active_control=True, dry_run=False, fast_recovery=False)
     r = OneFuseRegulator(settings)
 
     # Old template equivalent:

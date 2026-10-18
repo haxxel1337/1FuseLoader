@@ -25,7 +25,8 @@ class OverloadTests(unittest.TestCase):
         return logic.OneFuseRegulator(logic.RegulatorSettings(**settings))
 
     def sample(self, regulator, now, grid=28, ev=6, *, accept=True, status="charging", **metadata):
-        reports = {"grid_report_ts": 1000 + now, "charger_report_ts": 1000 + now}
+        reports = {"grid_report_ts": 1000 + now, "charger_report_ts": 1000 + now,
+                   "wall_now_ts": 1000 + now}
         reports.update(metadata)
         decision = regulator.evaluate(logic.RegulatorInput(
             now_ts=now, status=status, grid_l1=grid, charger_current=ev, **reports))
@@ -276,7 +277,7 @@ class OverloadTests(unittest.TestCase):
         nominal = self.sample(regulator, 1, grid=5, ev=0, status="awaiting_start")
         self.assertEqual(nominal.current_p1, 0)
         recovered = self.sample(regulator, 61, grid=5, ev=0, status="awaiting_start")
-        self.assertEqual(recovered.current_p1, 6)
+        self.assertEqual(recovered.current_p1, 16)
         self.assertTrue(recovered.overload_failure_latched)
 
 

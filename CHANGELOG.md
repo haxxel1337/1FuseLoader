@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0b9
+
+- Treat Startup Charge as the minimum fully buffered start threshold. After
+  stable headroom, a waiting vehicle may receive the safe available offer up
+  to its configured maximum, without explicit start/stop retry commands.
+- Refresh a selected charger's current/status pair using a bounded, read-only
+  authenticated cloud GET when recovery needs newer evidence. Reads run in
+  the background, at most once per 30 seconds, so protective ticks remain
+  available. Preserve original HA report times and label the cloud receipt
+  separately; a heartbeat is never relabelled as a current measurement.
+- Discard snapshots after new relevant events, reload, selection changes,
+  health loss or expiry. Recalculate on the newest grid after the read and
+  before an increase if checkpoint verification yielded to new telemetry.
+- Rebase obsolete house-load anchors only on verified coherent feedback,
+  preserving possible delayed-start response context and spent alignment
+  time. Never grant startup/takeover headroom from stale high EV readings.
+- Expose estimation basis, conservative house anchor and current-refresh
+  diagnostics. Preserve exposure storage, budgets, safeguards and settings.
+
 ## 0.4.0b8
 
 - Recover a transient exposure-storage fault only after the latest conservative

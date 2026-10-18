@@ -316,7 +316,7 @@ class ControllerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.tick=117;await c.async_tick()
         self.assertEqual(c.last_decision.current_p1,0)
         self.tick=177;await c.async_tick()
-        self.assertEqual(c.last_decision.current_p1,7)
+        self.assertEqual(c.last_decision.current_p1,16)  # Safe offer after the buffered restart threshold.
         self.assertEqual(c.regulator.export_overload_state()["used_seconds"],54)
 
     async def test_swallowed_error_cannot_clear_storage_fault(self):
