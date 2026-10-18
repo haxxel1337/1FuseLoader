@@ -244,11 +244,128 @@ class OneFuseRegulator:
 
     def _clear_partial_reduction_alignment(self) -> None:
         self._reduction_before_current: Optional[float] = None
+        self._accepted_reduction_cap: Optional[int] = None
+        self._reduction_previous_cap: Optional[int] = None
+        self._reduction_under_cap_baseline = False
+        self._reduction_high_current: Optional[float] = None
+        self._reduction_high_ev_ts: Optional[float] = None
+        self._reduction_low_response_ts: Optional[float] = None
+        self._reduction_guard_deadline: Optional[float] = None
         self._reduction_grid_ceiling: Optional[float] = None
         self._partial_reduction_current: Optional[float] = None
         self._partial_reduction_response_ts: Optional[float] = None
         self._partial_reduction_used_seconds = 0.0
         self._partial_reduction_budget: Optional[float] = None
+
+    def _reduction_alignment_remaining(self, now: float) -> float:
+        budget = min(self._partial_reduction_budget or 0.0,
+                     self.settings.measurement_settle_seconds,
+                     self.settings.max_sensor_age_seconds)
+        elapsed = max(0.0, now - self._settle_started) if self._settle_started is not None else 0.0
+        remaining = max(0.0, budget - self._partial_reduction_used_seconds - elapsed)
+        if self._reduction_guard_deadline is not None:
+            remaining = min(remaining, max(0.0, self._reduction_guard_deadline - now))
+        return remaining
+
+    def _begin_reduction_alignment(self, now: float, *, guarded: bool = False) -> None:
+        remaining = self._reduction_alignment_remaining(now)
+        if self._settle_started is None:
+            self._settle_started = now
+        if guarded and self._reduction_guard_deadline is None:
+            # The late-receipt extension never gets a fresh wall-clock window
+            # after apparently coherent feedback or an identical GET/lease.
+            self._reduction_guard_deadline = now + remaining
+
+    def _finish_reduction_alignment(self, now: float) -> None:
+        if self._settle_started is not None:
+            self._partial_reduction_used_seconds += max(0.0, now - self._settle_started)
+        self._settle_started = None
+        self._awaiting_reduction_target = None
+        self._partial_reduction_current = None
+        self._partial_reduction_response_ts = None
+        # Keep the accepted-cap history and spent time until an actual changed
+        # cap is accepted. A proposed increase or API failure proves nothing.
+
+    def _restore_late_reduction(self, current: float, status: str) -> bool:
+        """Restore only historical lower-cap protection, never a new budget."""
+        cap = self._accepted_reduction_cap
+        previous = self._reduction_previous_cap
+        if (self._awaiting_reduction_target is not None or cap is None or previous is None
+                or self.last_target is None or self.last_target[0] != cap
+                or status != "charging" or current <= cap + 0.5):
+            return False
+        if current > previous + 0.5:
+            return True
+        if self._fast_sources_fresh():
+            self._awaiting_reduction_target = cap
+            self._reduction_low_response_ts = None
+        return False
+
+    def _observe_reduction_current(self, current: float) -> None:
+        """A late receipt may still describe the preceding accepted offer.
+
+        Keep the measured high-water mark separately from the low value used
+        when the cap was submitted. A new receipt of that same low value is
+        not evidence that a physical reduction happened.
+        """
+        if (self._awaiting_reduction_target is None or self._reduction_high_current is None
+                or self._last_input_charger_ts is None or self._reduction_charger_ts is None
+                or self._last_input_charger_ts <= self._reduction_charger_ts
+                or not self._fast_sources_fresh()):
+            return
+        if current > self._awaiting_reduction_target + 0.5:
+            self._reduction_low_response_ts = None
+        if self._reduction_previous_cap is not None and current > self._reduction_previous_cap + 0.5:
+            return
+        if current > self._reduction_high_current:
+            self._reduction_high_current = current
+            self._reduction_high_ev_ts = self._last_input_charger_ts
+
+    def _reduction_low_is_response(self, cap: int, current: float, status: str) -> bool:
+        if not self._reduction_under_cap_baseline:
+            return True  # Preserve the established measured-decrease path.
+        stamp = self._last_input_charger_ts
+        if (stamp is None or self._reduction_charger_ts is None
+                or stamp <= self._reduction_charger_ts or not self._fast_sources_fresh()):
+            return False
+        if self._reduction_low_response_ts is not None:
+            return current <= cap + 0.5
+        reached_cap = (self._meaningfully_charging(status, current)
+                       and cap - 0.5 <= current <= cap + 0.5)
+        fell_from_observed_high = (
+            self._reduction_high_current is not None
+            and self._reduction_high_current > cap + 0.5
+            and self._reduction_high_ev_ts is not None and stamp > self._reduction_high_ev_ts
+            and current < self._reduction_high_current - 0.5
+        )
+        if reached_cap or fell_from_observed_high:
+            self._reduction_low_response_ts = stamp
+            return True
+        return False
+
+    def _late_high_reduction_can_wait(self, grid: float, current: float, status: str) -> bool:
+        """Only hold the accepted lower cap without subtracting uncertain EV.
+
+        This narrower extension requires the full normal buffer. The legacy
+        unchanged-EV path keeps its existing minimum-reserve contract.
+        """
+        cap = self._awaiting_reduction_target
+        previous = self._reduction_previous_cap
+        before = self._reduction_before_current
+        return bool(
+            status == "charging" and cap is not None and cap > 0
+            and self.settings.min_charge_amps <= cap <= self.settings.max_charge_amps
+            and self.last_target is not None and self.last_target[0] == cap
+            and previous is not None and previous > cap and before is not None
+            and cap + 0.5 < current <= previous + 0.5
+            and self._reduction_grid_ceiling is not None and grid < self._reduction_grid_ceiling
+            and self._last_input_grid_ts is not None and self._reduction_grid_ts is not None
+            and self._last_input_grid_ts > self._reduction_grid_ts
+            and self._last_input_charger_ts is not None and self._reduction_charger_ts is not None
+            and self._last_input_charger_ts > self._reduction_charger_ts
+            and self._fast_sources_fresh()
+            and grid + cap <= self.settings.main_fuse_amps - self.settings.buffer_amps
+        )
 
     def _partial_reduction_alignment(self, now: float, grid: float,
                                      current: float, status: str) -> Optional[str]:
@@ -281,7 +398,7 @@ class OneFuseRegulator:
         if (grid > self._reduction_grid_ceiling
                 or self._house_before_reduction + cap > self.settings.main_fuse_amps - margin):
             return None
-        low = self._partial_reduction_current if partial_seen else before
+        low = self._partial_reduction_current if partial_seen else max(before, self._reduction_high_current or 0.0)
         completed_partial = (partial_seen and low > cap + 0.5
                              and current <= cap + 0.5 and current < low)
         if ev_ts > self._reduction_charger_ts and (current < low - 0.5 or completed_partial):
@@ -295,9 +412,7 @@ class OneFuseRegulator:
         if current > self._partial_reduction_current + 0.5:
             return None
         elapsed = now - self._settle_started if self._settle_started is not None else 0.0
-        budget = min(self._partial_reduction_budget, self.settings.measurement_settle_seconds,
-                     self.settings.max_sensor_age_seconds)
-        if self._partial_reduction_used_seconds + elapsed >= budget:
+        if self._reduction_alignment_remaining(now) <= 0:
             return "timeout"
         if grid_ts > response and current <= grid + 1:
             self._partial_reduction_used_seconds += elapsed
@@ -306,7 +421,7 @@ class OneFuseRegulator:
             self._reduction_grid_ceiling = min(self._reduction_grid_ceiling, grid)
             return None
         if self._settle_started is None:
-            self._settle_started = now
+            self._begin_reduction_alignment(now, guarded=self._reduction_under_cap_baseline)
         return "hold"
 
     def _fast_sources_fresh(self) -> bool:
@@ -683,17 +798,57 @@ class OneFuseRegulator:
                             (old_target is not None and target < old_target)):
                 # A submitted cap is not a measured current. Retain the last
                 # house estimate, and inhibit rises until the EV responds.
-                self._awaiting_reduction_target = target
-                self._house_before_reduction = decision.house_load_l1
+                same_pending_chain = (
+                    target > 0 and old_target is not None and target < old_target
+                    and self._reduction_previous_cap is not None
+                    and self._partial_reduction_budget is not None
+                    and (self._awaiting_reduction_target == old_target
+                         or (self._accepted_reduction_cap == old_target
+                             and self._reduction_guard_deadline is not None
+                             and now_ts < self._reduction_guard_deadline))
+                )
+                previous_cap = self._reduction_previous_cap if same_pending_chain else old_target
+                budget = (self._partial_reduction_budget if same_pending_chain else
+                          min(self.settings.measurement_settle_seconds, self.settings.max_sensor_age_seconds))
+                spent = self._partial_reduction_used_seconds if same_pending_chain else 0.0
+                if same_pending_chain and self._settle_started is not None:
+                    spent += max(0.0, now_ts - self._settle_started)
+                deadline = self._reduction_guard_deadline if same_pending_chain else None
+                grid_ceiling = decision.grid_l1
+                if same_pending_chain:
+                    # A further reduction cannot refund uncertainty or replace
+                    # the known preceding offer by the smaller intermediate cap.
+                    self._house_before_reduction = max(
+                        self._house_before_reduction or 0.0, decision.house_load_l1)
+                    if self._reduction_grid_ceiling is not None and grid_ceiling is not None:
+                        grid_ceiling = max(grid_ceiling, self._reduction_grid_ceiling)
+                else:
+                    self._house_before_reduction = decision.house_load_l1
+                # Every accepted cap needs response baselines for THAT command,
+                # even when its uncertainty belongs to an older active chain.
                 self._reduction_grid_ts = self._last_input_grid_ts
                 self._reduction_charger_ts = self._last_input_charger_ts
                 self._settle_started = None
                 self._clear_partial_reduction_alignment()
+                self._awaiting_reduction_target = target
+                self._accepted_reduction_cap = target if target > 0 else None
                 self._reduction_before_current = decision.charger_current
-                self._reduction_grid_ceiling = decision.grid_l1
-                self._partial_reduction_budget = min(
-                    self.settings.measurement_settle_seconds, self.settings.max_sensor_age_seconds)
+                self._reduction_previous_cap = previous_cap
+                self._reduction_under_cap_baseline = (
+                    target > 0 and old_target is not None and old_target > target
+                    and decision.charger_current <= target + 0.5)
+                self._reduction_high_current = decision.charger_current
+                self._reduction_high_ev_ts = self._last_input_charger_ts
+                self._reduction_grid_ceiling = grid_ceiling
+                self._partial_reduction_budget = budget
+                self._partial_reduction_used_seconds = spent
+                self._reduction_guard_deadline = deadline
                 self._increase_since = None
+            elif changed:
+                self._awaiting_reduction_target = None
+                self._house_before_reduction = None
+                self._settle_started = None
+                self._clear_partial_reduction_alignment()
             if changed and (old_target is None or target > old_target):
                 self._last_increase_ts = now_ts
             if target == 0:
@@ -908,7 +1063,9 @@ class OneFuseRegulator:
                 measurement_alignment_remaining_seconds=(
                     max(0.0, min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
                         - self._positive_alignment_used_seconds - (now - self._positive_skew_since))
-                    if self._positive_skew_since is not None else None),
+                    if self._positive_skew_since is not None else
+                    self._reduction_alignment_remaining(now) if self._settle_started is not None
+                    and self._awaiting_reduction_target is not None else None),
                 current_refresh_required=refresh_required or self._fast_recovery_wait == "fresh",
                 house_load_basis=house_basis,
                 house_load_anchor_l1=self._positive_house,
@@ -1060,6 +1217,19 @@ class OneFuseRegulator:
             raw_available = s.main_fuse_amps - house - s.buffer_amps
             available = (int(floor(min(raw_available, s.max_charge_amps)))
                          if raw_available >= s.min_charge_amps else 0)
+        if self._restore_late_reduction(current, status):
+            self.reset_timers()
+            self._restart_required = True
+            return decision("unavailable", "Charger current exceeds the known pre-reduction offer; requesting 0 A.",
+                            "set_limit", emergency=True)
+        accepted_lower_cap = self._awaiting_reduction_target
+        if (accepted_lower_cap is not None and accepted_lower_cap > 0
+                and not s.min_charge_amps <= accepted_lower_cap <= s.max_charge_amps):
+            self.reset_timers()
+            self._restart_required = True
+            return decision("unavailable", "The accepted lower cap is outside the configured current bounds; requesting 0 A.",
+                            "set_limit", emergency=True)
+        self._observe_reduction_current(current)
         partial_reduction = self._partial_reduction_alignment(now, grid, current, status)
         if partial_reduction == "timeout":
             self.reset_timers()
@@ -1104,29 +1274,49 @@ class OneFuseRegulator:
                             and self._last_input_grid_ts > self._reduction_grid_ts)
             ev_not_updated = (self._last_input_charger_ts is not None
                               and self._reduction_charger_ts is not None
-                              and self._last_input_charger_ts <= self._reduction_charger_ts)
+                              and self._last_input_charger_ts == self._reduction_charger_ts)
+            late_high_can_wait = self._late_high_reduction_can_wait(grid, current, status)
             if (cap is not None and cap > 0 and self.last_target is not None
-                    and self.last_target[0] == cap and grid_updated and ev_not_updated
-                    and grid + cap <= s.main_fuse_amps - reserve):
+                    and s.min_charge_amps <= cap <= s.max_charge_amps
+                    and self.last_target[0] == cap and grid_updated
+                    and ((ev_not_updated and grid + cap <= s.main_fuse_amps - reserve)
+                         or late_high_can_wait)):
                 if self._settle_started is None:
-                    self._settle_started = now
-                settle_seconds = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
-                if now - self._settle_started < settle_seconds:
+                    self._begin_reduction_alignment(now, guarded=late_high_can_wait)
+                elif late_high_can_wait:
+                    self._begin_reduction_alignment(now, guarded=True)
+                if self._reduction_alignment_remaining(now) > 0:
                     # This is a new valid grid report. Keep its continuous
                     # observations current even though mixed EV data must not
                     # trigger a pause, resume, or increase from this snapshot.
-                    self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
-                    self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+                    soft_during_alignment = self._timer_reached(
+                        now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+                    pause_during_alignment = self._timer_reached(
+                        now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
                     self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
                     self._increase_since = None
-                    return decision("settling", "Waiting briefly for the EV report after observed grid reduction.",
+                    if (s.enable_pause_resume and pause_during_alignment
+                            and status in {"charging", "start_charging"}):
+                        return decision("pause", "L1 has exceeded the pause threshold for its full observation period.", "pause")
+                    if s.enable_soft_guard and soft_during_alignment and s.soft_current_amps < cap:
+                        soft_target = max(0, s.soft_current_amps)
+                        if soft_target < s.min_charge_amps:
+                            soft_target = 0
+                        return decision("soft_limit", "Soft guard overrides current-reduction alignment.",
+                                        "set_limit", soft_target, s.soft_ttl_seconds, emergency=True)
+                    if late_high_can_wait:
+                        house = grid
+                        house_basis = "accepted_lower_cap_raw_grid_hold"
+                        available, _ = self.calculate_available_l1(grid, 0.0)
+                    return decision("settling", "Holding the accepted lower cap briefly after observed grid reduction; no increase or resume.",
                                     "set_limit", cap, self.last_target[3])
             self.reset_timers()
             self._restart_required = True
             return decision("unavailable", "Charger and grid currents are inconsistent; cannot estimate house load safely. "
                             "Requesting 0 A; cloud control is best effort.", "set_limit", emergency=True)
         if self._awaiting_reduction_target is not None:
-            if current <= self._awaiting_reduction_target + 0.5:
+            if (current <= self._awaiting_reduction_target + 0.5
+                    and self._reduction_low_is_response(self._awaiting_reduction_target, current, status)):
                 # An EV event can arrive before the corresponding grid event.
                 # For a strictly bounded interval keep the already accepted
                 # lower cap; subtracting the new EV current from the old grid
@@ -1137,20 +1327,44 @@ class OneFuseRegulator:
                 ev_updated = (self._last_input_charger_ts is not None
                               and self._reduction_charger_ts is not None
                               and self._last_input_charger_ts > self._reduction_charger_ts)
-                if grid_not_updated and ev_updated:
+                grid_before_under_cap_response = (
+                    self._reduction_under_cap_baseline and self._last_input_grid_ts is not None
+                    and self._reduction_low_response_ts is not None
+                    and self._last_input_grid_ts <= self._reduction_low_response_ts)
+                if (grid_not_updated or grid_before_under_cap_response) and ev_updated:
                     if self._settle_started is None:
-                        self._settle_started = now
-                    settle_seconds = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
-                    if now - self._settle_started < settle_seconds:
+                        self._begin_reduction_alignment(now, guarded=self._reduction_under_cap_baseline)
+                    if self._reduction_alignment_remaining(now) > 0:
                         self._increase_since = None
                         cap = self._awaiting_reduction_target
                         ttl = self.last_target[3] if self.last_target else s.normal_ttl_seconds
+                        soft_during_alignment = self._timer_reached(
+                            now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+                        pause_during_alignment = self._timer_reached(
+                            now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+                        self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+                        if (s.enable_pause_resume and pause_during_alignment
+                                and status in {"charging", "start_charging"}):
+                            return decision("pause", "L1 has exceeded the pause threshold for its full observation period.", "pause")
+                        if s.enable_soft_guard and soft_during_alignment and s.soft_current_amps < cap:
+                            soft_target = max(0, s.soft_current_amps)
+                            if soft_target < s.min_charge_amps:
+                                soft_target = 0
+                            return decision("soft_limit", "Soft guard overrides current-reduction alignment.",
+                                            "set_limit", soft_target, s.soft_ttl_seconds, emergency=True)
                         return decision("settling", "Waiting briefly for the grid report after observed EV reduction.",
                                         "set_limit", cap, ttl)
-                self._awaiting_reduction_target = None
-                self._house_before_reduction = None
-                self._settle_started = None
-                self._clear_partial_reduction_alignment()
+                    self.reset_timers()
+                    self._restart_required = True
+                    return decision("unavailable", "Current-reduction measurement alignment timed out; requesting 0 A.",
+                                    "set_limit", emergency=True)
+                if self._awaiting_reduction_target > 0:
+                    self._finish_reduction_alignment(now)
+                else:
+                    self._awaiting_reduction_target = None
+                    self._house_before_reduction = None
+                    self._settle_started = None
+                    self._clear_partial_reduction_alignment()
             else:
                 # With asynchronous sources the subtraction can temporarily
                 # understate household load. Never recover headroom from the

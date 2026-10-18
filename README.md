@@ -158,16 +158,31 @@ why a newer read is needed and which current/status pair was used.
 Experimental timed overload is a separate, disabled-by-default
 option described below; the report-alignment window alone does not enable it.
 
-The opposite report order can also briefly pair a newer low grid current with
-an older high EV current. During an acknowledged reduction, the regulator may
-retain its accepted positive cap for the same bounded alignment window only
-when report timestamps identify the old EV sample and **grid current plus the
-entire cap** still fits the nominal budget and minimum reserve. This deliberately
-does not subtract the inconsistent EV reading to create headroom. A timeout,
-missing timestamps, inconsistent fresh EV data or an exceeded budget requests
-zero; the window never permits an increase or resume. A completed/disconnected
-session does not receive a zero command merely because its final current
-reports arrive out of order.
+The opposite report order can briefly pair a lower grid current with the EV
+current from before an accepted reduction. The established unchanged-EV path
+requires **grid current plus the entire accepted cap** to fit the nominal
+budget and minimum reserve. A later EV receipt can also contain the preceding
+high value: this narrower extension requires a known preceding accepted offer,
+current within that offer's tolerance, and the **full normal buffer** for raw
+grid current plus the entire lower cap. It never subtracts the inconsistent EV
+reading to create headroom or grants a higher cap or resume.
+
+An unchanged value well below the new cap cannot prove that a startup reduction
+has happened. A new near-cap report, or a distinct fall from an observed high
+current, needs a subsequent coherent grid report to confirm the response.
+Repeated identical receipts do not move that first response time. Confirmation
+releases the active wait but retains the accepted lower-cap context and its
+remaining alignment budget for delayed high reports. An actually accepted
+higher offer replaces that context with positive-response tracking; a displayed
+proposal or failed submission does not. Report-order changes, coherent partial
+feedback, lease renewals and further reductions in the same response chain
+cannot refund its spent alignment budget. Once the earlier response is
+confirmed and its guard has ended, a later reduction uses the latest accepted
+cap as its own preceding offer; it cannot reuse the older, higher offer.
+A timeout, missing or stale timestamps, an implausible EV value or an exceeded
+budget requests zero. Source faults and the overload/soft/pause protections
+retain priority. A completed/disconnected session does not receive a zero
+command merely because its final current reports arrive out of order.
 
 These checks do not synchronize physical measurements. Numerically consistent
 grid/EV values can still refer to different moments. While a submitted reduction
