@@ -91,9 +91,11 @@ class OverloadRegressionTests(unittest.TestCase):
             self.sample(regulator, 5, 32, 10, grid_at=3),
             self.sample(regulator, 7, 28, 10, ev_at=5),
             self.sample(regulator, 8, 28, 6, grid_at=7),
+            self.sample(regulator, 9, 28, 6, ev_at=8),
         ]
         for decision in samples:
             self.assert_minimum(decision)
+        self.assertEqual(samples[-2].mode, "overload_shedding")
         self.assertEqual(samples[-1].mode, "overload_minimum")
 
     def test_post_minimum_high_grid_stops_without_waiting_out_deadline(self):

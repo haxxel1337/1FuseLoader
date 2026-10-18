@@ -245,6 +245,16 @@ the same original response deadline. A grid value already at or below the
 ceiling is conservative while the EV is still reducing; a subsequent grid report
 above the ceiling after the minimum response still stops immediately.
 
+From **0.4.0b14**, reducing a higher accepted offer to the experimental minimum
+uses the same bounded response transition even if the latest EV reading is
+already low. That reading may precede the higher offer. Completion requires an
+accepted minimum offer, a later minimum-current EV report and then a coherent
+grid report strictly after that response. Mixed feedback cannot hand an
+unconfirmed reduction to ordinary headroom logic. The original response deadline
+still includes API latency; missing confirmation still requests zero and latches
+the failure, even if other measurements suggest that the vehicle reduced its
+draw. Updating or restarting does not clear an existing safety latch.
+
 Exposure is cumulative rather than a thermal cooling estimate. The controller
 persists its budget and unresolved exposure across unload/restart and setting
 changes; a short dip below the fuse rating, toggling the switch or restarting HA
