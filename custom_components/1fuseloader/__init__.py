@@ -35,6 +35,9 @@ EXPOSURE_STORE_TIMEOUT_SECONDS = 2
 EXPOSURE_STORE_RETRY_SECONDS = 15
 CURRENT_SNAPSHOT_INTERVAL_SECONDS = 30
 CURRENT_SNAPSHOT_MAX_AGE_SECONDS = 30
+CURRENT_SNAPSHOT_MIN_INTERVAL_SECONDS = 5
+CURRENT_SNAPSHOT_REQUEST_TIMEOUT_SECONDS = 10
+CURRENT_SNAPSHOT_MAX_BACKOFF_SECONDS = 300
 SNAPSHOT_ERROR_CODES = frozenset({
     "easee_snapshot_api_unavailable", "easee_snapshot_missing_or_invalid",
     "easee_snapshot_invalid_current", "easee_snapshot_invalid_operation_mode",
@@ -80,6 +83,7 @@ class OneFuseLoaderController:
         self.last_accepted_command: dict[str, Any] | None = None
         self.last_accepted_limit: dict[str, Any] | None = None
         self.last_stop_context: dict[str, Any] | None = None
+        self.last_stop_nominal_diagnostics: dict[str, Any] | None = None
         self._stop_context_armed = True
         self.source_diagnostics: dict[str, Any] = {}
         self._charger_snapshot: Any = None
@@ -89,6 +93,10 @@ class OneFuseLoaderController:
         self._charger_snapshot_error: str | None = None
         self._charger_snapshot_error_reason: str | None = None
         self._charger_snapshot_failure_type: str | None = None
+        self._charger_snapshot_refresh_unsub = None
+        self._charger_snapshot_refresh_due: float | None = None
+        self._charger_snapshot_refresh_token: object | None = None
+        self._charger_snapshot_failures = 0
         self.control_block_reason: str | None = "Easee adapter has not been initialized."
         self.unsub_timer = None
         self.unsub_states = None
@@ -108,6 +116,11 @@ class OneFuseLoaderController:
         storage_key = f"{DOMAIN}.{entry.entry_id}.overload"
         writer = Store(hass, 1, storage_key, atomic_writes=True)
         runtime_data = getattr(hass, "data", None)
+        rate_states = (runtime_data.setdefault(f"{DOMAIN}_snapshot_rate_limits", {})
+                       if runtime_data is not None else {})
+        self._charger_snapshot_rate_state = rate_states.setdefault(entry.entry_id, {})
+        self._charger_snapshot_next_request = self._charger_snapshot_rate_state.get("next_request", 0.0)
+        self._charger_snapshot_failures = self._charger_snapshot_rate_state.get("failures", 0)
         pending_writes = (runtime_data.setdefault(_PENDING_BUDGET_WRITES_KEY, {})
                           if runtime_data is not None else {})
 
@@ -178,6 +191,7 @@ class OneFuseLoaderController:
 
     async def async_set_option(self, key: str, value: Any) -> None:
         self._generation += 1
+        self._cancel_snapshot_refresh(cancel_request=True)
         async with self._lock:
             options = dict(self.entry.options or {})
             options[key] = value
@@ -192,6 +206,7 @@ class OneFuseLoaderController:
 
     async def async_reconfigure(self) -> None:
         self._generation += 1
+        self._cancel_snapshot_refresh(cancel_request=True)
         async with self._lock:
             changed = self._reload_settings_locked()
             source_changed = await self._async_configure_l1_source_locked()
@@ -202,6 +217,7 @@ class OneFuseLoaderController:
 
     async def async_reset_state(self) -> None:
         self._generation += 1
+        self._cancel_snapshot_refresh(cancel_request=True)
         async with self._lock:
             self.regulator.reset()
             if not self._stopped:
@@ -357,8 +373,7 @@ class OneFuseLoaderController:
         self._generation += 1
         self._pending_refresh = False
         snapshot_task = self._charger_snapshot_task
-        if snapshot_task is not None:
-            snapshot_task.cancel()
+        self._cancel_snapshot_refresh(cancel_request=True)
         self._charger_snapshot = None
         self._charger_snapshot_selection = None
         if self._l1_source is not None:
@@ -403,8 +418,96 @@ class OneFuseLoaderController:
             result.extend((entity_id, getattr(state, "state", None), self._report_timestamp(state)))
         return tuple(result)
 
+    def _cancel_snapshot_refresh(self, *, cancel_request: bool = False) -> None:
+        if self._charger_snapshot_refresh_unsub is not None:
+            self._charger_snapshot_refresh_unsub()
+        self._charger_snapshot_refresh_unsub = None
+        self._charger_snapshot_refresh_due = None
+        self._charger_snapshot_refresh_token = None
+        if cancel_request and self._charger_snapshot_task is not None:
+            self._charger_snapshot_task.cancel()
+
+    def _snapshot_freshness_window(self) -> float:
+        return max(0.0, min(float(self.settings.measurement_settle_seconds),
+                            float(self.settings.max_sensor_age_seconds), CURRENT_SNAPSHOT_MAX_AGE_SECONDS))
+
+    def _snapshot_prefetch_allowed(self, inp: RegulatorInput) -> bool:
+        try:
+            charging = inp.status == "charging" and float(inp.charger_current) >= 1
+        except (TypeError, ValueError):
+            charging = False
+        return bool(not self._stopped and self.settings.active_control and not self.settings.dry_run
+                    and self.settings.enable_dynamic_limit and inp.data_valid and charging
+                    and self._snapshot_freshness_window() > 0 and self._adapter is not None
+                    and not self._adapter.telemetry_block_reason
+                    and callable(getattr(self._adapter, "async_read_current_snapshot", None)))
+
+    def _schedule_current_snapshot(self, inp: RegulatorInput) -> None:
+        """Prefetch before numeric expiry, independent of the watchdog period.
+
+        The GET receipt is real input evidence, never a physical sample. A
+        five-second start floor shares quota with demand reads; very short
+        alignment windows or a slow API can still fail closed normally.
+        """
+        if not self._snapshot_prefetch_allowed(inp):
+            self._cancel_snapshot_refresh(cancel_request=not inp.data_valid or bool(
+                self._adapter is not None and self._adapter.telemetry_block_reason))
+            return
+        in_flight = self._charger_snapshot_task is not None and not self._charger_snapshot_task.done()
+        if in_flight and not self._charger_snapshot_task.cancelling():
+            self._cancel_snapshot_refresh()
+            return
+        now = self.hass.loop.time()
+        wall = inp.wall_now_ts
+        report = inp.charger_report_ts
+        age = (wall - report if wall is not None and report is not None
+               and isfinite(wall) and isfinite(report) else float("inf"))
+        target_age = self._snapshot_freshness_window() / 2
+        wait = max(0.0, target_age - age) if age >= -5 else 0.0
+        due = max(now + wait, self._charger_snapshot_next_request,
+                  now + CURRENT_SNAPSHOT_MIN_INTERVAL_SECONDS if in_flight else now)
+        if (self._charger_snapshot_refresh_due is not None
+                and abs(self._charger_snapshot_refresh_due - due) < .05):
+            return
+        self._cancel_snapshot_refresh()
+        token = object()
+        generation = self._generation
+        self._charger_snapshot_refresh_token = token
+        self._charger_snapshot_refresh_due = due
+
+        async def refresh_due(_now: datetime) -> None:
+            if (self._stopped or generation != self._generation
+                    or token is not self._charger_snapshot_refresh_token):
+                return
+            self._charger_snapshot_refresh_unsub = None
+            self._charger_snapshot_refresh_due = None
+            self._charger_snapshot_refresh_token = None
+            latest = self._read_input()
+            if not self._snapshot_prefetch_allowed(latest):
+                self._schedule_current_snapshot(latest)
+                return
+            age_now = (latest.wall_now_ts - latest.charger_report_ts
+                       if latest.wall_now_ts is not None and latest.charger_report_ts is not None
+                       else float("inf"))
+            if 0 <= age_now < self._snapshot_freshness_window() / 2:
+                self._schedule_current_snapshot(latest)
+                return
+            self._request_current_snapshot()
+            self._schedule_current_snapshot(latest)
+
+        self._charger_snapshot_refresh_unsub = async_call_later(self.hass, max(.001, due - now), refresh_due)
+
+    def _snapshot_backoff(self) -> None:
+        self._charger_snapshot_failures = min(self._charger_snapshot_failures + 1, 5)
+        delay = min(CURRENT_SNAPSHOT_MAX_BACKOFF_SECONDS,
+                    CURRENT_SNAPSHOT_INTERVAL_SECONDS * 2 ** (self._charger_snapshot_failures - 1))
+        self._charger_snapshot_next_request = max(self._charger_snapshot_next_request,
+                                                   self.hass.loop.time() + delay)
+        self._charger_snapshot_rate_state.update(next_request=self._charger_snapshot_next_request,
+                                                  failures=self._charger_snapshot_failures)
+
     def _request_current_snapshot(self) -> None:
-        """Read only on demand, outside the control lock and never in a loop."""
+        """One bounded read shared by demand and deadline-driven prefetch."""
         read_snapshot = getattr(self._adapter, "async_read_current_snapshot", None)
         snapshot_is_current = getattr(self._adapter, "snapshot_is_current", None)
         if (self._stopped or not callable(read_snapshot) or not callable(snapshot_is_current)
@@ -417,13 +520,16 @@ class OneFuseLoaderController:
         generation = self._generation
         revision = self._charger_source_revision()
         adapter = self._adapter
-        self._charger_snapshot_next_request = self.hass.loop.time() + CURRENT_SNAPSHOT_INTERVAL_SECONDS
+        self._cancel_snapshot_refresh()
+        self._charger_snapshot_next_request = self.hass.loop.time() + CURRENT_SNAPSHOT_MIN_INTERVAL_SECONDS
+        self._charger_snapshot_rate_state.update(next_request=self._charger_snapshot_next_request)
 
         async def fetch() -> None:
             try:
                 # Adapter uses a bounded GET. A slow network cannot hold the
                 # regulator lock and delay a meter-triggered reduction.
-                snapshot = await read_snapshot()
+                async with asyncio.timeout(CURRENT_SNAPSHOT_REQUEST_TIMEOUT_SECONDS):
+                    snapshot = await read_snapshot()
                 async with self._lock:
                     if (self._stopped or generation != self._generation or adapter is not self._adapter
                             or revision != self._charger_source_revision()
@@ -437,6 +543,7 @@ class OneFuseLoaderController:
                         self._charger_snapshot_error_reason = "snapshot_receipt_invalid"
                         self._charger_snapshot_failure_type = None
                         self._charger_snapshot = None
+                        self._snapshot_backoff()
                         return
                     report_times = [revision[3], revision[6]]
                     if any(stamp is None or stamp >= received.timestamp() for stamp in report_times):
@@ -444,18 +551,24 @@ class OneFuseLoaderController:
                         self._charger_snapshot_error_reason = "snapshot_not_newer_than_entity_reports"
                         self._charger_snapshot_failure_type = None
                         self._charger_snapshot = None
+                        self._snapshot_backoff()
                         return
                     self._charger_snapshot = snapshot
                     self._charger_snapshot_selection = revision
                     self._charger_snapshot_error = None
                     self._charger_snapshot_error_reason = None
                     self._charger_snapshot_failure_type = None
+                    self._charger_snapshot_failures = 0
+                    self._charger_snapshot_rate_state["failures"] = 0
                 # Always evaluate the newest grid after completion; the GET
                 # result is never a precomputed command or direct submission.
                 self._handle_source_change(None)
             except asyncio.CancelledError:
                 raise
             except Exception as err:
+                if (self._stopped or generation != self._generation or adapter is not self._adapter
+                        or revision != self._charger_source_revision()):
+                    return
                 self._charger_snapshot = None
                 self._charger_snapshot_error = type(err).__name__
                 # Only our fixed vocabulary may enter diagnostics/logs. Never
@@ -467,11 +580,15 @@ class OneFuseLoaderController:
                     parts[1] if candidate == "easee_snapshot_failed" and len(parts) == 2
                     and parts[1] in SNAPSHOT_FAILURE_TYPES else None
                 )
+                self._snapshot_backoff()
                 _LOGGER.warning("1FuseLoader current snapshot failed (%s; %s; %s)", type(err).__name__,
                                 self._charger_snapshot_error_reason or "unclassified",
                                 self._charger_snapshot_failure_type or "unspecified")
             finally:
-                self._charger_snapshot_task = None
+                if self._charger_snapshot_task is asyncio.current_task():
+                    self._charger_snapshot_task = None
+                if (not self._stopped and generation == self._generation and adapter is self._adapter):
+                    self._schedule_current_snapshot(self._read_input())
 
         self._charger_snapshot_task = self.hass.async_create_task(fetch())
 
@@ -571,6 +688,13 @@ class OneFuseLoaderController:
             "charger_snapshot_error_reason": self._charger_snapshot_error_reason,
             "charger_snapshot_failure_type": self._charger_snapshot_failure_type,
             "charger_snapshot_scope": "cloud_state_read_receipt_not_physical_acquisition",
+            "charger_snapshot_prefetch_target_seconds": self._snapshot_freshness_window() / 2,
+            "charger_snapshot_request_floor_seconds": CURRENT_SNAPSHOT_MIN_INTERVAL_SECONDS,
+            "charger_snapshot_failure_backoff_count": self._charger_snapshot_failures,
+            "charger_snapshot_next_request_in_seconds": max(0.0, self._charger_snapshot_next_request - self.hass.loop.time()),
+            "charger_snapshot_prefetch_due_in_seconds": (
+                max(0.0, self._charger_snapshot_refresh_due - self.hass.loop.time())
+                if self._charger_snapshot_refresh_due is not None else None),
             "effective_charger_current": current_value,
             "effective_charger_status": status_value,
             "effective_charger_reported_at_utc": (datetime.fromtimestamp(current_report_ts, timezone.utc).isoformat()
@@ -714,12 +838,15 @@ class OneFuseLoaderController:
             "last_accepted_command": dict(self.last_accepted_command) if self.last_accepted_command else None,
             "last_accepted_limit": dict(accepted) if accepted else None,
             "last_stop_context": dict(self.last_stop_context) if self.last_stop_context else None,
+            "last_stop_nominal_diagnostics": (dict(self.last_stop_nominal_diagnostics)
+                                               if self.last_stop_nominal_diagnostics else None),
             "reported_cap_matches_last_accepted_limit": comparison,
             "reported_cap_report_after_acceptance": post_acceptance,
             "readback_scope": "cached_circuit_cap_only",
             "physical_current_verified": False,
             "device_ttl_verified": False,
             "budget_storage_error": self._budget_error,
+            "overload_failure_reason": self.regulator.export_overload_state()["failure_reason"],
             "budget_storage_error_type": self._budget_error_type,
             "budget_checkpoint_verified_at_utc": (
                 datetime.fromtimestamp(self._budget_store.last_verified_at, timezone.utc).isoformat()
@@ -758,6 +885,7 @@ class OneFuseLoaderController:
         except Exception:
             self.bmw_context = {}
         inp = self._read_input()
+        self._schedule_current_snapshot(inp)
         plan_source_diagnostics = dict(self.source_diagnostics)
         if self.settings.overload_enabled:
             offline_problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
@@ -897,6 +1025,15 @@ class OneFuseLoaderController:
                 "command_completed_at_utc": None,
                 "command_result": "pending", "command_error": None,
                 "clock_scope": "validated_grid_sample_and_local_HA_receipts_not_physical_stop_proof",
+            }
+            self.last_stop_nominal_diagnostics = {
+                "plan_utc": self.last_stop_context["plan_utc"],
+                "nominal_rejection_code": decision.nominal_rejection_code,
+                "source_report_skew_seconds": decision.source_report_skew_seconds,
+                "grid_report_age_seconds": decision.grid_report_age_seconds,
+                "charger_report_age_seconds": decision.charger_report_age_seconds,
+                "source_alignment_window_seconds": decision.source_alignment_window_seconds,
+                "source_max_age_seconds": self.settings.max_sensor_age_seconds,
             }
             self._stop_context_armed = False
         self.last_service_error = None

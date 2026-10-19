@@ -126,6 +126,11 @@ class RegulatorDecision:
     current_refresh_required: bool = False
     house_load_basis: str = "grid_minus_reported_ev"
     house_load_anchor_l1: Optional[float] = None
+    nominal_rejection_code: Optional[str] = None
+    source_report_skew_seconds: Optional[float] = None
+    grid_report_age_seconds: Optional[float] = None
+    charger_report_age_seconds: Optional[float] = None
+    source_alignment_window_seconds: Optional[float] = None
 
 
 class OneFuseRegulator:
@@ -211,6 +216,7 @@ class OneFuseRegulator:
         self._nominal_shedding_started: Optional[float] = None
         self._nominal_shedding_budget: Optional[float] = None
         self._nominal_overload_blocked = False
+        self._nominal_rejection_code: Optional[str] = None
         self._clear_positive_alignment()
 
     @property
@@ -309,18 +315,34 @@ class OneFuseRegulator:
         normal shedding attempt without renewing time on reports or leases.
         """
         s = self.settings
-        if (self._restart_required or not s.enable_dynamic_limit
-                or self._overload_transition_started is not None or self.last_target is None
-                or not self._meaningfully_charging(status, current) or self.paused_by_us
-                or not self._fast_sources_fresh() or current > grid + 1
-                or grid > s.main_fuse_amps + s.overload_margin_amps):
+        def reject(code: str) -> bool:
+            self._nominal_rejection_code = code
             return False
+        for blocked, code in (
+            (self._restart_required, "restart_observation_required"),
+            (not s.enable_dynamic_limit, "dynamic_limiting_disabled"),
+            (self._overload_transition_started is not None, "experimental_transition_active"),
+            (self.last_target is None, "no_accepted_limit"),
+            (not self._meaningfully_charging(status, current), "not_meaningfully_charging"),
+            (self.paused_by_us, "owned_pause_active"),
+        ):
+            if blocked:
+                return reject(code)
+        freshness = self._numeric_source_rejection()
+        if freshness:
+            return reject(freshness)
+        if current > grid + 1:
+            return reject("current_observations_inconsistent")
+        if grid > s.main_fuse_amps + s.overload_margin_amps:
+            return reject("raw_grid_above_post_response_ceiling")
+        assert self.last_target is not None
         accepted = self.last_target[0]
         previous = (self._reduction_previous_cap if self._awaiting_reduction_target is not None
                     and self._reduction_previous_cap is not None else accepted)
-        if (not s.min_charge_amps <= accepted <= s.max_charge_amps
-                or current > min(previous, s.max_charge_amps) + 0.5):
-            return False
+        if not s.min_charge_amps <= accepted <= s.max_charge_amps:
+            return reject("accepted_limit_outside_current_bounds")
+        if current > min(previous, s.max_charge_amps) + 0.5:
+            return reject("current_exceeds_known_offer")
         conservative_house = max(house, self._house_before_reduction or 0.0)
         nominal = int(floor(min(s.max_charge_amps, s.main_fuse_amps - s.buffer_amps - conservative_house)))
         observed_ev_first = (
@@ -334,15 +356,15 @@ class OneFuseRegulator:
             and self._last_limit_change_ts is not None
             and 0 <= now - self._last_limit_change_ts < min(s.measurement_settle_seconds, s.max_sensor_age_seconds))
         if not s.min_charge_amps <= nominal <= accepted and not observed_ev_first:
-            return False
+            return reject("no_buffered_nominal_reduction")
         budget = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
         if budget <= 0:
-            return False
+            return reject("measurement_alignment_disabled")
         if self._nominal_shedding_started is None:
             self._nominal_shedding_started = now
             self._nominal_shedding_budget = budget
         elif now - self._nominal_shedding_started >= min(self._nominal_shedding_budget or 0.0, budget):
-            return False
+            return reject("nominal_response_window_expired")
         self._nominal_overload_blocked = True
         return True
 
@@ -530,14 +552,35 @@ class OneFuseRegulator:
 
     def _fast_sources_fresh(self) -> bool:
         """Require actual UTC receipt ages; a stream heartbeat is insufficient."""
+        return self._numeric_source_rejection() is None
+
+    def _numeric_source_rejection(self) -> Optional[str]:
+        """Describe existing numeric freshness checks without weakening them."""
         wall = self._last_input_wall_now_ts
         grid = self._last_input_grid_ts
         ev = self._last_input_charger_ts
-        if wall is None or grid is None or ev is None:
-            return False
+        if wall is None:
+            return "wall_clock_missing_or_invalid"
+        if grid is None:
+            return "grid_receipt_missing_or_invalid"
+        if ev is None:
+            return "charger_receipt_missing_or_invalid"
         age_limit = self.settings.max_sensor_age_seconds
-        return (-5 <= wall - grid <= age_limit and -5 <= wall - ev <= age_limit
-                and abs(grid - ev) <= self.settings.measurement_settle_seconds)
+        if _valid_number(age_limit) is None:
+            return "source_age_limit_invalid"
+        if _valid_number(self.settings.measurement_settle_seconds) is None:
+            return "source_alignment_window_invalid"
+        if wall - grid < -5:
+            return "grid_receipt_in_future"
+        if not -5 <= wall - grid <= age_limit:
+            return "grid_receipt_stale"
+        if wall - ev < -5:
+            return "charger_receipt_in_future"
+        if not -5 <= wall - ev <= age_limit:
+            return "charger_receipt_stale"
+        if not abs(grid - ev) <= self.settings.measurement_settle_seconds:
+            return "report_skew_exceeds_alignment_window"
+        return None
 
     def _raw_zero_restart_allowed(self, grid_current: float, status: str, current: float) -> bool:
         """Observe raw headroom without claiming physical zero confirmation.
@@ -815,7 +858,9 @@ class OneFuseRegulator:
             self._overload_hold_active = False
             self._restart_required = True
             self._restart_ready_since = None
-            return "overload_stop", f"Overload allowance blocked: {reason}; requesting 0 A.", 0, house
+            explanation = (f" Nominal reduction rejected: {self._nominal_rejection_code}."
+                           if self._nominal_rejection_code else "")
+            return "overload_stop", f"Overload allowance blocked: {reason}; requesting 0 A.{explanation}", 0, house
 
         if status != "charging" or current <= 0 or self.paused_by_us:
             if pending or self._overload_hold_active:
@@ -1261,6 +1306,7 @@ class OneFuseRegulator:
         status = (inp.status or "").strip().lower()
         self._fast_recovery_wait = None
         self._nominal_overload_blocked = False
+        self._nominal_rejection_code = None
         self._snapshot_aligned = False
         self._last_input_status = status
         if status != "paused":
@@ -1319,6 +1365,14 @@ class OneFuseRegulator:
                 current_refresh_required=refresh_required or self._fast_recovery_wait == "fresh",
                 house_load_basis=house_basis,
                 house_load_anchor_l1=self._positive_house,
+                nominal_rejection_code=self._nominal_rejection_code,
+                source_report_skew_seconds=(abs(self._last_input_grid_ts - self._last_input_charger_ts)
+                    if self._last_input_grid_ts is not None and self._last_input_charger_ts is not None else None),
+                grid_report_age_seconds=(self._last_input_wall_now_ts - self._last_input_grid_ts
+                    if self._last_input_wall_now_ts is not None and self._last_input_grid_ts is not None else None),
+                charger_report_age_seconds=(self._last_input_wall_now_ts - self._last_input_charger_ts
+                    if self._last_input_wall_now_ts is not None and self._last_input_charger_ts is not None else None),
+                source_alignment_window_seconds=s.measurement_settle_seconds,
             )
 
         error = inp.data_error

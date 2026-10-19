@@ -92,13 +92,25 @@ project 20 A total and fits a 25 A fuse with a 2 A buffer. The direct rise still
 requires fresh, mutually consistent grid/EV report times and no active response
 mismatch or unobserved reduction. When unchanged event-driven values are too
 old for an increase, a bounded read-only GET obtains a coherent current/status
-pair from the selected charger. This runs outside the control lock, at most
-once per 30 seconds, without delaying a meter-triggered protective reduction.
-The GET receipt is not a physical sample time; original HA report times remain
-visible. New relevant HA events, reconfiguration, health loss and a 30-second
-cache expiry discard the pair. A heartbeat alone never refreshes a current
-measurement. An unavailable read retains conservative limits and retries only
-after the cooldown.
+pair from the selected charger. From **0.4.0b16**, an actively controlled,
+actually charging session schedules a read before its effective current
+receipt reaches the alignment/age deadline. New native reports postpone that
+read. This closes the gap between the previous 30-second request cooldown and
+a shorter alignment window without relaxing the current checks.
+
+Reads remain outside the control lock and single-flight. Their adaptive
+interval has a five-second minimum; failed requests use increasing backoff.
+Very short alignment windows, slow requests and cloud outages can still fail
+the original freshness checks and stop charging. The GET returns the cloud's
+last-reported observations: its receipt is not a new physical sample time or
+proof that the charger responded. Original HA report times remain visible.
+New relevant HA events, reconfiguration, health loss and cache expiry discard
+the pair. A heartbeat alone never refreshes a current measurement.
+
+The observation endpoint documents a limit of 100 requests per five minutes;
+the integration's own five-second floor leaves room below that limit, but
+other clients share API capacity and rate-limited requests still require
+backoff. See [Easee Get Observations](https://developer.easee.com/reference/getobservations).
 
 The read uses `max(inCurrentT2, inCurrentT3, inCurrentT4, inCurrentT5)`,
 matching the supported Easee integration's Current sensor. All four measured
@@ -268,6 +280,13 @@ to an already accepted positive offer, fresh valid current/grid evidence,
 and a bounded, nonrenewable response context. It cannot increase an offer,
 resume a vehicle, refund exposure or clear the saved overload failure. A
 load that genuinely needs the blocked overload allowance still stops.
+
+An enabled switch does not mean this allowance is usable. A saved failure or
+exhausted cumulative budget remains blocked after an upgrade. Version b16
+exposes the saved failure separately and records why an otherwise possible
+normal reduction was rejected, including input ages and receipt skew. This
+does not clear the latch, refund time, grant a new transition, or change any
+fuse/current limit.
 
 During a known accepted startup, a newer grid report can precede the EV
 report that explains it. A narrowly bounded normal alignment hold may keep
