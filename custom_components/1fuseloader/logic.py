@@ -174,6 +174,7 @@ class OneFuseRegulator:
         self.below_resume_since: Optional[float] = None
         self._increase_since: Optional[float] = None
         self._restart_ready_since: Optional[float] = None
+        self._raw_zero_restart_cap: Optional[int] = None
         self._previous_desired: Optional[int] = None
 
     def reset(self) -> None:
@@ -207,6 +208,9 @@ class OneFuseRegulator:
         self._clear_partial_reduction_alignment()
         self._waiting_for_vehicle_since: Optional[float] = None
         self._last_input_status: Optional[str] = None
+        self._nominal_shedding_started: Optional[float] = None
+        self._nominal_shedding_budget: Optional[float] = None
+        self._nominal_overload_blocked = False
         self._clear_positive_alignment()
 
     @property
@@ -236,12 +240,111 @@ class OneFuseRegulator:
         self._positive_alignment_used_seconds = 0.0
         self._positive_verified_low_current: Optional[float] = None
         self._positive_verified_low_ts: Optional[float] = None
+        self._positive_grid_first_ts: Optional[float] = None
+        self._positive_grid_first_closed = False
 
     def _positive_reports_advanced(self) -> bool:
         return (self._last_input_grid_ts is not None and self._positive_grid_ts is not None
                 and self._last_input_grid_ts > self._positive_grid_ts
                 and self._last_input_charger_ts is not None and self._positive_ev_ts is not None
                 and self._last_input_charger_ts > self._positive_ev_ts)
+
+    def _normal_grid_first_hold(self, now: float, grid: float, current: float,
+                                house: float, status: str) -> bool:
+        """Keep an existing nominal offer while the first grid rise is mixed.
+
+        This is bounded observation of a previously accepted offer, not proof
+        that a grid rise came from the car. A new EV receipt after that first
+        grid must be evaluated normally; it cannot reopen this exception.
+        """
+        def reject() -> bool:
+            if self._positive_grid_first_ts is not None:
+                self._positive_grid_first_closed = True
+            return False
+
+        if self._positive_grid_first_closed:
+            return False
+        cap, anchor = self._positive_cap, self._positive_house
+        if (self._restart_required or not self.settings.enable_dynamic_limit
+                or cap is None or anchor is None or self.last_target is None
+                or self.last_target[0] != cap
+                or not self.settings.min_charge_amps <= cap <= self.settings.max_charge_amps
+                or not self._meaningfully_charging(status, current) or self.paused_by_us
+                or self._awaiting_reduction_target is not None
+                or self._overload_transition_started is not None or self._overload_hold_active
+                or self._positive_skew_since is None or self._positive_response_ts is None
+                or not self._fast_sources_fresh()
+                or self._last_input_grid_ts is None or self._positive_grid_ts is None
+                or self._last_input_charger_ts is None or self._positive_ev_ts is None
+                or self._last_input_grid_ts <= self._positive_grid_ts
+                or self._last_input_charger_ts <= self._positive_ev_ts
+                or self._last_input_charger_ts < self._positive_response_ts
+                or current > cap + 0.5 or current > grid + 1):
+            return reject()
+        budget = min(self.settings.measurement_settle_seconds, self.settings.max_sensor_age_seconds)
+        if self._positive_alignment_used_seconds + max(0.0, now - self._positive_skew_since) >= budget:
+            return reject()
+        normal = self.settings.main_fuse_amps - self.settings.buffer_amps
+        if (anchor + cap > normal or grid > normal or grid > anchor + cap + 0.5
+                or house + cap <= normal):
+            return reject()
+        first_grid = self._positive_grid_first_ts
+        if first_grid is not None and self._last_input_grid_ts < first_grid:
+            return reject()
+        if first_grid is not None and self._last_input_charger_ts > first_grid:
+            return reject()
+        if self._last_input_grid_ts <= self._last_input_charger_ts:
+            return reject()
+        if first_grid is None:
+            self._positive_grid_first_ts = self._last_input_grid_ts
+        return True
+
+    def _blocked_overload_allows_nominal_reduction(self, now: float, grid: float,
+                                                   current: float, house: float,
+                                                   status: str) -> bool:
+        """A blocked opt-in envelope need not prohibit a safe nominal decrease.
+
+        Trust only fresh numeric sources and a known accepted offer. Keep the
+        conservative reduction anchor, never grant a rise, and bound the whole
+        normal shedding attempt without renewing time on reports or leases.
+        """
+        s = self.settings
+        if (self._restart_required or not s.enable_dynamic_limit
+                or self._overload_transition_started is not None or self.last_target is None
+                or not self._meaningfully_charging(status, current) or self.paused_by_us
+                or not self._fast_sources_fresh() or current > grid + 1
+                or grid > s.main_fuse_amps + s.overload_margin_amps):
+            return False
+        accepted = self.last_target[0]
+        previous = (self._reduction_previous_cap if self._awaiting_reduction_target is not None
+                    and self._reduction_previous_cap is not None else accepted)
+        if (not s.min_charge_amps <= accepted <= s.max_charge_amps
+                or current > min(previous, s.max_charge_amps) + 0.5):
+            return False
+        conservative_house = max(house, self._house_before_reduction or 0.0)
+        nominal = int(floor(min(s.max_charge_amps, s.main_fuse_amps - s.buffer_amps - conservative_house)))
+        observed_ev_first = (
+            self._awaiting_reduction_target == accepted and self._house_before_reduction is not None
+            and self._house_before_reduction + accepted <= s.main_fuse_amps - s.buffer_amps
+            and self._reduction_before_current is not None and current < self._reduction_before_current - 0.5
+            and self._reduction_charger_ts is not None
+            and self._last_input_charger_ts > self._reduction_charger_ts
+            and self._last_input_grid_ts <= self._last_input_charger_ts
+            and self._reduction_grid_ceiling is not None and grid <= self._reduction_grid_ceiling
+            and self._last_limit_change_ts is not None
+            and 0 <= now - self._last_limit_change_ts < min(s.measurement_settle_seconds, s.max_sensor_age_seconds))
+        if not s.min_charge_amps <= nominal <= accepted and not observed_ev_first:
+            return False
+        budget = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+        if budget <= 0:
+            return False
+        if self._nominal_shedding_started is None:
+            self._nominal_shedding_started = now
+            self._nominal_shedding_budget = budget
+        elif now - self._nominal_shedding_started >= min(self._nominal_shedding_budget or 0.0, budget):
+            return False
+        self._nominal_overload_blocked = True
+        return True
 
     def _clear_partial_reduction_alignment(self) -> None:
         self._reduction_before_current: Optional[float] = None
@@ -435,6 +538,37 @@ class OneFuseRegulator:
         age_limit = self.settings.max_sensor_age_seconds
         return (-5 <= wall - grid <= age_limit and -5 <= wall - ev <= age_limit
                 and abs(grid - ev) <= self.settings.measurement_settle_seconds)
+
+    def _raw_zero_restart_allowed(self, grid_current: float, status: str, current: float) -> bool:
+        """Observe raw headroom without claiming physical zero confirmation.
+
+        A small residual can outlive an accepted zero indefinitely. No EV
+        subtraction is needed here, so distinct receipt ordering is immaterial;
+        both sources must have fresh absolute receipt times before offering
+        positive current. An aged EV fallback can preserve only an observation
+        that already began with fresh idle evidence; it cannot begin one.
+        """
+        wall, grid, ev = (self._last_input_wall_now_ts, self._last_input_grid_ts,
+                          self._last_input_charger_ts)
+        common = bool(
+            self.settings.enable_dynamic_limit and self._restart_required
+            and self._awaiting_reduction_target == 0
+            and self.last_target is not None and self.last_target[0] == 0
+            and status in START_ALLOWED_STATUSES and not self.paused_by_us
+            and wall is not None and grid is not None and ev is not None
+            and -5 <= wall - grid <= self.settings.max_sensor_age_seconds
+            and wall - ev >= -5
+            and (self._reduction_grid_ts is None or grid >= self._reduction_grid_ts)
+            and grid_current + self.startup_current <= self.settings.main_fuse_amps - self.settings.buffer_amps
+        )
+        if not common:
+            return False
+        assert wall is not None and ev is not None
+        if wall - ev > self.settings.max_sensor_age_seconds:
+            return bool(self._restart_ready_since is not None and self._raw_zero_restart_cap is not None
+                        and self.settings.min_charge_amps <= self._raw_zero_restart_cap <= self.settings.max_charge_amps)
+        return bool(current > 0.5 and not self._meaningfully_charging(status, current)
+                    and (self._reduction_charger_ts is None or ev >= self._reduction_charger_ts))
 
     def _rebase_positive_house(self, now: float, grid: float, house: float, current: float, status: str,
                                snapshot_verified: bool) -> bool:
@@ -690,7 +824,10 @@ class OneFuseRegulator:
         if grid > s.overload_transition_limit_amps:
             return stop("transition_current_exceeded")
         if self._overload_failure_reason is not None and (needed or grid > s.main_fuse_amps or pending):
-            return stop(self._overload_failure_reason)
+            if (pending
+                    or not self._blocked_overload_allows_nominal_reduction(now, grid, current, house, status)):
+                return stop(self._overload_failure_reason)
+            return None
         if (needed or pending) and self._overload_used_seconds >= s.overload_budget_seconds:
             return stop("cumulative_budget_exhausted")
         if (needed or pending) and (self._last_input_grid_ts is None or self._last_input_charger_ts is None):
@@ -785,6 +922,7 @@ class OneFuseRegulator:
             old_target = self.last_target[0] if self.last_target is not None else None
             target = decision.current_p1
             changed = old_target != target
+            same_cap_restart = not changed and target > 0 and self._restart_required
             positive_shedding_budget = None
             if (changed and target > 0 and old_target is not None and target < old_target
                     and self._positive_cap == old_target and self._positive_skew_since is not None):
@@ -813,6 +951,20 @@ class OneFuseRegulator:
                 # not acknowledge physical response or reset the grace period.
                 if (target > 0 and (old_target is None or target > old_target)
                         and target > decision.charger_current + 0.5
+                        and self._last_input_grid_ts is not None
+                        and self._last_input_charger_ts is not None
+                        and decision.house_load_l1 + target <= self.settings.main_fuse_amps - self.settings.buffer_amps):
+                    self._positive_cap = target
+                    self._positive_house = decision.house_load_l1
+                    self._positive_grid_ts = self._last_input_grid_ts
+                    self._positive_ev_ts = self._last_input_charger_ts
+                    self._positive_before_current = decision.charger_current
+            if same_cap_restart:
+                # The zero may have physically stopped the car without an HTTP
+                # ACK. An accepted, fully qualified restart is a new potential
+                # positive response even if its cap matches the old lease.
+                self._clear_positive_alignment()
+                if (target > decision.charger_current + 0.5
                         and self._last_input_grid_ts is not None
                         and self._last_input_charger_ts is not None
                         and decision.house_load_l1 + target <= self.settings.main_fuse_amps - self.settings.buffer_amps):
@@ -888,6 +1040,7 @@ class OneFuseRegulator:
                 self._clear_partial_reduction_alignment()
             if changed and (old_target is None or target > old_target):
                 self._last_increase_ts = now_ts
+                self._nominal_shedding_started = self._nominal_shedding_budget = None
             if (target == self.settings.min_charge_amps
                     and self._overload_transition_started is not None
                     and self._overload_minimum_accepted_at is None):
@@ -913,9 +1066,14 @@ class OneFuseRegulator:
                         self._reduction_guard_deadline if self._reduction_guard_deadline is not None
                         else deadline, deadline)
             if target == 0:
+                self._nominal_shedding_started = self._nominal_shedding_budget = None
                 self._restart_required = True
                 self._waiting_for_vehicle_since = None
             elif self._restart_required:
+                # A genuinely accepted restart after the full observation can
+                # reuse the old cap when the preceding zero never got an ACK.
+                # It is a new nominal attempt, not a TTL refund of the old one.
+                self._nominal_shedding_started = self._nominal_shedding_budget = None
                 self._restart_required = False
                 self._restart_ready_since = None
             self.last_set_limit_ts = now_ts
@@ -949,7 +1107,8 @@ class OneFuseRegulator:
 
     def _limit_with_continuity(self, now: float, desired: int, available: int,
                                house: float, current: float, status: str,
-                               allow_minimum: bool = True) -> int:
+                               allow_minimum: bool = True, raw_zero_restart: bool = False,
+                               raw_zero_fresh: bool = False) -> int:
         """Lower promptly, retain minimum within budget, and raise slowly.
 
         The reserve may spend part of the normal operating buffer, but never
@@ -977,11 +1136,24 @@ class OneFuseRegulator:
         if self._restart_required:
             self._increase_since = None
             self._previous_desired = desired
+            if raw_zero_restart:
+                # Keep the lowest whole-cap raw allowance observed throughout
+                # this period. A last-second load drop cannot turn sixty
+                # seconds of 7 A headroom into an immediate 16 A restart.
+                cap = min(desired, available)
+                if self._restart_ready_since is None or self._raw_zero_restart_cap is None:
+                    self._raw_zero_restart_cap = cap
+                else:
+                    self._raw_zero_restart_cap = min(self._raw_zero_restart_cap, cap)
+            else:
+                self._raw_zero_restart_cap = None
             ready = self._timer_reached(
                 now, "_restart_ready_since", available >= startup and desired >= startup
-                and self._awaiting_reduction_target is None,
+                and (self._awaiting_reduction_target is None or raw_zero_restart),
                 s.restart_stable_seconds,
             )
+            if raw_zero_restart:
+                return self._raw_zero_restart_cap if ready and raw_zero_fresh else 0
             return (desired if self._start_allowed(status) else startup) if ready else 0
 
         if self.last_target is None:
@@ -1088,6 +1260,7 @@ class OneFuseRegulator:
         self._last_input_now_ts = None if isinstance(inp.now_ts, bool) else observed_now
         status = (inp.status or "").strip().lower()
         self._fast_recovery_wait = None
+        self._nominal_overload_blocked = False
         self._snapshot_aligned = False
         self._last_input_status = status
         if status != "paused":
@@ -1194,6 +1367,58 @@ class OneFuseRegulator:
         assert current is not None
         if not current_fresh:
             refresh_required = True
+        if self._restart_required:
+            # A requested zero is terminal even if its API call failed. Old
+            # accepted offers must not bypass the normal restart observation
+            # through a later favorable/reverted source snapshot.
+            self._clear_positive_alignment()
+            if self._nominal_shedding_started is not None:
+                self._awaiting_reduction_target = None
+                self._house_before_reduction = None
+                self._settle_started = None
+                self._clear_partial_reduction_alignment()
+        raw_zero_restart = self._raw_zero_restart_allowed(grid, status, current)
+        raw_zero_fresh = bool(raw_zero_restart and self._last_input_wall_now_ts is not None
+                              and self._last_input_charger_ts is not None
+                              and self._last_input_wall_now_ts - self._last_input_charger_ts <= s.max_sensor_age_seconds)
+        if not raw_zero_restart and self._raw_zero_restart_cap is not None:
+            self._raw_zero_restart_cap = None
+            self._restart_ready_since = None
+        if (self._nominal_shedding_started is not None and self.last_target is not None
+                and self._awaiting_reduction_target is None
+                and self._accepted_reduction_cap == self.last_target[0]
+                and self._meaningfully_charging(status, current) and current_fresh
+                and current <= self.last_target[0] + 0.5
+                and grid <= s.main_fuse_amps - s.buffer_amps
+                and self._last_input_grid_ts > self._last_input_charger_ts):
+            self._nominal_shedding_started = self._nominal_shedding_budget = None
+        if self._normal_grid_first_hold(now, grid, current, house, status):
+            # The normal raw envelope is already below every experimental
+            # ceiling. Observe custom guards before retaining the old offer.
+            soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+            pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+            self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+            self._increase_since = None
+            cap = self._positive_cap
+            assert cap is not None and self.last_target is not None and self._positive_house is not None
+            house = self._positive_house
+            house_basis = "prior_coherent_house_grid_first_hold"
+            available = int(floor(min(s.max_charge_amps, s.main_fuse_amps - s.buffer_amps - house)))
+            if s.enable_pause_resume and pause:
+                return decision("pause", "L1 has exceeded the pause threshold for its full observation period.",
+                                "pause", emergency=True)
+            if s.enable_soft_guard and soft and s.soft_current_amps < cap:
+                soft_target = max(0, s.soft_current_amps)
+                if soft_target < s.min_charge_amps:
+                    soft_target = 0
+                if soft_target == 0:
+                    self._restart_required = True
+                    self._positive_grid_first_closed = True
+                return decision("soft_limit", "Soft guard overrides nominal grid-first alignment.",
+                                "set_limit", soft_target, s.soft_ttl_seconds, emergency=True)
+            refresh_required = True
+            return decision("settling", "Holding only the accepted nominal offer briefly while a grid-first rise awaits fresh EV evidence; no increase or resume.",
+                            "set_limit", cap, self.last_target[3])
         overload = self._overload_plan(now, grid, current, house, status)
         if overload is not None:
             mode, reason, target, house = overload
@@ -1364,7 +1589,8 @@ class OneFuseRegulator:
                 now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
             self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
             if s.enable_pause_resume and pause_during_alignment:
-                return decision("pause", "L1 has exceeded the pause threshold for its full observation period.", "pause")
+                return decision("pause", "L1 has exceeded the pause threshold for its full observation period.",
+                                "pause", emergency=self._nominal_overload_blocked)
             if s.enable_soft_guard and soft_during_alignment and s.soft_current_amps < cap:
                 soft_target = max(0, s.soft_current_amps)
                 if soft_target < s.min_charge_amps:
@@ -1374,6 +1600,18 @@ class OneFuseRegulator:
             return decision("settling", "Waiting briefly for the grid report after observed partial EV reduction.",
                             "set_limit", cap, self.last_target[3])
         if current > grid + 1:
+            # A locally aged numeric fallback can look inconsistent even while
+            # every raw-grid observation remains safe. It still requests zero:
+            # preserve ONLY an already established raw observation clock, not
+            # any permission to charge or evidence of physical zero response.
+            raw_observation = None
+            if raw_zero_restart and not raw_zero_fresh:
+                raw_available, _ = self.calculate_available_l1(grid, 0.0)
+                self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+                self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+                raw_observation = (self._restart_ready_since,
+                                   min(self._raw_zero_restart_cap, raw_available),
+                                   self.above_soft_since, self.above_pause_since)
             # The grid can report the reduction before the EV source does.
             # Hold only our accepted lower cap, with enough headroom even if
             # the actual EV draw is already zero. An inconsistent subtraction
@@ -1422,10 +1660,13 @@ class OneFuseRegulator:
                     return decision("settling", "Holding the accepted lower cap briefly after observed grid reduction; no increase or resume.",
                                     "set_limit", cap, self.last_target[3])
             self.reset_timers()
+            if raw_observation is not None:
+                (self._restart_ready_since, self._raw_zero_restart_cap,
+                 self.above_soft_since, self.above_pause_since) = raw_observation
             self._restart_required = True
             return decision("unavailable", "Charger and grid currents are inconsistent; cannot estimate house load safely. "
                             "Requesting 0 A; cloud control is best effort.", "set_limit", emergency=True)
-        if self._awaiting_reduction_target is not None:
+        if self._awaiting_reduction_target is not None and not raw_zero_restart:
             if (current <= self._awaiting_reduction_target + 0.5
                     and self._reduction_low_is_response(self._awaiting_reduction_target, current, status)):
                 # An EV event can arrive before the corresponding grid event.
@@ -1456,7 +1697,8 @@ class OneFuseRegulator:
                         self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
                         if (s.enable_pause_resume and pause_during_alignment
                                 and status in {"charging", "start_charging"}):
-                            return decision("pause", "L1 has exceeded the pause threshold for its full observation period.", "pause")
+                            return decision("pause", "L1 has exceeded the pause threshold for its full observation period.",
+                                            "pause", emergency=self._nominal_overload_blocked)
                         if s.enable_soft_guard and soft_during_alignment and s.soft_current_amps < cap:
                             soft_target = max(0, s.soft_current_amps)
                             if soft_target < s.min_charge_amps:
@@ -1485,6 +1727,12 @@ class OneFuseRegulator:
                 raw_available = s.main_fuse_amps - house - s.buffer_amps
                 available = (int(floor(min(raw_available, s.max_charge_amps)))
                              if raw_available >= s.min_charge_amps else 0)
+        if raw_zero_restart:
+            # Pending zero remains unconfirmed until a positive submission is
+            # actually accepted. The new offer credits NONE of its residual
+            # current and must fit the entire normal buffer for sixty seconds.
+            available, house = self.calculate_available_l1(grid, 0.0)
+            house_basis = "raw_grid_unconfirmed_zero_restart"
         soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
         pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
         resume = self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
@@ -1504,13 +1752,21 @@ class OneFuseRegulator:
 
         if s.enable_pause_resume and pause and status in {"charging", "start_charging"}:
             if not self.paused_by_us or status == "charging":
-                return decision("pause", "L1 has exceeded the pause threshold for its full observation period.", "pause")
+                return decision("pause", "L1 has exceeded the pause threshold for its full observation period.",
+                                "pause", emergency=self._nominal_overload_blocked)
 
         if not s.enable_dynamic_limit:
             return decision("monitor", "Dynamic limiting is disabled; automatic resume is inhibited.")
 
+        if raw_zero_restart and s.enable_pause_resume and pause:
+            self._restart_ready_since = None
+            self._raw_zero_restart_cap = None
+            return decision("restart_wait", "The raw-grid pause guard inhibits an unconfirmed-zero restart.",
+                            "set_limit", 0, emergency=True)
+
         target = available
-        if not current_fresh and (self.last_target is None or target > self.last_target[0]):
+        if (not current_fresh and not raw_zero_restart
+                and (self.last_target is None or target > self.last_target[0])):
             raw_available, raw_house = self.calculate_available_l1(grid, 0.0)
             base = self.last_target[0] if self.last_target is not None else 0
             if raw_available > base or self.last_target is None:
@@ -1526,6 +1782,8 @@ class OneFuseRegulator:
         ttl = s.normal_ttl_seconds
         mode = "normal"
         reason = f"Calculated charge headroom is {available} A."
+        if self._nominal_overload_blocked:
+            reason += f" Nominal limiting only; experimental overload remains blocked: {self._overload_failure_reason}."
         if s.enable_soft_guard and soft:
             target = min(target, max(0, s.soft_current_amps))
             if 0 < target < s.min_charge_amps:
@@ -1538,6 +1796,8 @@ class OneFuseRegulator:
         target = self._limit_with_continuity(
             now, target, available, house, current, status,
             allow_minimum=not (s.enable_soft_guard and soft and s.soft_current_amps < s.min_charge_amps),
+            raw_zero_restart=raw_zero_restart,
+            raw_zero_fresh=raw_zero_fresh,
         )
         if target > original_target:
             mode = "minimum_continuity"

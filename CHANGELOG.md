@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0b15
+
+- Keep an existing timed-overload failure or exhausted allowance from
+  preempting a proven, fully buffered normal reduction of an accepted offer.
+  Bound its unconfirmed response; do not grant an increase, resume, new
+  overload allowance or extra response time through that normal path.
+- Handle grid-first feedback during a known accepted positive startup within
+  the original alignment window and normal raw-grid envelope. Retain only
+  that accepted offer; later low EV reports, excess load, stale sources and
+  the original deadline retain their protective response.
+- Avoid an indefinite pending-zero restart wait when the entire new offer
+  fits the fresh raw-grid budget for the stable restart period. Do not
+  subtract idle EV readings or declare physical zero confirmation. A real
+  accepted restart establishes new response tracking even for an unchanged
+  numeric offer; failed calls and TTL renewals do not reset its budget.
+- Recheck latest source data after checkpoint I/O before every positive
+  command, including reductions and lease renewals. Reevaluate after API
+  acceptance when source data changed during the request, while keeping
+  cloud acceptance separate from physical charger feedback.
+- Preserve the first zero/pause request's reason, input clocks and command
+  result through subsequent inconsistent feedback. Clarify that Easee's
+  latestPulse is a local ProductUpdate receipt, not a transport ping or a
+  physical current sample. Old product data still requests zero; this update
+  does not repair a cloud/SignalR outage or clear saved overload protection.
+
 ## 0.4.0b14
 
 - When a higher accepted offer is reduced to the experimental minimum, an

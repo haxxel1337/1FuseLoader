@@ -293,9 +293,9 @@ class EaseeCommandAdapter:
     def telemetry_block_reason(self) -> str | None:
         """Use stream health, since unchanged status/current entities can be old.
 
-        Easee sets latestPulse locally whenever a SignalR message arrives. This
-        is a connection/stream heartbeat, not proof of each physical sample.
-        Missing heartbeat conservatively prevents an increase or resume.
+        Easee sets latestPulse locally when ProductUpdate data arrives. It is
+        not the transport's own ping clock or a physical acquisition timestamp.
+        Missing recent product data conservatively blocks positive commands.
         """
         problem = self._resolve_runtime()
         if problem:
