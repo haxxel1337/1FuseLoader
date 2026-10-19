@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0b16
+
+- Refresh a quiet charging session's numeric current/status pair before its
+  alignment/age deadline instead of waiting for an already expired source to
+  request a read. Native telemetry takes priority; requests remain outside
+  the control lock, single-flight and bounded by a minimum interval and error
+  backoff. Short windows or unavailable cloud data retain their protective
+  response rather than extending freshness.
+- Preserve the saved experimental-overload failure independently from the
+  concrete reason a normal current reduction was rejected. Include input age,
+  receipt skew and the active window in the first stop diagnostics.
+- Expose the saved overload failure for an accurate dashboard status. An
+  enabled experimental switch does not restore spent cumulative time or clear
+  a timeout latch. No overload budget, response window, current limit or
+  source-health guard is reset or relaxed by this update.
+
 ## 0.4.0b15
 
 - Keep an existing timed-overload failure or exhausted allowance from
