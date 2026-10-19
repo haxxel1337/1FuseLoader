@@ -79,6 +79,8 @@ class OneFuseLoaderController:
         self.last_command_attempt: dict[str, Any] | None = None
         self.last_accepted_command: dict[str, Any] | None = None
         self.last_accepted_limit: dict[str, Any] | None = None
+        self.last_stop_context: dict[str, Any] | None = None
+        self._stop_context_armed = True
         self.source_diagnostics: dict[str, Any] = {}
         self._charger_snapshot: Any = None
         self._charger_snapshot_selection: tuple | None = None
@@ -635,7 +637,7 @@ class OneFuseLoaderController:
             "source_errors": source_errors,
             "source_health_reason": " ".join(source_errors) or "Required source checks passed.",
             "easee_source_health": health_error or "healthy",
-            "source_health_scope": "required_input_values_and_source_heartbeat; see regulator reason for policy and alignment",
+            "source_health_scope": "required_input_values_and_latest_product_update; not_transport_ping_or_physical_sample; see regulator reason for policy and alignment",
             "report_time_scope": "ha_receipt_not_physical_acquisition",
             "easee_stream_pulse_utc": None,
             "reported_circuit_p1": None, "reported_circuit_p2": None, "reported_circuit_p3": None,
@@ -691,6 +693,8 @@ class OneFuseLoaderController:
         except Exception:
             # This is diagnostic only. Do not expose exception text/site data.
             diagnostics["reported_circuit_source"] = "cached_readback_unavailable"
+        diagnostics["easee_product_update_received_at_utc"] = diagnostics["easee_stream_pulse_utc"]
+        diagnostics["easee_product_update_clock_scope"] = "native_local_ProductUpdate_receipt_not_transport_ping_or_physical_acquisition"
         self.source_diagnostics = diagnostics
 
     def diagnostic_attributes(self) -> dict[str, Any]:
@@ -709,6 +713,7 @@ class OneFuseLoaderController:
             "last_command_attempt": dict(self.last_command_attempt) if self.last_command_attempt else None,
             "last_accepted_command": dict(self.last_accepted_command) if self.last_accepted_command else None,
             "last_accepted_limit": dict(accepted) if accepted else None,
+            "last_stop_context": dict(self.last_stop_context) if self.last_stop_context else None,
             "reported_cap_matches_last_accepted_limit": comparison,
             "reported_cap_report_after_acceptance": post_acceptance,
             "readback_scope": "cached_circuit_cap_only",
@@ -753,6 +758,7 @@ class OneFuseLoaderController:
         except Exception:
             self.bmw_context = {}
         inp = self._read_input()
+        plan_source_diagnostics = dict(self.source_diagnostics)
         if self.settings.overload_enabled:
             offline_problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
             if offline_problem or self._budget_error:
@@ -825,12 +831,12 @@ class OneFuseLoaderController:
             )
             self.notify()
             return
-        previous_cap = self.regulator.last_target
-        increasing = (decision.current_p1 > 0 and (decision.command == "resume"
-                      or previous_cap is None or decision.current_p1 > previous_cap[0]))
-        if increasing:
+        positive_submission = decision.command == "resume" or (
+            decision.command == "set_limit" and decision.current_p1 > 0)
+        if positive_submission:
             # A checkpoint write above can yield to newer telemetry. Never
-            # execute the stale increase; a fresh tick plans from latest grid.
+            # execute any stale positive offer, including a reduction or a
+            # lease renewal. A new hard load/fault can require zero instead.
             latest = self._read_input()
             if self.settings.overload_enabled:
                 problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
@@ -840,7 +846,7 @@ class OneFuseLoaderController:
                 self.last_service_result = "not_sent"
                 self.last_decision = replace(
                     decision, mode="waiting_for_latest_sources",
-                    reason="New telemetry arrived during checkpoint verification; recalculating before an increase.",
+                    reason="New telemetry arrived during checkpoint verification; recalculating before a positive offer.",
                     should_call_service=False,
                 )
                 self._handle_source_change(None)
@@ -854,6 +860,45 @@ class OneFuseLoaderController:
             "result": "pending", "error": None,
         }
         self.last_command_attempt = attempt
+        capture_stop = (decision.command == "pause" or (
+            decision.command == "set_limit" and decision.current_p1 == 0)) and self._stop_context_armed
+        if capture_stop:
+            def number(value: Any) -> float | None:
+                try:
+                    parsed = float(value)
+                    return parsed if not isinstance(value, bool) and isfinite(parsed) else None
+                except (TypeError, ValueError, OverflowError):
+                    return None
+
+            def report_utc(value: Any) -> str | None:
+                parsed = number(value)
+                try:
+                    return datetime.fromtimestamp(parsed, timezone.utc).isoformat() if parsed is not None else None
+                except (ValueError, OverflowError, OSError):
+                    return None
+
+            # Keep the first request's cause through subsequent inconsistent
+            # feedback/retries. A newly accepted positive offer arms a new
+            # incident. These are diagnostic receipts, never physical proof.
+            self.last_stop_context = {
+                "plan_utc": report_utc(inp.wall_now_ts),
+                "reason": decision.reason, "mode": decision.mode,
+                "grid_l1": number(inp.grid_l1),
+                "charger_current": number(inp.charger_current), "status": inp.status,
+                "grid_report_utc": report_utc(inp.grid_report_ts),
+                "charger_report_utc": report_utc(inp.charger_report_ts),
+                "source_error": inp.data_error,
+                "product_update_received_at_utc": plan_source_diagnostics.get("easee_stream_pulse_utc"),
+                "previous_submitted_limit_p1": (self.last_accepted_limit.get("target_p1")
+                                                if self.last_accepted_limit else None),
+                "overload_used_seconds": exposure["used_seconds"],
+                "overload_failure_reason": exposure["failure_reason"],
+                "command_started_at_utc": attempt["started_at_utc"],
+                "command_completed_at_utc": None,
+                "command_result": "pending", "command_error": None,
+                "clock_scope": "validated_grid_sample_and_local_HA_receipts_not_physical_stop_proof",
+            }
+            self._stop_context_armed = False
         self.last_service_error = None
         try:
             await asyncio.wait_for(self._adapter.async_execute(decision), ACTION_TIMEOUT_SECONDS)
@@ -874,6 +919,23 @@ class OneFuseLoaderController:
             self.last_accepted_command = dict(attempt)
             if decision.command in {"set_limit", "resume"}:
                 self.last_accepted_limit = dict(attempt)
+            if positive_submission:
+                self._stop_context_armed = True
+                # API acceptance stays accurately recorded even if sources
+                # changed while awaiting it. Immediately plan from new data;
+                # do not wait for another periodic tick or replay this offer.
+                latest = self._read_input()
+                if self.settings.overload_enabled:
+                    problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
+                    if problem or self._budget_error:
+                        latest = replace(latest, data_valid=False, data_error=self._budget_error or problem)
+                if self._input_revision(latest) != self._input_revision(inp):
+                    self._handle_source_change(None)
+        if capture_stop and self.last_stop_context is not None:
+            self.last_stop_context.update({
+                "command_completed_at_utc": attempt["completed_at_utc"],
+                "command_result": attempt["result"], "command_error": attempt["error"],
+            })
         self.notify()
 
     def _schedule_overload_deadline(self, decision: Any, elapsed: float = 0.0) -> None:

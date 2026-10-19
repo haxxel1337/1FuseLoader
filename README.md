@@ -262,6 +262,20 @@ does not grant another 30 minutes. There is no user budget-reset button in this
 release. Unknown elapsed exposure is handled conservatively. Diagnostic sensors
 show used/remaining time, the response window and any latched failure.
 
+A blocked timed-overload profile does not by itself forbid a proven normal
+reduction within the full configured fuse buffer. This exception is limited
+to an already accepted positive offer, fresh valid current/grid evidence,
+and a bounded, nonrenewable response context. It cannot increase an offer,
+resume a vehicle, refund exposure or clear the saved overload failure. A
+load that genuinely needs the blocked overload allowance still stops.
+
+During a known accepted startup, a newer grid report can precede the EV
+report that explains it. A narrowly bounded normal alignment hold may keep
+the existing accepted offer using its prior buffered household anchor only
+while raw grid remains within the normal envelope. A later low EV report,
+new excessive load, source failure or the original alignment deadline ends
+that hold. Repeated reports and lease renewals do not restart its clock.
+
 Checkpoint writes are atomic, serialized and independently read back with a
 unique revision. Unchanged exposure state does not cause another disk write;
 running exposure and changed safety flags still require new checkpoints.
@@ -304,12 +318,38 @@ vendor identity and protocol; it does not infer L1 freshness from another phase,
 power sensor or broker connection alone. Other grid sources continue to use
 `State.last_reported`.
 Easee status/current are event driven, so their unchanged state timestamps are
-not used as heartbeats; the adapter checks the charger's online state, SignalR
-connection and latest received stream pulse instead. The default age limit is
-120 seconds for the configurable grid age and the adapter's fixed stream-pulse
-age. An idle, disconnected charger can legitimately be quiet for longer; this
-conservatively inhibits increases until new telemetry arrives. Observe the
-actual cadence while charging before takeover.
+not used as heartbeats. The adapter checks the charger's online state, SignalR
+connection and latest local ProductUpdate receipt (`latestPulse`). This receipt
+is neither a transport ping nor the physical acquisition time of each value.
+The default age limit is 120 seconds for configurable grid age and the adapter's
+fixed product-update age. Missing recent product data conservatively requests
+0 A and blocks positive commands; it does not prove that the websocket itself
+disconnected. A read-only GET also returns last-reported observations, so its
+local receipt alone cannot repair that freshness gap. Observe the actual
+cadence while charging before takeover.
+
+All positive offers, including reductions and identical renewals, are checked
+against the latest input revision again after exposure-checkpoint I/O. Source
+changes during a successful API submission schedule another coalesced
+evaluation; they do not turn HTTP acceptance into proof of physical response.
+Source-health diagnostics retain `last_stop_context`: the first zero/pause
+attempt in an incident, with its original reason, input clocks,
+budget/latch and command result. Later inconsistent feedback or repeated zero
+requests do not overwrite it. A new accepted positive offer arms the next
+incident. This context is memory-only and does not authorize control.
+
+A pending zero offer is not physical confirmation that current reached zero.
+It also must not indefinitely prevent a waiting vehicle from restarting when
+the entire new offer fits the fresh raw-grid budget through the normal stable
+observation period. This restart subtracts no EV current and does not loosen
+the zero-response tolerance. A genuinely accepted positive restart replaces
+the pending context and starts new raw-house response tracking, even when its
+numeric cap happens to match an older offer whose zero request failed.
+An already qualified raw-budget observation can retain its history through
+an aged EV receipt while fresh grid and product health remain valid. It
+requests only zero until fresh current/status data again confirms that the
+vehicle may start. This does not refresh the old receipt; source faults,
+fresh contradictory feedback and manual/scheduled waits still stop recovery.
 
 The integration only resumes a pause that it requested during the current
 runtime. It does not infer ownership from a charger's paused status after an
