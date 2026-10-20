@@ -44,6 +44,8 @@ class RegulatorSettings:
     max_charge_amps: int = 16
     startup_charge_amps: int = 7
     fast_recovery: bool = True
+    # Explicit installation assumption; never infer it from a GET receipt.
+    nominal_import_only_fallback: bool = False
     minimum_reserve_amps: float = 0.5
     increase_stable_seconds: int = 30
     increase_interval_seconds: int = 15
@@ -95,8 +97,11 @@ class RegulatorInput:
     # UTC epoch clock for explicit report-age checks. now_ts stays monotonic.
     wall_now_ts: Optional[float] = None
     # The effective current/status pair was read in one authenticated cloud GET.
-    # charger_report_ts is its receipt time, never a physical acquisition time.
+    # Its report timestamp may be a vendor state-event time, never an invented
+    # physical acquisition time or a replacement with the local GET receipt.
     charger_snapshot_verified: bool = False
+    # False for a known old/invalid vendor observation despite a fresh GET.
+    charger_current_trusted: bool = True
 
 
 @dataclass(slots=True)
@@ -131,6 +136,11 @@ class RegulatorDecision:
     grid_report_age_seconds: Optional[float] = None
     charger_report_age_seconds: Optional[float] = None
     source_alignment_window_seconds: Optional[float] = None
+    charger_current_trusted: bool = True
+    measurement_uncertainty_active: bool = False
+    measurement_uncertainty_cap: Optional[int] = None
+    measurement_uncertainty_stops: int = 0
+    measurement_recovery_wait_seconds: float = 0.0
 
 
 class OneFuseRegulator:
@@ -153,6 +163,8 @@ class OneFuseRegulator:
             raise ValueError("Startup current must be an integer from 6 to 16 A")
         if type(settings.fast_recovery) is not bool:
             raise ValueError("Fast recovery must be a boolean")
+        if type(settings.nominal_import_only_fallback) is not bool:
+            raise ValueError("Nominal import-only fallback must be a boolean")
         overload_values = (
             settings.overload_margin_amps, settings.overload_budget_seconds,
             settings.overload_transition_limit_amps, settings.overload_response_seconds,
@@ -204,6 +216,7 @@ class OneFuseRegulator:
         self._last_input_grid_ts: Optional[float] = None
         self._last_input_charger_ts: Optional[float] = None
         self._last_input_wall_now_ts: Optional[float] = None
+        self._last_input_current_trusted = True
         self._last_input_now_ts: Optional[float] = None
         self._fast_recovery_wait: Optional[str] = None
         self._snapshot_aligned = False
@@ -217,7 +230,124 @@ class OneFuseRegulator:
         self._nominal_shedding_budget: Optional[float] = None
         self._nominal_overload_blocked = False
         self._nominal_rejection_code: Optional[str] = None
+        self._clear_measurement_uncertainty()
         self._clear_positive_alignment()
+
+    def _clear_measurement_uncertainty(self) -> None:
+        """Only session/reset or sustained source recovery retires this mode."""
+        self._uncertainty_ceiling: Optional[int] = None
+        self._uncertainty_previous_offer: Optional[int] = None
+        self._uncertainty_recovery_since: Optional[float] = None
+        self._uncertainty_recovery_ev_ts: Optional[float] = None
+        self._uncertainty_recovery_grid_ts: Optional[float] = None
+        self._uncertainty_recovery_epochs = 0
+        self._uncertainty_stops = 0
+        self._uncertainty_stop_recorded = False
+        self._uncertainty_retry_after: Optional[float] = None
+        self._uncertainty_restart = False
+        self._uncertainty_last_attempt: Optional[float] = None
+        self._uncertainty_last_attempt_cap: Optional[int] = None
+
+    def _record_uncertainty_stop(self, now: float) -> None:
+        if self._uncertainty_ceiling is None or self._uncertainty_stop_recorded:
+            return
+        self._uncertainty_stop_recorded = True
+        self._uncertainty_stops += 1
+        self._uncertainty_restart = True
+        self._uncertainty_retry_after = now + min(
+            600, self.settings.restart_stable_seconds * 2 ** min(self._uncertainty_stops - 1, 3))
+        self._uncertainty_recovery_since = None
+        self._uncertainty_recovery_epochs = 0
+
+    def _observe_uncertainty_recovery(self, now: float, grid: float, current: float,
+                                      status: str) -> bool:
+        """Do not promote a lower offer from a new GET receipt alone.
+
+        Vendor current is an event-driven state, not a periodic sample. An
+        unchanged trusted state plus multiple new grid observations can prove
+        durable reported-state continuity, not a new physical acquisition.
+        Ordinary increases still require their existing strict freshness gate.
+        """
+        if self._uncertainty_ceiling is None or self.last_target is None:
+            return False
+        cap = self.last_target[0]
+        available, _ = self.calculate_available_l1(grid, current)
+        valid = (not self._restart_required and not self._uncertainty_restart
+                 and self._meaningfully_charging(status, current)
+                 and self.settings.min_charge_amps <= cap <= self.settings.max_charge_amps
+                 and cap <= self._uncertainty_ceiling
+                 and self._current_cache_and_grid_usable() and current <= cap + 0.5 and current <= grid + 1
+                 and grid <= self.settings.main_fuse_amps - self.settings.buffer_amps and available >= cap)
+        if not valid:
+            self._uncertainty_recovery_since = None
+            self._uncertainty_recovery_epochs = 0
+            self._uncertainty_recovery_ev_ts = self._uncertainty_recovery_grid_ts = None
+            return False
+        if self._uncertainty_recovery_since is None:
+            self._uncertainty_recovery_since = now
+            self._uncertainty_recovery_epochs = 1
+            self._uncertainty_recovery_ev_ts = self._last_input_charger_ts
+            self._uncertainty_recovery_grid_ts = self._last_input_grid_ts
+        elif self._last_input_grid_ts > self._uncertainty_recovery_grid_ts:
+            self._uncertainty_recovery_epochs += 1
+            self._uncertainty_recovery_ev_ts = self._last_input_charger_ts
+            self._uncertainty_recovery_grid_ts = self._last_input_grid_ts
+        if now - self._uncertainty_recovery_since < 30 or self._uncertainty_recovery_epochs < 2:
+            return False
+        # A tapered EV may already be below its offer. This retires only the
+        # uncertainty mode; an old current event earns no new rise/resume.
+        if self._awaiting_reduction_target == cap:
+            self._finish_reduction_alignment(now)
+        if self._positive_cap == cap:
+            self._clear_positive_alignment()
+        self._clear_measurement_uncertainty()
+        return True
+
+    def _current_cache_and_grid_usable(self) -> bool:
+        """Health/trust and fresh raw grid, without forging an EV sample age."""
+        s = self.settings
+        wall, grid, ev = (self._last_input_wall_now_ts, self._last_input_grid_ts,
+                          self._last_input_charger_ts)
+        return bool(self._last_input_current_trusted
+                    and wall is not None and grid is not None and ev is not None
+                    and _valid_number(s.max_sensor_age_seconds) is not None
+                    and -5 <= wall - grid <= s.max_sensor_age_seconds
+                    and ev <= wall + 5)
+
+    def _uncertainty_raw_cap(self, grid: float, current: float, status: str) -> Optional[int]:
+        """Only under an explicit import/phase/RMS installation contract.
+
+        This is a normal-budget cap, not an overload transition or EV credit.
+        It cannot override an existing stop, real fault or experimental timer.
+        """
+        s = self.settings
+        if (not s.nominal_import_only_fallback or not s.enable_dynamic_limit
+                or self._restart_required or self.paused_by_us or status != "charging"
+                or self._overload_transition_started is not None or self._overload_hold_active
+                or self.last_target is None or self._last_input_wall_now_ts is None
+                or self._last_input_grid_ts is None
+                or not -5 <= self._last_input_wall_now_ts - self._last_input_grid_ts <= s.max_sensor_age_seconds
+                or grid > s.main_fuse_amps - s.buffer_amps):
+            return None
+        accepted = self.last_target[0]
+        if (self.last_set_limit_ts is None or self._last_input_now_ts is None
+                or not 0 <= self._last_input_now_ts - self.last_set_limit_ts < self.last_target[3]):
+            return None  # an expired cloud lease is not an accepted live offer
+        if not s.min_charge_amps <= accepted <= s.max_charge_amps:
+            return None
+        previous = max(accepted, self._uncertainty_previous_offer or accepted)
+        if (self._reduction_previous_cap is not None
+                and (self._awaiting_reduction_target == accepted or self._accepted_reduction_cap == accepted)):
+            previous = max(previous, self._reduction_previous_cap)
+        if current > min(s.max_charge_amps, previous) + 0.5:
+            return None  # do not hide a reported current beyond every known offer
+        raw_available = int(floor(min(s.max_charge_amps, s.main_fuse_amps - s.buffer_amps - grid)))
+        target = min(accepted, raw_available, self._uncertainty_ceiling or accepted)
+        if target < s.min_charge_amps:
+            return None
+        self._uncertainty_previous_offer = previous
+        self._uncertainty_ceiling = target
+        return target
 
     @property
     def startup_current(self) -> int:
@@ -556,6 +686,8 @@ class OneFuseRegulator:
 
     def _numeric_source_rejection(self) -> Optional[str]:
         """Describe existing numeric freshness checks without weakening them."""
+        if not self._last_input_current_trusted:
+            return "charger_current_untrusted"
         wall = self._last_input_wall_now_ts
         grid = self._last_input_grid_ts
         ev = self._last_input_charger_ts
@@ -1121,6 +1253,13 @@ class OneFuseRegulator:
                 self._nominal_shedding_started = self._nominal_shedding_budget = None
                 self._restart_required = False
                 self._restart_ready_since = None
+            if target > 0 and self._uncertainty_restart:
+                # Only actual acceptance of the qualified, capped restart
+                # begins the next bounded recovery attempt.
+                self._uncertainty_ceiling = target
+                self._uncertainty_restart = False
+                self._uncertainty_stop_recorded = False
+                self._uncertainty_last_attempt = self._uncertainty_last_attempt_cap = None
             self.last_set_limit_ts = now_ts
             self.last_target = (
                 decision.current_p1, decision.current_p2, decision.current_p3, decision.ttl_seconds
@@ -1181,6 +1320,9 @@ class OneFuseRegulator:
         if self._restart_required:
             self._increase_since = None
             self._previous_desired = desired
+            if self._uncertainty_restart and self._uncertainty_stops >= 3:
+                self._restart_ready_since = None
+                return 0
             if raw_zero_restart:
                 # Keep the lowest whole-cap raw allowance observed throughout
                 # this period. A last-second load drop cannot turn sixty
@@ -1197,6 +1339,9 @@ class OneFuseRegulator:
                 and (self._awaiting_reduction_target is None or raw_zero_restart),
                 s.restart_stable_seconds,
             )
+            if (self._uncertainty_restart and self._uncertainty_retry_after is not None
+                    and now < self._uncertainty_retry_after):
+                return 0
             if raw_zero_restart:
                 return self._raw_zero_restart_cap if ready and raw_zero_fresh else 0
             return (desired if self._start_allowed(status) else startup) if ready else 0
@@ -1311,12 +1456,18 @@ class OneFuseRegulator:
         self._last_input_status = status
         if status != "paused":
             self._resume_submission_ts = None
-        grid = _valid_number(inp.grid_l1)
-        current = _valid_number(inp.charger_current)
+        grid = None if isinstance(inp.grid_l1, bool) else _valid_number(inp.grid_l1)
+        current = None if isinstance(inp.charger_current, bool) else _valid_number(inp.charger_current)
         self._last_input_grid_ts = (None if isinstance(inp.grid_report_ts, bool) else _valid_number(inp.grid_report_ts))
         self._last_input_charger_ts = (None if isinstance(inp.charger_report_ts, bool) else _valid_number(inp.charger_report_ts))
         self._last_input_wall_now_ts = (None if isinstance(inp.wall_now_ts, bool) else _valid_number(inp.wall_now_ts))
-        available, house = self.calculate_available_l1(grid, current or 0.0)
+        self._last_input_current_trusted = inp.charger_current_trusted is True
+        # Some protective branches retire their context before constructing
+        # the zero decision. Retain only the cause, not any positive authority.
+        measurement_conflict = bool(grid is not None and current is not None
+            and (not self._last_input_current_trusted or current > grid + 1
+                 or (self._positive_cap is not None and current > self._positive_cap + 0.5)))
+        available, house = self.calculate_available_l1(grid, (current or 0.0) if self._last_input_current_trusted else 0.0)
         current_fresh = self._fast_sources_fresh()
         refresh_required = False
         house_basis = "grid_minus_reported_ev"
@@ -1327,6 +1478,23 @@ class OneFuseRegulator:
 
         def decision(mode: str, reason: str, command: str | None = None,
                      target: int = 0, ttl: int | None = None, emergency: bool = False) -> RegulatorDecision:
+            if (command == "set_limit" and target == 0 and mode in {"unavailable", "overload_stop"}
+                    and self._uncertainty_ceiling is None and self.last_target is not None
+                    and self.last_target[0] > 0 and inp.data_valid and not inp.data_error
+                    and status == "charging" and grid is not None and current is not None
+                    and current <= s.max_charge_amps + 0.5
+                    and measurement_conflict):
+                self._uncertainty_ceiling = min(self.last_target[0], s.max_charge_amps)
+                self._uncertainty_previous_offer = self.last_target[0]
+            if self._uncertainty_ceiling is not None and command in {"set_limit", "resume"}:
+                if target > 0:
+                    ceiling = self.startup_current if self._uncertainty_restart else self._uncertainty_ceiling
+                    target = min(target, ceiling)
+                elif command == "set_limit":
+                    self._record_uncertainty_stop(now)
+                    if self._uncertainty_stops >= 3:
+                        mode = "measurement_recovery_blocked"
+                        reason += " Repeated measurement recovery failed; needs attention. Reconnect or explicitly reset controller state after diagnosis."
             ttl_value = s.normal_ttl_seconds if ttl is None else ttl
             should_call = s.active_control and command is not None
             if command == "set_limit":
@@ -1373,6 +1541,12 @@ class OneFuseRegulator:
                 charger_report_age_seconds=(self._last_input_wall_now_ts - self._last_input_charger_ts
                     if self._last_input_wall_now_ts is not None and self._last_input_charger_ts is not None else None),
                 source_alignment_window_seconds=s.measurement_settle_seconds,
+                charger_current_trusted=self._last_input_current_trusted,
+                measurement_uncertainty_active=self._uncertainty_ceiling is not None,
+                measurement_uncertainty_cap=self._uncertainty_ceiling,
+                measurement_uncertainty_stops=self._uncertainty_stops,
+                measurement_recovery_wait_seconds=(max(0.0, self._uncertainty_retry_after - now)
+                    if self._uncertainty_retry_after is not None else 0.0),
             )
 
         error = inp.data_error
@@ -1415,10 +1589,65 @@ class OneFuseRegulator:
             self._clear_partial_reduction_alignment()
             self._clear_positive_alignment()
             self._waiting_for_vehicle_since = None
+            self._clear_measurement_uncertainty()
             return decision("idle", f"Status '{status}' does not require charge control.")
 
         assert grid is not None
         assert current is not None
+        if (self._uncertainty_ceiling is not None and not self._restart_required
+                and self.last_target is not None and self.last_target[0] > 0
+                and (self.last_set_limit_ts is None
+                     or not 0 <= now - self.last_set_limit_ts < self.last_target[3])):
+            self.reset_timers()
+            self._clear_positive_alignment()
+            self._restart_required = True
+            return decision("unavailable", "The accepted uncertainty-mode lease expired; requesting 0 A before a qualified capped restart.",
+                            "set_limit", emergency=True)
+        self._observe_uncertainty_recovery(now, grid, current, status)
+        uncertain = (not self._last_input_current_trusted or current > grid + 1
+                     or (self._positive_cap is not None and current > self._positive_cap + 0.5)
+                     or self._uncertainty_ceiling is not None)
+        if uncertain:
+            cap = self._uncertainty_raw_cap(grid, current, status)
+            if cap is not None:
+                soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+                pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+                self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+                self._increase_since = None
+                available, house = self.calculate_available_l1(grid, 0.0)
+                house_basis = "verified_import_only_raw_bound"
+                refresh_required = True
+                if s.enable_pause_resume and pause:
+                    return decision("pause", "Pause guard overrides measurement-uncertainty fallback.", "pause", emergency=True)
+                if s.enable_soft_guard and soft:
+                    cap = min(cap, max(0, s.soft_current_amps))
+                    if cap < s.min_charge_amps:
+                        self._restart_required = True
+                        return decision("soft_limit", "Soft guard overrides measurement-uncertainty fallback.",
+                                        "set_limit", 0, s.soft_ttl_seconds, emergency=True)
+                    self._uncertainty_ceiling = min(self._uncertainty_ceiling, cap)
+                result = decision("measurement_uncertainty", "Holding only a lower nominal offer under the explicit import-only raw-current assumption; no EV subtraction, increase or resume.",
+                                  "set_limit", cap, self.last_target[3])
+                # Same failed proposal cannot be retried on every source event.
+                # A genuinely smaller protective offer can still be sent now.
+                if (result.should_call_service and self._uncertainty_last_attempt is not None
+                        and cap >= self._uncertainty_last_attempt_cap
+                        and now - self._uncertainty_last_attempt < s.min_seconds_between_actions):
+                    result.should_call_service = False
+                elif result.should_call_service and not result.dry_run:
+                    self._uncertainty_last_attempt = now
+                    self._uncertainty_last_attempt_cap = cap
+                return result
+        if not self._last_input_current_trusted:
+            if s.overload_enabled and (self._overload_transition_started is not None or self._overload_hold_active):
+                self._fail_overload("untrusted_current_during_overload")
+                self._clear_overload_transition()
+                self._overload_hold_active = False
+            self.reset_timers()
+            self._clear_positive_alignment()
+            self._restart_required = True
+            return decision("unavailable", "Charger current source is not trusted; no EV credit or restart is permitted. Requesting 0 A.",
+                            "set_limit", emergency=True)
         if not current_fresh:
             refresh_required = True
         if self._restart_required:
@@ -1847,6 +2076,9 @@ class OneFuseRegulator:
             reason = f"Soft guard caps the available headroom at {target} A."
 
         original_target = target
+        if self._uncertainty_ceiling is not None:
+            target = min(target, self.startup_current if self._uncertainty_restart else self._uncertainty_ceiling)
+            original_target = target
         target = self._limit_with_continuity(
             now, target, available, house, current, status,
             allow_minimum=not (s.enable_soft_guard and soft and s.soft_current_amps < s.min_charge_amps),

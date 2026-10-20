@@ -97,6 +97,38 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(settings.dry_run)
         self.assertFalse(settings.force_min_when_available_too_low)
         self.assertTrue(settings.fast_recovery)
+        self.assertFalse(settings.nominal_import_only_fallback)
+
+    async def test_long_incident_reason_is_valid_ha_state_with_complete_attribute(self):
+        module = importlib.import_module("custom_components.1fuseloader.sensor")
+        logic = importlib.import_module("custom_components.1fuseloader.logic")
+        controller = self.component.OneFuseLoaderController(self.hass, self.entry)
+        controller.last_decision = controller.regulator.evaluate(logic.RegulatorInput(
+            0, "charging", 14, charger_current=8, data_valid=False, data_error="evidence " * 60))
+        description = next(item for item in module.SENSOR_DESCRIPTIONS if item.key == "reason")
+        entity = module.OneFuseSensor(controller, self.entry, description)
+        self.assertLessEqual(len(entity.native_value), 255)
+        self.assertGreater(len(entity.extra_state_attributes["reason"]), 255)
+        self.hass.states.async_set("sensor.test_reason", entity.native_value, entity.extra_state_attributes)
+        self.assertEqual(self.hass.states.get("sensor.test_reason").state, entity.native_value)
+
+    async def test_import_only_option_requires_explicit_boolean_and_is_translated(self):
+        self.hass.config_entries = SimpleNamespace(async_get_known_entry=lambda _: self.entry)
+        flow = self.flow_module.OneFuseLoaderOptionsFlow()
+        flow.hass = self.hass
+        flow.handler = self.entry.entry_id
+        result = await flow.async_step_init()
+        fields = result["data_schema"].schema
+        marker = next(key for key in fields if str(key.schema) == "nominal_import_only_fallback")
+        self.assertFalse(marker.default())
+        self.assertIs(fields[marker], bool)
+        rejected = await flow.async_step_init({"nominal_import_only_fallback": "true"})
+        self.assertEqual(rejected["errors"].get("base"), "invalid_settings")
+        accepted = await flow.async_step_init({"nominal_import_only_fallback": True})
+        self.assertTrue(accepted["data"]["nominal_import_only_fallback"])
+        for name in ("strings.json", "translations/en.json", "translations/sv.json"):
+            content = json.loads((Path(__file__).parent / "custom_components" / "1fuseloader" / name).read_text(encoding="utf-8"))
+            self.assertTrue(content["options"]["step"]["init"]["data"]["nominal_import_only_fallback"])
 
     async def test_fast_recovery_options_field_is_a_validated_boolean(self):
         self.hass.config_entries = SimpleNamespace(async_get_known_entry=lambda _: self.entry)

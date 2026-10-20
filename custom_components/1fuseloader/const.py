@@ -47,6 +47,7 @@ OPT_MIN_SECONDS_BETWEEN_ACTIONS = "min_seconds_between_actions"
 OPT_ACTIVE_CONTROL = "active_control"
 OPT_DRY_RUN = "dry_run"
 OPT_FAST_RECOVERY = "fast_recovery"
+OPT_NOMINAL_IMPORT_ONLY_FALLBACK = "nominal_import_only_fallback"
 OPT_ENABLE_DYNAMIC_LIMIT = "enable_dynamic_limit"
 OPT_ENABLE_SOFT_GUARD = "enable_soft_guard"
 OPT_ENABLE_PAUSE_RESUME = "enable_pause_resume"
@@ -85,6 +86,9 @@ DEFAULT_OPTIONS = {
     OPT_ACTIVE_CONTROL: False,
     OPT_DRY_RUN: True,
     OPT_FAST_RECOVERY: True,
+    # Requires an explicitly verified import-only, same-phase installation.
+    # A delayed EV observation must not silently imply this topology.
+    OPT_NOMINAL_IMPORT_ONLY_FALLBACK: False,
     OPT_ENABLE_DYNAMIC_LIMIT: True,
     OPT_ENABLE_SOFT_GUARD: True,
     OPT_ENABLE_PAUSE_RESUME: True,

@@ -18,8 +18,10 @@ class SnapshotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.adapter.snapshot_is_current = Mock(return_value=True)
 
     def snapshot(self, current=8.0, status="charging", received=None):
+        received = received or datetime.now(timezone.utc)
         return SimpleNamespace(current=current, status=status,
-            received_at=received or datetime.now(timezone.utc))
+            received_at=received, current_source_timestamp=received,
+            status_source_timestamp=received, source_timestamp_error=None)
 
     async def fetch(self):
         self.controller._request_current_snapshot()

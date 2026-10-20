@@ -50,6 +50,46 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Delayed observations and bounded recovery (b17)
+
+Easee current and operating-mode observations are event states. Their source
+timestamp can legitimately remain unchanged while the value is steady. A new
+HTTP response confirms a cloud read, not a new physical sample. B17 preserves
+both clocks and prefers independent newer native events, including a manual
+pause or schedule. Observation metadata alone is never proof of physical
+command response.
+
+The **Conservative reduction with delayed EV data (verified import-only
+supply)** option is off by default. Enable it only after verifying that the
+grid measurement includes the controlled L1, and that the installation uses
+comparable importing loads without generation, storage or cancelling current.
+The raw grid magnitude is not a general upper bound on household RMS current
+when these assumptions do not hold.
+
+When that model is explicitly enabled and an accepted positive offer is
+already charging, an uncertain EV report can cause a conservative reduction
+instead of an immediate zero. The entire new offer must fit the normal
+raw-grid budget without subtracting EV current, and may never exceed the
+accepted cap or the uncertainty episode's previous cap. For example, a 25 A
+fuse with 2 A buffer and 14 A raw grid current allows at most 9 A on this path.
+If the minimum current cannot fit, the path still stops. Physical faults,
+stale grid measurements and existing overload-response limits still apply.
+
+Recovery does not repeatedly offer the car maximum after a telemetry stop.
+It uses bounded attempts and a conservative startup offer. A measurement
+recovery block requires attention, a new physical session or the existing
+explicit state reset; an HA restart also clears this memory-only recovery
+state. The separate persistent overload budget and failure latch are never
+cleared by this path.
+
+Source Health exposes recent command and stop receipts. On each new stop,
+bounded evidence is saved by the integration to its local
+`1fuseloader.<entry-id>.incident_journal` Store. This is private diagnostic
+data, not a control input. It distinguishes proposed limits, API acceptance,
+cached readback and reported physical current. Offline process tests cover
+transport ordering separately from physical EV response; actual charging must
+still be verified under supervision after activation.
+
 Same base formula as the old `sensor.easee_max_available_l1_v2`:
 
 ```text

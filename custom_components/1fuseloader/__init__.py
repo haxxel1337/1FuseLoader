@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections import deque
 from pathlib import Path
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
@@ -24,7 +25,7 @@ from .const import (
 )
 from .easee_adapter import EaseeCommandAdapter
 from .bmw_context import BMWContext
-from .logic import ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, OneFuseRegulator, RegulatorInput, RegulatorSettings
+from .logic import ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, START_ALLOWED_STATUSES, OneFuseRegulator, RegulatorInput, RegulatorSettings
 from .overload_persistence import OverloadBudgetStore
 from .mqtt_freshness import MqttL1Config, MqttL1Source
 
@@ -84,12 +85,21 @@ class OneFuseLoaderController:
         self.last_accepted_limit: dict[str, Any] | None = None
         self.last_stop_context: dict[str, Any] | None = None
         self.last_stop_nominal_diagnostics: dict[str, Any] | None = None
+        self._recent_commands: deque[dict[str, Any]] = deque(maxlen=32)
+        self._recent_stop_contexts: deque[dict[str, Any]] = deque(maxlen=8)
+        self._incident_journal_pending: dict[str, Any] | None = None
+        self._incident_journal_task: asyncio.Task | None = None
+        self._incident_journal_error: str | None = None
         self._stop_context_armed = True
         self.source_diagnostics: dict[str, Any] = {}
         self._charger_snapshot: Any = None
         self._charger_snapshot_selection: tuple | None = None
         self._charger_snapshot_task: asyncio.Task | None = None
         self._charger_snapshot_next_request = 0.0
+        self._charger_snapshot_last_receipt_monotonic: float | None = None
+        self._charger_snapshot_receipt_has_old_event = False
+        self._charger_snapshot_last_request_need: tuple | None = None
+        self._charger_vendor_evidence: dict[str, Any] | None = None
         self._charger_snapshot_error: str | None = None
         self._charger_snapshot_error_reason: str | None = None
         self._charger_snapshot_failure_type: str | None = None
@@ -116,6 +126,10 @@ class OneFuseLoaderController:
         storage_key = f"{DOMAIN}.{entry.entry_id}.overload"
         writer = Store(hass, 1, storage_key, atomic_writes=True)
         runtime_data = getattr(hass, "data", None)
+        journal_states = (runtime_data.setdefault(f"{DOMAIN}_incident_journal_writers", {})
+                          if runtime_data is not None else {})
+        self._incident_journal_writer = journal_states.setdefault(
+            entry.entry_id, {"lock": asyncio.Lock(), "revision": 0})
         rate_states = (runtime_data.setdefault(f"{DOMAIN}_snapshot_rate_limits", {})
                        if runtime_data is not None else {})
         self._charger_snapshot_rate_state = rate_states.setdefault(entry.entry_id, {})
@@ -465,6 +479,8 @@ class OneFuseLoaderController:
         target_age = self._snapshot_freshness_window() / 2
         wait = max(0.0, target_age - age) if age >= -5 else 0.0
         due = max(now + wait, self._charger_snapshot_next_request,
+                  (self._charger_snapshot_last_receipt_monotonic + target_age
+                   if self._charger_snapshot_last_receipt_monotonic is not None else now),
                   now + CURRENT_SNAPSHOT_MIN_INTERVAL_SECONDS if in_flight else now)
         if (self._charger_snapshot_refresh_due is not None
                 and abs(self._charger_snapshot_refresh_due - due) < .05):
@@ -517,11 +533,21 @@ class OneFuseLoaderController:
         if self._adapter.telemetry_block_reason:
             self._charger_snapshot = None
             return
+        need = (self._generation, id(self._adapter), self.entry.data.get(CONF_CHARGER_CURRENT_ENTITY),
+                _get_state_value(self.hass, self.entry.data.get(CONF_CHARGER_CURRENT_ENTITY)),
+                _get_state_value(self.hass, self.entry.data.get(CONF_STATUS_ENTITY)), self.regulator.last_target)
+        if (need == self._charger_snapshot_last_request_need
+                and self._charger_snapshot_receipt_has_old_event
+                and self._charger_snapshot_last_receipt_monotonic is not None
+                and self.hass.loop.time() < self._charger_snapshot_last_receipt_monotonic
+                    + self._snapshot_freshness_window() / 2):
+            return
         generation = self._generation
         revision = self._charger_source_revision()
         adapter = self._adapter
         self._cancel_snapshot_refresh()
         self._charger_snapshot_next_request = self.hass.loop.time() + CURRENT_SNAPSHOT_MIN_INTERVAL_SECONDS
+        self._charger_snapshot_last_request_need = need
         self._charger_snapshot_rate_state.update(next_request=self._charger_snapshot_next_request)
 
         async def fetch() -> None:
@@ -545,6 +571,12 @@ class OneFuseLoaderController:
                         self._charger_snapshot = None
                         self._snapshot_backoff()
                         return
+                    self._charger_snapshot_last_receipt_monotonic = self.hass.loop.time() - age
+                    observed = self._utc_time(getattr(snapshot, "current_source_timestamp", None))
+                    self._charger_snapshot_receipt_has_old_event = bool(
+                        observed is None or getattr(snapshot, "source_timestamp_error", None)
+                        or (received - observed).total_seconds() >= self._snapshot_freshness_window() / 2
+                        or observed > received + timedelta(seconds=2))
                     report_times = [revision[3], revision[6]]
                     if any(stamp is None or stamp >= received.timestamp() for stamp in report_times):
                         self._charger_snapshot_error = "snapshot_not_newer_than_entity_reports"
@@ -662,9 +694,71 @@ class OneFuseLoaderController:
                         if received is not None else float("inf"))
         snapshot_is_current = getattr(self._adapter, "snapshot_is_current", None)
         entity_report_times = (self._report_timestamp(current_state), self._report_timestamp(status_state))
+        source_stamp = self._utc_time(getattr(snapshot, "current_source_timestamp", None))
+        status_source_stamp = self._utc_time(getattr(snapshot, "status_source_timestamp", None))
+        source_error = getattr(snapshot, "source_timestamp_error", None)
+        current_trusted = True
+        current_clock_scope = "native_HA_receipt_not_guaranteed_acquisition"
+        def current_number(value: Any) -> float | None:
+            try:
+                number = float(value)
+                return number if not isinstance(value, bool) and isfinite(number) else None
+            except (TypeError, ValueError, OverflowError):
+                return None
+        native_number = current_number(current_value)
+        evidence = self._charger_vendor_evidence
+        if evidence is not None and (
+                self._stopped or errors or health_error or evidence["generation"] != self._generation
+                or evidence["adapter"] is not self._adapter
+                or evidence["entity_id"] != data.get(CONF_CHARGER_CURRENT_ENTITY)
+                or native_number is None or native_number != evidence["value"]
+                or not callable(snapshot_is_current) or not snapshot_is_current(evidence["snapshot"])):
+            evidence = self._charger_vendor_evidence = None
+        if (snapshot is not None and not errors and not health_error
+                and self._charger_snapshot_selection == self._charger_source_revision()
+                and 0 <= snapshot_age <= CURRENT_SNAPSHOT_MAX_AGE_SECONDS
+                and callable(snapshot_is_current) and snapshot_is_current(snapshot)
+                and native_number is not None and native_number == current_number(snapshot.current)):
+            missing = source_stamp is None and (source_error is None
+                or source_error == "easee_observation_timestamp_missing")
+            malformed = (bool(source_error) and source_error != "easee_observation_timestamp_missing"
+                         or (getattr(snapshot, "current_source_timestamp", None) is not None and source_stamp is None)
+                         or (source_stamp is not None and (source_stamp - datetime.now(timezone.utc)).total_seconds() > 2))
+            if malformed or not missing:
+                evidence = self._charger_vendor_evidence = {
+                    "generation": self._generation, "adapter": self._adapter, "snapshot": snapshot,
+                    "entity_id": data.get(CONF_CHARGER_CURRENT_ENTITY), "value": native_number,
+                    "timestamp": None if malformed else source_stamp, "invalid": bool(malformed),
+                }
+        snapshot_source_rejection = None
+        if snapshot is not None:
+            if source_error:
+                snapshot_source_rejection = "observation_timestamp_invalid"
+            elif source_stamp is None:
+                snapshot_source_rejection = "observation_timestamp_missing"
+            else:
+                source_age = (datetime.now(timezone.utc) - source_stamp).total_seconds()
+                if source_age < -2:
+                    snapshot_source_rejection = "observation_timestamp_in_future"
+                elif source_age > self.settings.max_sensor_age_seconds:
+                    snapshot_source_rejection = "observation_timestamp_stale"
+                elif (current_report_ts is not None and source_stamp.timestamp() < current_report_ts):
+                    # A GET of a previous observation must not replace a later
+                    # native event or renew that event's report clock.
+                    snapshot_source_rejection = "observation_precedes_native_report"
+            if snapshot_source_rejection is None:
+                if status_source_stamp is None:
+                    snapshot_source_rejection = "status_observation_timestamp_missing_or_invalid"
+                elif (status_value.strip().lower() not in START_ALLOWED_STATUSES
+                      and snapshot.status != status_value):
+                    snapshot_source_rejection = "native_pause_schedule_or_idle_wins"
+                elif (snapshot.status != status_value and entity_report_times[1] is not None
+                      and status_source_stamp.timestamp() <= entity_report_times[1]):
+                    snapshot_source_rejection = "status_observation_precedes_native_report"
         # A new HA status/current event supersedes the whole REST pair. Never
         # combine a new current with an old authorization/schedule status.
         snapshot_used = bool(snapshot is not None and not errors and not health_error
+            and snapshot_source_rejection is None
             and self._charger_snapshot_selection == self._charger_source_revision()
             and 0 <= snapshot_age <= CURRENT_SNAPSHOT_MAX_AGE_SECONDS
             and all(stamp is not None and stamp < received.timestamp() for stamp in entity_report_times)
@@ -672,10 +766,20 @@ class OneFuseLoaderController:
         if snapshot_used:
             current_value = snapshot.current
             status_value = snapshot.status
-            current_report_ts = received.timestamp()
+            # Vendor observation time is still not guaranteed acquisition
+            # time. It is nevertheless distinct from a new HTTP receipt.
+            current_report_ts = source_stamp.timestamp()
+            current_clock_scope = "vendor_observation_timestamp_not_guaranteed_acquisition"
         elif snapshot is not None:
             self._charger_snapshot = None
             self._charger_snapshot_selection = None
+        if not snapshot_used and evidence is not None:
+            current_trusted = not evidence["invalid"]
+            if evidence["timestamp"] is not None:
+                current_report_ts = evidence["timestamp"].timestamp()
+                current_clock_scope = "retained_vendor_event_timestamp_not_guaranteed_acquisition"
+            else:
+                current_clock_scope = "native_HA_receipt_with_invalid_matching_vendor_metadata"
         self.source_diagnostics.update({
             "charger_current_entity_reported_at_utc": (self._utc_time(getattr(current_state, "last_reported", None)).isoformat()
                 if self._utc_time(getattr(current_state, "last_reported", None)) else None),
@@ -688,6 +792,15 @@ class OneFuseLoaderController:
             "charger_snapshot_error_reason": self._charger_snapshot_error_reason,
             "charger_snapshot_failure_type": self._charger_snapshot_failure_type,
             "charger_snapshot_scope": "cloud_state_read_receipt_not_physical_acquisition",
+            "charger_snapshot_current_source_timestamp_utc": source_stamp.isoformat() if source_stamp else None,
+            "charger_snapshot_status_source_timestamp_utc": (
+                self._utc_time(getattr(snapshot, "status_source_timestamp", None)).isoformat()
+                if self._utc_time(getattr(snapshot, "status_source_timestamp", None)) else None),
+            "charger_snapshot_source_rejection": snapshot_source_rejection,
+            "effective_current_clock_scope": current_clock_scope,
+            "charger_current_trusted": current_trusted,
+            "retained_current_source_timestamp_utc": (
+                evidence["timestamp"].isoformat() if evidence is not None and evidence["timestamp"] is not None else None),
             "charger_snapshot_prefetch_target_seconds": self._snapshot_freshness_window() / 2,
             "charger_snapshot_request_floor_seconds": CURRENT_SNAPSHOT_MIN_INTERVAL_SECONDS,
             "charger_snapshot_failure_backoff_count": self._charger_snapshot_failures,
@@ -715,6 +828,7 @@ class OneFuseLoaderController:
             charger_report_ts=current_report_ts,
             wall_now_ts=datetime.now(timezone.utc).timestamp(),
             charger_snapshot_verified=snapshot_used,
+            charger_current_trusted=current_trusted,
         )
 
     @staticmethod
@@ -838,6 +952,10 @@ class OneFuseLoaderController:
             "last_accepted_command": dict(self.last_accepted_command) if self.last_accepted_command else None,
             "last_accepted_limit": dict(accepted) if accepted else None,
             "last_stop_context": dict(self.last_stop_context) if self.last_stop_context else None,
+            "recent_command_journal": [dict(item) for item in list(self._recent_commands)[-8:]],
+            "recent_stop_contexts": [dict(item) for item in self._recent_stop_contexts],
+            "incident_journal_error_type": self._incident_journal_error,
+            "incident_journal_scope": "bounded_local_receipts_and_vendor_observations_not_physical_proof",
             "last_stop_nominal_diagnostics": (dict(self.last_stop_nominal_diagnostics)
                                                if self.last_stop_nominal_diagnostics else None),
             "reported_cap_matches_last_accepted_limit": comparison,
@@ -869,7 +987,8 @@ class OneFuseLoaderController:
     @staticmethod
     def _input_revision(inp: RegulatorInput) -> tuple:
         return (inp.status, inp.grid_l1, inp.charger_current, inp.data_valid, inp.data_error,
-                inp.grid_report_ts, inp.charger_report_ts, inp.charger_snapshot_verified)
+                inp.grid_report_ts, inp.charger_report_ts, inp.charger_snapshot_verified,
+                inp.charger_current_trusted)
 
     async def _async_tick_locked(self) -> None:
         generation = self._generation
@@ -1052,6 +1171,16 @@ class OneFuseLoaderController:
             self.last_service_result = "submitted_unverified"
             attempt["result"] = "submitted_unverified"
         attempt["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        journal_record = {
+            **attempt, "mode": decision.mode, "reason": decision.reason,
+            "grid_l1": decision.grid_l1, "charger_current": decision.charger_current,
+            "grid_report_utc": plan_source_diagnostics.get("grid_reported_at_utc"),
+            "charger_report_utc": plan_source_diagnostics.get("effective_charger_reported_at_utc"),
+            "charger_clock_scope": plan_source_diagnostics.get("effective_current_clock_scope"),
+            "snapshot_source_timestamp_utc": plan_source_diagnostics.get("charger_snapshot_current_source_timestamp_utc"),
+            "reported_cap_p1": plan_source_diagnostics.get("reported_circuit_p1"),
+        }
+        self._recent_commands.append(journal_record)
         if attempt["result"] == "submitted_unverified":
             self.last_accepted_command = dict(attempt)
             if decision.command in {"set_limit", "resume"}:
@@ -1073,7 +1202,72 @@ class OneFuseLoaderController:
                 "command_completed_at_utc": attempt["completed_at_utc"],
                 "command_result": attempt["result"], "command_error": attempt["error"],
             })
+            self._recent_stop_contexts.append(dict(self.last_stop_context))
+            self._queue_incident_journal()
         self.notify()
+
+    def _queue_incident_journal(self) -> None:
+        """Persist bounded diagnostic evidence off the protective command path.
+
+        This journal has no control authority. A failed diagnostic write never
+        changes exposure accounting, cap ownership or retry policy.
+        """
+        self._incident_journal_writer["revision"] += 1
+        revision = self._incident_journal_writer["revision"]
+        self._incident_journal_pending = {
+            "revision": revision,
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "scope": "API_and_local_receipts_not_physical_acquisition_or_delivery_proof",
+            "commands": [dict(item) for item in self._recent_commands],
+            "stops": [dict(item) for item in self._recent_stop_contexts],
+        }
+        if self._incident_journal_task is not None and not self._incident_journal_task.done():
+            return
+
+        async def save() -> None:
+            try:
+                store = Store(self.hass, 1, f"{DOMAIN}.{self.entry.entry_id}.incident_journal", atomic_writes=True)
+                while self._incident_journal_pending is not None:
+                    payload = self._incident_journal_pending
+                    self._incident_journal_pending = None
+                    try:
+                        async with self._incident_journal_writer["lock"]:
+                            if payload["revision"] != self._incident_journal_writer["revision"]:
+                                continue
+                            # Keep the actual I/O serialized across reloads.
+                            # A timeout must not release the lock while an
+                            # executor-backed old write can still finish last.
+                            write = self.hass.async_create_task(store.async_save(payload))
+                            try:
+                                try:
+                                    await asyncio.wait_for(asyncio.shield(write), EXPOSURE_STORE_TIMEOUT_SECONDS)
+                                except TimeoutError:
+                                    self._incident_journal_error = "TimeoutError"
+                                    _LOGGER.warning("1FuseLoader diagnostic journal write is still pending")
+                                    await asyncio.shield(write)
+                            except asyncio.CancelledError:
+                                # Cancellation of this diagnostic worker must
+                                # not free the entry lock while old I/O lives.
+                                while not write.done():
+                                    try:
+                                        await asyncio.shield(write)
+                                    except asyncio.CancelledError:
+                                        continue
+                                    except Exception:
+                                        break
+                                if not write.cancelled():
+                                    write.exception()  # retrieve any completed I/O failure
+                                raise
+                    except Exception as err:
+                        self._incident_journal_error = type(err).__name__
+                        _LOGGER.warning("1FuseLoader diagnostic journal write failed (%s)", type(err).__name__)
+                    else:
+                        self._incident_journal_error = None
+            finally:
+                if self._incident_journal_task is asyncio.current_task():
+                    self._incident_journal_task = None
+
+        self._incident_journal_task = self.hass.async_create_task(save())
 
     def _schedule_overload_deadline(self, decision: Any, elapsed: float = 0.0) -> None:
         if self._unsub_deadline:
