@@ -91,7 +91,8 @@ class RegulatorInput:
     charger_current: object = 0
     data_valid: bool = True
     data_error: Optional[str] = None
-    # HA report receipt timestamps, not guaranteed device acquisition times.
+    # Source clocks: validated grid report time and HA receipt or retained
+    # vendor EV event time. Neither guarantees physical acquisition time.
     grid_report_ts: Optional[float] = None
     charger_report_ts: Optional[float] = None
     # UTC epoch clock for explicit report-age checks. now_ts stays monotonic.
@@ -100,7 +101,8 @@ class RegulatorInput:
     # Its report timestamp may be a vendor state-event time, never an invented
     # physical acquisition time or a replacement with the local GET receipt.
     charger_snapshot_verified: bool = False
-    # False for a known old/invalid vendor observation despite a fresh GET.
+    # False for known invalid/conflicting current provenance. A valid unchanged
+    # vendor event may remain a trusted cache state without fresh sample credit.
     charger_current_trusted: bool = True
 
 

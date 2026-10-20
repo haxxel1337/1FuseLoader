@@ -310,6 +310,11 @@ class EaseeCommandAdapter:
                 or value.endswith("-00:00")):
             return None, "easee_observation_timestamp_invalid"
         try:
+            # ISO parsers may normalize forms such as 24:00 differently across
+            # Python versions. Validate the original civil components first;
+            # no normalization may turn malformed metadata into time credit.
+            datetime(int(value[0:4]), int(value[5:7]), int(value[8:10]),
+                     int(value[11:13]), int(value[14:16]), int(value[17:19]))
             stamp = datetime.fromisoformat(
                 value[:-1] + "+00:00" if value[-1:] in {"Z", "z"} else value
             ).astimezone(timezone.utc)

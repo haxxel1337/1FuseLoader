@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 import unittest
+from unittest.mock import patch
 
 import test_1fuseloader_snapshot_adapter as fixtures
 
@@ -193,6 +194,41 @@ class ObservationTimestampTests(unittest.IsolatedAsyncioTestCase):
             parsed, error = fixtures.adapter.EaseeCommandAdapter._observation_timestamp(value, received)
             self.assertEqual(error, expected_error)
             self.assertEqual(parsed, received + timedelta(seconds=delta) if error is None else None)
+
+    def test_invalid_civil_components_are_rejected_even_if_iso_parser_would_normalize_them(self):
+        # Model a permissive ISO parser so this regression does not depend on
+        # whether the local Python version already accepts e.g. 24:00.
+        calls = []
+        class PermissiveDateTime(datetime):
+            @classmethod
+            def fromisoformat(cls, value):
+                calls.append(value)
+                return datetime(2026, 1, 1, tzinfo=timezone.utc)
+        invalid = ('2026-10-20T24:00:00Z', '2026-10-20T24:00:00.000Z',
+                   '2026-10-20T99:00:00Z', '2026-10-20T14:60:00Z',
+                   '2026-10-20T14:00:60Z', '2026-02-29T14:00:00Z',
+                   '2026-02-30T14:00:00Z', '2026-04-31T14:00:00Z',
+                   '2026-00-01T14:00:00Z', '0000-01-01T00:00:00Z')
+        with patch.object(fixtures.adapter, 'datetime', PermissiveDateTime):
+            # A later receipt makes normalized invalid values look old and
+            # acceptable, rather than accidentally failing only a future gate.
+            received = datetime(2027, 1, 1, tzinfo=timezone.utc)
+            for value in invalid:
+                with self.subTest(value=value):
+                    parsed, error = fixtures.adapter.EaseeCommandAdapter._observation_timestamp(value, received)
+                    self.assertIsNone(parsed)
+                    self.assertEqual(error, 'easee_observation_timestamp_invalid')
+        self.assertEqual(calls, [])
+
+    def test_valid_leap_day_and_end_of_day_are_preserved_without_normalization(self):
+        received = datetime(2028, 3, 1, tzinfo=timezone.utc)
+        for value, expected in (
+                ('2028-02-29T23:59:59.999999Z', datetime(2028, 2, 29, 23, 59, 59, 999999, tzinfo=timezone.utc)),
+                ('2028-03-01T01:59:59.999999+02:00', datetime(2028, 2, 29, 23, 59, 59, 999999, tzinfo=timezone.utc))):
+            with self.subTest(value=value):
+                parsed, error = fixtures.adapter.EaseeCommandAdapter._observation_timestamp(value, received)
+                self.assertEqual(parsed, expected)
+                self.assertIsNone(error)
 
 
 if __name__ == "__main__":
