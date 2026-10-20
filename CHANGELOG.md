@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0b17
+
+- Preserve Easee observation timestamps independently of HTTP receipts. Reject
+  missing, invalid, conflicting or regressing timestamp metadata for new
+  observation credit. An unchanged event timestamp is not itself a fault or
+  a new physical sample. A cached GET cannot overwrite a newer native current
+  or a native pause, schedule or authorization state.
+- Add an explicit, default-off import-only fallback for delayed or inconsistent
+  EV reports. Under the verified same-phase importing-load model, it can only
+  retain or reduce an accepted positive cap whose entire offered current fits
+  the fresh raw-grid normal budget. It cannot create EV credit, force 6 A,
+  resume a pause or replenish experimental overload time.
+- Keep measurement-uncertainty recovery separate from normal increases and
+  experimental failure accounting. Bound repeated recovery attempts and their
+  startup offers instead of cycling directly back to the maximum current.
+- Keep a bounded command and first-stop timeline, including source clock
+  provenance and API receipt times. Persist incident evidence locally outside
+  the control path; diagnostic write failures do not alter the overload ledger.
+- Add independent process/transport regressions for delayed EV ramps, old
+  observations in new GET responses, lower physical demand, and true protective
+  stops. These offline checks do not establish physical end-to-end performance.
+
 ## 0.4.0b16
 
 - Refresh a quiet charging session's numeric current/status pair before its

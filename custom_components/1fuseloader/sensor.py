@@ -164,7 +164,9 @@ class OneFuseSensor(SensorEntity):
         if key == "house_load_l1":
             return round(d.house_load_l1, 2)
         if key == "reason":
-            return d.reason
+            # HA states are limited to 255 characters. Preserve the complete
+            # explanation in the existing `reason` state attribute below.
+            return d.reason if len(d.reason) <= 255 else d.reason[:252] + "..."
         if key == "last_command":
             return self.controller.regulator.last_command or "none"
         if key == "service_result":

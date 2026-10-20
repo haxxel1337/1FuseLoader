@@ -58,7 +58,9 @@ class RefreshDeadlineTests(unittest.IsolatedAsyncioTestCase):
         return datetime.fromtimestamp(self.epoch+(self.now if then is None else then), timezone.utc)
 
     def snapshot(self, current=16.227, status="charging"):
-        return SimpleNamespace(current=current, status=status, received_at=self.wall())
+        return SimpleNamespace(current=current, status=status, received_at=self.wall(),
+            current_source_timestamp=self.wall(), status_source_timestamp=self.wall(),
+            source_timestamp_error=None)
 
     def schedule(self, hass, delay, callback):
         item = SimpleNamespace(due=self.now+delay, callback=callback, cancelled=False)

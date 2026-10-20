@@ -21,6 +21,7 @@ SUPPORTED_EASEE_VERSION = "0.9.74"
 SUPPORTED_PYEASEE_VERSION = "0.8.17"
 REQUEST_TIMEOUT_SECONDS = 10
 MAX_TELEMETRY_AGE_SECONDS = 120
+OBSERVATION_FUTURE_TOLERANCE_SECONDS = 2
 SNAPSHOT_OBSERVATION_IDS = (109, 182, 183, 184, 185)
 
 # Raw numeric modes in the audited pyeasee 0.8.17 operation-mode enum.
@@ -59,12 +60,20 @@ class EaseeAdapterError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ChargerCurrentSnapshot:
-    """API values and local UTC receipt, without a physical sample timestamp."""
+    """Cloud values, local receipt and optional vendor observation metadata.
+
+    Source timestamps describe the server's observations, not synchronized
+    physical acquisition. A new GET receipt must never renew these timestamps.
+    """
 
     current: float
     status: str
     received_at: datetime
     source_identity: tuple[int, ...] = field(repr=False)
+    current_source_timestamp: datetime | None = None
+    status_source_timestamp: datetime | None = None
+    current_source_timestamps: tuple[tuple[int, datetime | None], ...] = ()
+    source_timestamp_error: str | None = None
 
 
 class EaseeCommandAdapter:
@@ -78,6 +87,8 @@ class EaseeCommandAdapter:
         self._product_data: Any = None
         self._controller: Any = None
         self._registry_device: Any = None
+        self._observation_timestamp_identity: tuple[int, ...] | None = None
+        self._observation_timestamp_history: dict[int, tuple[datetime, float]] = {}
 
     async def async_initialize(self) -> None:
         """Validate already loaded objects without making any network request."""
@@ -210,6 +221,7 @@ class EaseeCommandAdapter:
             if type(observations) is not list or len(observations) < 5:
                 raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
             values = {}
+            timestamp_values = {}
             for observation in observations:
                 if not isinstance(observation, Mapping):
                     raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
@@ -228,6 +240,7 @@ class EaseeCommandAdapter:
                 if data_type != (4 if observation_id == 109 else 3):
                     raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
                 values[observation_id] = observation.get("value")
+                timestamp_values[observation_id] = observation.get("timestamp")
             if set(values) != set(SNAPSHOT_OBSERVATION_IDS):
                 raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
             # Match Easee 0.9.74's current sensor: max of all input terminals.
@@ -245,13 +258,71 @@ class EaseeCommandAdapter:
             status = CHARGER_OPERATION_MODES.get(mode)
             if status is None:
                 raise EaseeAdapterError("easee_snapshot_invalid_operation_mode")
+            source_identity = self._snapshot_source_identity()
+            if source_identity != self._observation_timestamp_identity:
+                self._observation_timestamp_identity = source_identity
+                self._observation_timestamp_history.clear()
+            numbers = dict(zip(SNAPSHOT_OBSERVATION_IDS[1:], terminal_currents))
+            numbers[109] = mode
+            timestamps = {}
+            timestamp_errors = {}
+            for observation_id in SNAPSHOT_OBSERVATION_IDS:
+                stamp, error = self._observation_timestamp(
+                    timestamp_values[observation_id], received_at)
+                previous = self._observation_timestamp_history.get(observation_id)
+                if stamp is not None and previous is not None:
+                    if stamp < previous[0]:
+                        stamp, error = None, "easee_observation_timestamp_regressed"
+                    elif stamp == previous[0] and numbers[observation_id] != previous[1]:
+                        stamp, error = None, "easee_observation_timestamp_value_changed"
+                if stamp is not None:
+                    self._observation_timestamp_history[observation_id] = (stamp, numbers[observation_id])
+                timestamps[observation_id] = stamp
+                timestamp_errors[observation_id] = error
+            # All equally maximal terminals can explain the returned current.
+            # Do not let a newer zero on an unused terminal renew an old high
+            # current. For all-zero readings this remains conservative: no
+            # active terminal or physical zero response is inferred here.
+            maxima = [key for key in SNAPSHOT_OBSERVATION_IDS[1:] if numbers[key] == current]
+            source_error = next((timestamp_errors[key] for key in maxima if timestamp_errors[key]), None)
+            current_timestamp = (min(timestamps[key] for key in maxima)
+                                 if source_error is None else None)
             return ChargerCurrentSnapshot(
-                current, status, received_at, self._snapshot_source_identity()
+                current, status, received_at, source_identity,
+                current_source_timestamp=current_timestamp,
+                status_source_timestamp=timestamps[109],
+                current_source_timestamps=tuple((key, timestamps[key]) for key in SNAPSHOT_OBSERVATION_IDS[1:]),
+                source_timestamp_error=source_error,
             )
         except EaseeAdapterError:
             raise
         except Exception as err:
             raise EaseeAdapterError(f"easee_snapshot_failed:{type(err).__name__}") from None
+
+    @staticmethod
+    def _observation_timestamp(value: Any, received_at: datetime) -> tuple[datetime | None, str | None]:
+        """Parse only aware RFC3339 metadata; never substitute a local clock."""
+        if value is None:
+            return None, "easee_observation_timestamp_missing"
+        if (type(value) is not str or re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+                r"(?:\.[0-9]{1,9})?(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])", value) is None
+                or value.endswith("-00:00")):
+            return None, "easee_observation_timestamp_invalid"
+        try:
+            # ISO parsers may normalize forms such as 24:00 differently across
+            # Python versions. Validate the original civil components first;
+            # no normalization may turn malformed metadata into time credit.
+            datetime(int(value[0:4]), int(value[5:7]), int(value[8:10]),
+                     int(value[11:13]), int(value[14:16]), int(value[17:19]))
+            stamp = datetime.fromisoformat(
+                value[:-1] + "+00:00" if value[-1:] in {"Z", "z"} else value
+            ).astimezone(timezone.utc)
+            if (stamp - received_at).total_seconds() > OBSERVATION_FUTURE_TOLERANCE_SECONDS:
+                return None, "easee_observation_timestamp_future"
+        except (ValueError, TypeError, OverflowError):
+            return None, "easee_observation_timestamp_invalid"
+        return stamp, None
 
     @staticmethod
     def _snapshot_number(value: Any, error_code: str, *, integer: bool = False) -> float:
