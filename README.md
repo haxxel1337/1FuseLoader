@@ -90,7 +90,7 @@ cached readback and reported physical current. Offline process tests cover
 transport ordering separately from physical EV response; actual charging must
 still be verified under supervision after activation.
 
-### Bounded lower-current trial (unreleased)
+### Bounded lower-current trial (b18)
 
 The separate **Bounded lower-current trial after overload lockout** option is
 off by default. It requires the experimental profile to be enabled. When an

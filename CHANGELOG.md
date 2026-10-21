@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0b18
 
 - Add an explicit default-off, sample-aged lower-current response trial for
   charging sessions blocked by an old experimental timeout or spent budget.
