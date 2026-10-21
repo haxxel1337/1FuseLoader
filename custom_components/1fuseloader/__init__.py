@@ -950,7 +950,7 @@ class OneFuseLoaderController:
         started = self._utc_time(accepted.get("started_at_utc")) if accepted else None
         fresh_ev = bool(inp.charger_current_trusted and (not require_new_current or (
                         started is not None and inp.charger_report_ts is not None
-                        and inp.charger_report_ts >= started.timestamp())))
+                        and inp.charger_report_ts > started.timestamp())))
         return dict(phases=reported if self.source_diagnostics.get("reported_circuit_available") else None,
                     after_submission=after, report_age=age,
                     ev_current=inp.charger_current if fresh_ev else None,
@@ -1112,11 +1112,18 @@ class OneFuseLoaderController:
                 return
             await self._async_tick_locked()
 
-    @staticmethod
-    def _input_revision(inp: RegulatorInput) -> tuple:
+    def _input_revision(self, inp: RegulatorInput) -> tuple:
+        def age_class(report: float | None) -> tuple | None:
+            if report is None or inp.wall_now_ts is None:
+                return None
+            age = inp.wall_now_ts - report
+            return (age < 0, age < -5,
+                    age <= self.settings.measurement_settle_seconds,
+                    age <= self.settings.max_sensor_age_seconds)
         return (inp.status, inp.grid_l1, inp.charger_current, inp.data_valid, inp.data_error,
                 inp.grid_report_ts, inp.charger_report_ts, inp.charger_snapshot_verified,
-                inp.charger_current_trusted, inp.control_source_id)
+                inp.charger_current_trusted, inp.control_source_id,
+                age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
     async def _async_tick_locked(self) -> None:
         generation = self._generation
@@ -1183,9 +1190,9 @@ class OneFuseLoaderController:
                 self._budget_retry_at = 0.0
         if self._stopped or generation != self._generation:
             return
-        if self.settings.overload_enabled and decision.current_p1 > 0 and (
+        if decision.current_p1 > 0 and (
             self._budget_error or (
-                decision.mode.removeprefix("dry_run_").startswith("overload")
+                self.settings.overload_enabled and decision.mode.removeprefix("dry_run_").startswith("overload")
                 and (decision.overload_remaining_seconds < OVERLOAD_LEASE_RESERVE_SECONDS
                      or (self._overload_restore_receipt_floor is not None and (
                          inp.grid_report_ts is None or inp.charger_report_ts is None

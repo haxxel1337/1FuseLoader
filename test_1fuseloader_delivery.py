@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
@@ -242,6 +242,7 @@ class DispatchRaceTests(unittest.IsolatedAsyncioTestCase):
         self.fresh_control_reports()
         self.adapter.async_execute = Mock(side_effect=lambda _: asyncio.sleep(0, result=receipt()))
         await self.controller.async_tick()
+        self.states["sensor.car"].last_reported -= timedelta(seconds=1)
         inp = self.controller._read_input()  # EV=0 event is older than request.
         self.controller.source_diagnostics.update(reported_circuit_available=True,
             reported_circuit_p1=0, reported_circuit_p2=0, reported_circuit_p3=0)
@@ -322,6 +323,35 @@ class DispatchRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(timer.call_count, 1)
         self.assertGreater(timer.call_args.args[1], 0)
         self.assertLessEqual(timer.call_args.args[1], 3)
+
+    async def test_ev_age_crossing_checkpoint_invalidates_positive_dispatch(self):
+        original = self.controller._read_input()
+        before = replace(original, wall_now_ts=119.5, grid_report_ts=119.5, charger_report_ts=0)
+        after = replace(before, wall_now_ts=121.5)
+        positive = self.controller.regulator.evaluate(original)
+        positive = replace(positive, command="set_limit", current_p1=12, should_call_service=True)
+        with patch.object(self.controller, "_read_input", side_effect=[before, after]), \
+                patch.object(self.controller.regulator, "evaluate", return_value=positive), \
+                patch.object(self.controller, "_handle_source_change"):
+            await self.controller.async_tick()
+        self.assertEqual(self.adapter.calls, [])
+        self.assertEqual(self.controller.last_decision.mode, "waiting_for_latest_sources")
+
+    async def test_failed_alignment_checkpoint_blocks_positive_with_overload_off(self):
+        self.entry.options.update(nominal_import_only_fallback=True, overload_enabled=False)
+        self.controller._reload_settings_locked()
+        self.controller._configured_control_identity = lambda: "same-configured-source"
+        self.states["sensor.grid"].state = "21.7"
+        self.states["sensor.car"].state = "16.2"
+        self.fresh_control_reports()
+        await self.controller.async_tick()
+        self.assertEqual(self.adapter.calls[-1].current_p1, 16)
+        self.controller._budget_store.store.failure = True
+        self.states["sensor.grid"].state = "2.4"
+        self.states["sensor.grid"].last_reported = datetime.now(timezone.utc)
+        await self.controller.async_tick()
+        self.assertEqual(self.adapter.calls[-1].current_p1, 0)
+        self.assertNotIn(7, [d.current_p1 for d in self.adapter.calls])
 
 
 if __name__ == "__main__":
