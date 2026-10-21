@@ -273,11 +273,21 @@ class DispatchRaceTests(unittest.IsolatedAsyncioTestCase):
     async def test_native_connection_rebind_requires_new_protection_not_old_ack(self):
         self.adapter.control_identity = (1,)
         self.controller._sync_command_identity()
-        self.controller._delivery.begin("set_limit", (7, 0, 0), self.hass.loop.time())
+        self.controller._delivery.begin("set_limit", (0, 0, 0), self.hass.loop.time())
         self.adapter.control_identity = (2,)
         self.controller._sync_command_identity()
         self.assertTrue(self.controller._protective_zero_pending)
         self.assertIsNone(self.controller._delivery.latest)
+
+    async def test_settled_positive_history_alone_does_not_create_reconnect_stop(self):
+        self.adapter.control_identity = (1,)
+        self.controller._sync_command_identity()
+        record = self.controller._delivery.begin("set_limit", (16, 0, 0), self.hass.loop.time())
+        self.controller._delivery.accepted(record, receipt(), self.hass.loop.time())
+        self.controller._delivery.delivery(event(), self.hass.loop.time())
+        self.adapter.control_identity = (2,)
+        self.controller._sync_command_identity()
+        self.assertFalse(self.controller._protective_zero_pending)
 
     async def test_experimental_envelope_does_not_preempt_at_ordinary_25a_crossing(self):
         self.entry.options.update(overload_enabled=True)

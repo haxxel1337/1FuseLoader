@@ -921,7 +921,9 @@ class OneFuseLoaderController:
     def _sync_command_identity(self) -> None:
         identity = getattr(self._adapter, "control_identity", None)
         if identity != self._control_identity:
-            if self._control_identity is not None and self._delivery.records:
+            latest = self._delivery.latest
+            if self._control_identity is not None and (self._delivery.unresolved_correlated_zero or (
+                    latest is not None and latest.phases == (0, 0, 0))):
                 self._protective_zero_pending = True
             self._delivery.reset()
             self._control_identity = identity
