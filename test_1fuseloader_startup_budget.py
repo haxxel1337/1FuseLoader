@@ -46,6 +46,12 @@ class StartupBudgetTests(unittest.IsolatedAsyncioTestCase):
                 "version": 1, "used_seconds": 120.0,
                 "exposure_active": False, "transition_pending": False,
                 "minimum_held": False, "failure_reason": None,
+                "normal_control": {
+                    "version": 1, "response_pending": False, "cap": None,
+                    "previous_offer": None, "stops": 0, "stop_recorded": False,
+                    "restart": False, "retry_wait_seconds": 0.0,
+                    "response_failure": None, "retry_submission_pending": False,
+                },
                 **state_changes,
             },
         }
@@ -113,6 +119,7 @@ class StartupBudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.controller._budget_store.store.data, original)
             release.set()
             await self.controller._budget_store.async_wait_pending()
+
             await self.controller.async_tick()
             self.assertEqual(self.controller._budget_error, "overload_budget_restore_failed")
             self.assertTrue(all(d.current_p1 == 0 for d in self.adapter.calls))
@@ -122,6 +129,19 @@ class StartupBudgetTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await asyncio.gather(starting, return_exceptions=True)
             await self.controller._budget_store.async_wait_pending()
+
+    async def test_legacy_checkpoint_migrates_without_refunding_exposure(self):
+        original = self.envelope()
+        del original["regulator"]["normal_control"]
+        self.controller._budget_store.store.data = deepcopy(original)
+        await self.controller.async_start()
+        migrated = self.controller._budget_store.store.data["regulator"]
+        for key, value in original["regulator"].items():
+            self.assertEqual(migrated[key], value)
+        self.assertEqual(migrated["normal_control"]["stops"], 0)
+        self.assertFalse(migrated["normal_control"]["response_pending"])
+        self.assertTrue(self.controller._budget_store.state_is_durable(
+            self.controller.regulator.export_overload_state()))
 
     async def test_runtime_write_uses_short_deadline_and_blocks_before_positive_submission(self):
         self.states["sensor.grid"].state = "28"

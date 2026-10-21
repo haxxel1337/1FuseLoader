@@ -162,11 +162,13 @@ class OneFuseLoaderController:
             ledger_exists=budget_ledger_exists,
         )
         self._budget_loaded = False
+        self._normal_control_checkpoint_pending = False
         self._budget_error: str | None = None
         self._budget_error_type: str | None = None
         self._budget_retry_at = 0.0
         self._overload_restore_receipt_floor: float | None = None
         self._unsub_deadline = None
+        self._deadline_token: object | None = None
         if command_adapter is not None:
             self.control_block_reason = command_adapter.control_block_reason
 
@@ -242,10 +244,13 @@ class OneFuseLoaderController:
             self._stopped = False
             self._reload_settings_locked()
             if not self._budget_loaded:
+                restore_rejected = False
                 try:
                     saved = await asyncio.wait_for(self._budget_store.async_load(), INITIAL_EXPOSURE_LOAD_TIMEOUT_SECONDS)
                     if saved is not None:
+                        self._normal_control_checkpoint_pending = bool(saved.get("normal_control"))
                         if not self.regulator.import_overload_state(saved):
+                            restore_rejected = True
                             raise ValueError("Invalid restored exposure")
                         if saved.get("minimum_held"):
                             self._overload_restore_receipt_floor = datetime.now(timezone.utc).timestamp()
@@ -254,7 +259,11 @@ class OneFuseLoaderController:
                     self._budget_error_type = type(err).__name__
                     # An unknown older ledger must never be overwritten by a
                     # newly initialized zero allowance after a failed load.
-                    self.regulator.import_overload_state(None)
+                    # A rejected additive recovery checkpoint may already
+                    # have preserved valid older exposure and failure fields.
+                    # Do not replace those with a new synthetic allowance.
+                    if not restore_rejected:
+                        self.regulator.import_overload_state(None)
                     _LOGGER.warning("1FuseLoader exposure restore failed (%s)",
                                     self._budget_error_type, exc_info=True)
                 self._budget_loaded = True
@@ -1014,8 +1023,16 @@ class OneFuseLoaderController:
         if decision.current_refresh_required:
             self._request_current_snapshot()
         exposure = self.regulator.export_overload_state()
+        normal_control = exposure.get("normal_control", {})
+        normal_active = bool(normal_control.get("cap") is not None
+                             or normal_control.get("response_pending")
+                             or normal_control.get("stops")
+                             or normal_control.get("response_failure"))
+        if normal_active:
+            self._normal_control_checkpoint_pending = True
         if (self._budget_error != "overload_budget_restore_failed"
-                and (self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"])
+                and (self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"]
+                     or self._normal_control_checkpoint_pending)
                 and self.hass.loop.time() >= self._budget_retry_at):
             try:
                 await asyncio.wait_for(self._budget_store.async_save(exposure), EXPOSURE_STORE_TIMEOUT_SECONDS)
@@ -1029,6 +1046,7 @@ class OneFuseLoaderController:
                 _LOGGER.warning("1FuseLoader exposure save failed (%s); timed overload remains blocked",
                                 self._budget_error_type, exc_info=True)
             else:
+                self._normal_control_checkpoint_pending = normal_active
                 if self._budget_error == "overload_budget_save_failed":
                     # This tick was already evaluated conservatively with the
                     # storage fault. Only a subsequent fresh evaluation can
@@ -1050,6 +1068,8 @@ class OneFuseLoaderController:
                      )))
             )
         ):
+            if self.regulator.reject_submission(decision, self.hass.loop.time()):
+                self._handle_source_change(None)
             decision = replace(
                 decision, mode="overload_control_blocked",
                 reason=self._budget_error or "Overload requires a complete lease reserve and fresh post-restart reports.",
@@ -1071,6 +1091,8 @@ class OneFuseLoaderController:
         if self._adapter is not None:
             self.control_block_reason = self._adapter.control_block_reason
         if self.control_block_reason or self._adapter is None:
+            if self.regulator.reject_submission(decision, self.hass.loop.time()):
+                self._handle_source_change(None)
             self.last_service_result = "blocked"
             self.last_decision = replace(
                 decision, mode="control_blocked", reason=self.control_block_reason or "No verified command adapter.",
@@ -1080,6 +1102,32 @@ class OneFuseLoaderController:
             return
         positive_submission = decision.command == "resume" or (
             decision.command == "set_limit" and decision.current_p1 > 0)
+        response_deadline = decision.nominal_response_deadline_ts
+        if (positive_submission and response_deadline is not None
+                and self.hass.loop.time() >= response_deadline):
+            # Checkpoint verification may have consumed the entire window.
+            # Re-evaluate to record the failure before issuing protection;
+            # an old positive plan must never acquire a fresh dispatch window.
+            latest = self._read_input()
+            decision = self.regulator.evaluate(latest)
+            inp = latest
+            plan_source_diagnostics = dict(self.source_diagnostics)
+            exposure = self.regulator.export_overload_state()
+            if decision.current_p1 > 0 or decision.command == "resume":
+                decision = replace(
+                    decision, mode="normal_shedding_stop",
+                    reason="The fixed nominal response deadline expired before dispatch; requesting 0 A.",
+                    command="set_limit", current_p1=0, current_p2=0, current_p3=0,
+                    should_call_service=self.settings.active_control,
+                )
+            positive_submission = False
+            self.last_decision = decision
+            self._schedule_overload_deadline(decision)
+            self._handle_source_change(None)
+            if not decision.should_call_service or decision.command is None:
+                self.last_service_result = "not_sent"
+                self.notify()
+                return
         if positive_submission:
             # A checkpoint write above can yield to newer telemetry. Never
             # execute any stale positive offer, including a reduction or a
@@ -1090,6 +1138,7 @@ class OneFuseLoaderController:
                 if problem or self._budget_error:
                     latest = replace(latest, data_valid=False, data_error=self._budget_error or problem)
             if self._input_revision(latest) != self._input_revision(inp):
+                self.regulator.reject_submission(decision, self.hass.loop.time())
                 self.last_service_result = "not_sent"
                 self.last_decision = replace(
                     decision, mode="waiting_for_latest_sources",
@@ -1157,8 +1206,12 @@ class OneFuseLoaderController:
             self._stop_context_armed = False
         self.last_service_error = None
         try:
-            await asyncio.wait_for(self._adapter.async_execute(decision), ACTION_TIMEOUT_SECONDS)
+            action_timeout = ACTION_TIMEOUT_SECONDS
+            if positive_submission and response_deadline is not None:
+                action_timeout = min(action_timeout, max(0.001, response_deadline - self.hass.loop.time()))
+            await asyncio.wait_for(self._adapter.async_execute(decision), action_timeout)
         except Exception as err:
+            rejected_retry = self.regulator.reject_submission(decision, self.hass.loop.time())
             self.last_service_result = "error"
             self.last_service_error = type(err).__name__
             attempt.update(result="error", error=self.last_service_error)
@@ -1166,6 +1219,10 @@ class OneFuseLoaderController:
                 decision, reason=f"Command submission failed ({type(err).__name__}); charger state is unverified.",
             )
             _LOGGER.warning("1FuseLoader command submission failed (%s)", type(err).__name__)
+            if rejected_retry or (positive_submission and response_deadline is not None):
+                # Cancellation cannot establish whether the cloud applied a
+                # request. Re-evaluate rather than waiting for another report.
+                self._handle_source_change(None)
         else:
             self.regulator.acknowledge(decision, self.hass.loop.time())
             self.last_service_result = "submitted_unverified"
@@ -1195,7 +1252,8 @@ class OneFuseLoaderController:
                     problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
                     if problem or self._budget_error:
                         latest = replace(latest, data_valid=False, data_error=self._budget_error or problem)
-                if self._input_revision(latest) != self._input_revision(inp):
+                if (self._input_revision(latest) != self._input_revision(inp)
+                        or response_deadline is not None):
                     self._handle_source_change(None)
         if capture_stop and self.last_stop_context is not None:
             self.last_stop_context.update({
@@ -1270,6 +1328,7 @@ class OneFuseLoaderController:
         self._incident_journal_task = self.hass.async_create_task(save())
 
     def _schedule_overload_deadline(self, decision: Any, elapsed: float = 0.0) -> None:
+        self._deadline_token = None
         if self._unsub_deadline:
             self._unsub_deadline()
             self._unsub_deadline = None
@@ -1278,12 +1337,21 @@ class OneFuseLoaderController:
         delays = []
         if decision.overload_transition_remaining_seconds is not None:
             delays.append(decision.overload_transition_remaining_seconds)
+        if decision.current_p1 > 0 and decision.nominal_response_deadline_ts is not None:
+            # Absolute monotonic time includes source age and every await.
+            delays.append(decision.nominal_response_deadline_ts - self.hass.loop.time() + elapsed)
         if decision.mode.removeprefix("dry_run_").startswith("overload") and decision.current_p1 > 0:
             delays.append(decision.overload_remaining_seconds - OVERLOAD_LEASE_RESERVE_SECONDS)
         if not delays:
             return
+        token = self._deadline_token = object()
+        generation = self._generation
 
         async def deadline_tick(_now: datetime) -> None:
+            if (self._stopped or generation != self._generation
+                    or token is not self._deadline_token):
+                return
+            self._deadline_token = None
             # The event loop and remote command still have delivery latency;
             # this removes the avoidable five-second watchdog rounding only.
             self._handle_source_change(None)

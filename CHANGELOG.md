@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Add an explicit default-off, sample-aged lower-current response trial for
+  charging sessions blocked by an old experimental timeout or spent budget.
+  A live higher accepted cap can only be reduced; new post-acceptance EV and
+  later grid evidence must establish normal buffered operation.
+- Charge checkpoint and API latency to the fixed local response deadline.
+  Prevent stale positive dispatch, bound API waiting, and re-evaluate without
+  depending on another sensor report. Cloud delivery is still best effort.
+- Persist recovery caps, attempt counts and conservative backoff. An
+  interrupted response fails closed after restart. Bound telemetry-stop
+  recovery to startup current and two automatic retries, including the
+  old-latch rejection family. Preserve experimental usage and failure.
+- Add independent physical/transport and runtime race regressions. No fuse
+  cooling model, automatic budget reset or renewed 30-minute allowance is
+  introduced.
+
 ## 0.4.0b17
 
 - Preserve Easee observation timestamps independently of HTTP receipts. Reject
