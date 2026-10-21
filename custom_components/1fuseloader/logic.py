@@ -105,6 +105,9 @@ class RegulatorInput:
     # False for known invalid/conflicting current provenance. A valid unchanged
     # vendor event may remain a trusted cache state without fresh sample credit.
     charger_current_trusted: bool = True
+    # Stable configured source/device binding, never a measured value or clock.
+    # The optional identity opts a caller into the source-bound alignment path.
+    control_source_id: Optional[str | tuple] = None
 
 
 @dataclass(slots=True)
@@ -190,6 +193,9 @@ class OneFuseRegulator:
             raise ValueError("Enabled overload requires dynamic limiting and a separate transition ceiling")
         self.settings = settings
         self.reset_timers()
+        if getattr(self, "_low_grid_pending", False):
+            self._low_grid_failure = "settings_changed_during_alignment"
+            self._restart_required = True
         # An options change cannot extend an alignment deadline using old bounds.
         self._clear_positive_alignment()
 
@@ -205,12 +211,14 @@ class OneFuseRegulator:
     def reset(self) -> None:
         # Routine controller resets must not grant another overload budget.
         preserve_normal = None
-        if (getattr(self, "_normal_shed_deadline", None) is not None
+        if (getattr(self, "_low_grid_pending", False)
+                or getattr(self, "_normal_shed_deadline", None) is not None
                 or getattr(self, "_uncertainty_stops", 0) > 0) or (
                 getattr(self, "_uncertainty_ceiling", None) is not None
                 and getattr(self, "settings", None) is not None and self.settings.bounded_nominal_shedding):
             preserve_normal = {key: value for key, value in vars(self).items()
                                if key.startswith("_normal_shed_") or key.startswith("_uncertainty_")
+                               or key.startswith("_low_grid_")
                                or key == "_restored_normal_wait"}
         if getattr(self, "_overload_transition_started", None) is not None:
             self._fail_overload("interrupted_transition")
@@ -233,6 +241,9 @@ class OneFuseRegulator:
         self._last_input_charger_ts: Optional[float] = None
         self._last_input_wall_now_ts: Optional[float] = None
         self._last_input_current_trusted = True
+        self._last_input_control_source_id = None
+        self._accepted_control_source_id = None
+        self._accepted_control_ev_ts: Optional[float] = None
         self._last_input_now_ts: Optional[float] = None
         self._fast_recovery_wait: Optional[str] = None
         self._snapshot_aligned = False
@@ -248,6 +259,7 @@ class OneFuseRegulator:
         self._nominal_rejection_code: Optional[str] = None
         self._clear_measurement_uncertainty()
         self._clear_bounded_nominal_shedding()
+        self._clear_low_grid_alignment()
         self._clear_positive_alignment()
         if preserve_normal:
             for key, value in preserve_normal.items():
@@ -256,7 +268,145 @@ class OneFuseRegulator:
             # response attempt from an already running monotonic deadline.
             if self._normal_shed_deadline is not None:
                 self._normal_shed_failure = "controller_reset_during_response"
+            if self._low_grid_pending:
+                self._low_grid_failure = "controller_reset_during_alignment"
             self._restart_required = True
+
+    def _clear_low_grid_alignment(self) -> None:
+        self._low_grid_pending = False
+        self._low_grid_deadline: Optional[float] = None
+        self._low_grid_origin: Optional[float] = None
+        self._low_grid_cap: Optional[int] = None
+        self._low_grid_previous: Optional[int] = None
+        self._low_grid_source_id = None
+        self._low_grid_ev_floor: Optional[float] = None
+        self._low_grid_grid_floor: Optional[float] = None
+        self._low_grid_failure: Optional[str] = None
+        self._low_grid_attempt_at: Optional[float] = None
+
+    def _low_grid_alignment_plan(self, now: float, grid: float, current: float, status: str):
+        """A source-bound, only-decreasing offer under the explicit import model.
+
+        The whole offer fits beside RAW grid current. No reported EV current is
+        subtracted, and accepting the lower offer never renews this deadline.
+        A paired refresh is requested; a GET receipt alone is not completion.
+        """
+        s = self.settings
+        identity = self._last_input_control_source_id
+        numeric_conflict = (current > grid + 1
+                           or (self._positive_cap is not None and current > self._positive_cap + .5))
+        conflict = numeric_conflict or not self._fast_sources_fresh()
+        if not self._low_grid_pending and not (identity is not None and conflict and current >= 1):
+            return None
+        if (not self._low_grid_pending and self._low_grid_deadline is not None
+                and self._low_grid_failure is None and not numeric_conflict):
+            # A completed coherent episode is not reopened solely because an
+            # unchanged, healthy event-driven state later becomes old.
+            return None
+        # A completed episode retains its original window. A different accepted
+        # cap (not a same-value TTL ACK) is needed to establish new authority.
+        active = self._low_grid_pending
+        cap = self._low_grid_cap if self._low_grid_deadline is not None else self.startup_current
+
+        def stop(code: str):
+            self._low_grid_pending = False
+            self._low_grid_failure = code
+            self._uncertainty_ceiling = min(self._uncertainty_ceiling or cap, cap)
+            self._restart_required = True
+            self.reset_timers()
+            self._clear_positive_alignment()
+            self._awaiting_reduction_target = None
+            self._house_before_reduction = None
+            self._settle_started = None
+            self._clear_partial_reduction_alignment()
+            return ("low_grid_alignment_stop", f"Low-grid measurement alignment failed: {code}; requesting 0 A without changing experimental allowance.", 0, grid)
+
+        if self._low_grid_failure is not None:
+            return stop(self._low_grid_failure) if active else None
+        accepted = self.last_target[0] if self.last_target is not None else None
+        if not active and not (s.nominal_import_only_fallback and s.enable_dynamic_limit
+                and not self._restart_required and not self.paused_by_us
+                and status in START_ALLOWED_STATUSES and accepted is not None and accepted >= cap
+                and self._accepted_control_source_id == identity
+                and self._overload_transition_started is None and not self._overload_hold_active
+                and not (self._normal_shed_deadline is not None and self._normal_shed_failure is None)
+                and grid + cap <= s.main_fuse_amps - s.buffer_amps):
+            return None
+        wall, gt, et = self._last_input_wall_now_ts, self._last_input_grid_ts, self._last_input_charger_ts
+        previous = self._low_grid_previous if self._low_grid_deadline is not None else max(
+            accepted or 0, self._uncertainty_previous_offer or 0,
+            self._reduction_previous_cap or 0)
+        valid = bool(s.nominal_import_only_fallback and s.enable_dynamic_limit
+            and identity is not None and identity == self._accepted_control_source_id
+            and (self._low_grid_source_id is None or identity == self._low_grid_source_id)
+            and not self._restart_required and not self.paused_by_us
+            and status in START_ALLOWED_STATUSES and self._last_input_current_trusted
+            and self._overload_transition_started is None and not self._overload_hold_active
+            and self._overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
+            and accepted is not None and s.min_charge_amps <= cap <= accepted <= s.max_charge_amps
+            and self.last_set_limit_ts is not None and 0 <= now - self.last_set_limit_ts < self.last_target[3]
+            and wall is not None and gt is not None and et is not None
+            and _valid_number(s.max_sensor_age_seconds) is not None
+            and 0 <= wall - gt <= s.max_sensor_age_seconds and et <= wall + 2
+            and current <= min(s.max_charge_amps, previous) + .5
+            and grid + cap <= s.main_fuse_amps - s.buffer_amps)
+        if not valid:
+            return stop("source_control_or_raw_budget_invalid")
+        if self._low_grid_deadline is None:
+            configured = _valid_number(s.measurement_settle_seconds)
+            if configured is None or configured <= 0:
+                return stop("invalid_alignment_window")
+            window = min(10.0, configured, s.max_sensor_age_seconds)
+            self._low_grid_origin = now - (wall - gt)
+            self._low_grid_deadline = self._low_grid_origin + window
+            if self._positive_skew_since is not None:
+                positive_deadline = (self._positive_skew_since
+                    + min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+                    - self._positive_alignment_used_seconds)
+                self._low_grid_deadline = min(self._low_grid_deadline, positive_deadline)
+            if self._awaiting_reduction_target is not None and self._settle_started is not None:
+                self._low_grid_deadline = min(self._low_grid_deadline,
+                    now + self._reduction_alignment_remaining(now))
+            if self._reduction_guard_deadline is not None:
+                self._low_grid_deadline = min(self._low_grid_deadline, self._reduction_guard_deadline)
+            if self._nominal_shedding_started is not None:
+                self._low_grid_deadline = min(self._low_grid_deadline,
+                    self._nominal_shedding_started + (self._nominal_shedding_budget or 0.0))
+            self._low_grid_cap, self._low_grid_previous = cap, previous
+            self._low_grid_source_id = identity
+            # An EV-first event can itself start this episode. Pair that event
+            # with the later grid; do not demand an additional value-change
+            # event merely because the paired GET copied the same state.
+            self._low_grid_ev_floor = self._accepted_control_ev_ts
+            self._low_grid_grid_floor = gt
+            self._uncertainty_ceiling = min(self._uncertainty_ceiling or cap, cap)
+            self._uncertainty_previous_offer = max(self._uncertainty_previous_offer or 0, previous)
+        self._low_grid_pending = True
+        if now >= self._low_grid_deadline:
+            return stop("alignment_timeout")
+        if gt < self._low_grid_grid_floor:
+            return stop("grid_clock_regressed")
+        soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+        pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+        self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+        if s.enable_pause_resume and pause:
+            return stop("pause_guard")
+        if s.enable_soft_guard and soft and s.soft_current_amps < cap:
+            return stop("soft_guard")
+        self._increase_since = None
+        complete = bool(accepted == cap and self._low_grid_ev_floor is not None
+            and et > self._low_grid_ev_floor
+            and -2 <= wall - et <= s.max_sensor_age_seconds and gt > et
+            and gt > self._low_grid_grid_floor and current <= cap + .5 and current <= grid + 1)
+        if complete:
+            self._low_grid_pending = False
+            self._awaiting_reduction_target = None
+            self._house_before_reduction = None
+            self._settle_started = None
+            self._clear_partial_reduction_alignment()
+            self._clear_positive_alignment()
+            return ("low_grid_alignment_complete", "Accepted lower offer has an advanced trusted EV event and later coherent grid; experimental allowance is unchanged.", cap, grid)
+        return ("low_grid_alignment", "Holding only the conservative lower offer within the original raw-grid alignment window; paired current/status refresh requested, without EV subtraction or resume.", cap, grid)
 
     def _clear_bounded_nominal_shedding(self) -> None:
         self._normal_shed_origin: Optional[float] = None
@@ -1082,6 +1232,7 @@ class OneFuseRegulator:
             "normal_control": {
                 "version": 1,
                 "response_pending": self._normal_shed_deadline is not None and self._normal_shed_failure is None,
+                **({"alignment_pending": True} if self._low_grid_pending else {}),
                 "cap": self._uncertainty_ceiling,
                 "previous_offer": self._uncertainty_previous_offer,
                 "stops": self._uncertainty_stops,
@@ -1131,6 +1282,7 @@ class OneFuseRegulator:
             wait = _valid_number(normal.get("retry_wait_seconds")) if isinstance(normal, dict) else None
             valid_normal = bool(isinstance(normal, dict) and normal.get("version") == 1
                 and type(normal.get("response_pending")) is bool
+                and type(normal.get("alignment_pending", False)) is bool
                 and type(normal.get("stops")) is int and 0 <= normal["stops"] <= 3
                 and type(normal.get("stop_recorded")) is bool and type(normal.get("restart")) is bool
                 and type(normal.get("retry_submission_pending", False)) is bool
@@ -1139,11 +1291,14 @@ class OneFuseRegulator:
                      and 6 <= normal["previous_offer"] <= 32)
                 and wait is not None and not isinstance(normal.get("retry_wait_seconds"), bool) and 0 <= wait <= 600
                 and (normal.get("response_failure") is None or isinstance(normal["response_failure"], str))
-                and (not (normal["response_pending"] or normal["stops"] or normal["restart"])
+                and (not (normal["response_pending"] or normal.get("alignment_pending", False)
+                          or normal["stops"] or normal["restart"])
                      or normal.get("cap") is not None)
                 and (not normal.get("retry_submission_pending", False)
-                     or normal["restart"] and normal["stops"] >= 1 and not normal["response_pending"]))
+                     or normal["restart"] and normal["stops"] >= 1 and not normal["response_pending"]
+                     and not normal.get("alignment_pending", False)))
             self._clear_bounded_nominal_shedding()
+            self._clear_low_grid_alignment()
             if not valid_normal:
                 self._uncertainty_ceiling = self.startup_current
                 self._uncertainty_stops = 3
@@ -1159,8 +1314,9 @@ class OneFuseRegulator:
             self._normal_shed_failure = normal["response_failure"]
             self._restored_normal_wait = wait
             self._uncertainty_retry_submission_pending = False
-            if normal["response_pending"] or normal.get("retry_submission_pending", False):
+            if normal["response_pending"] or normal.get("alignment_pending", False) or normal.get("retry_submission_pending", False):
                 self._normal_shed_failure = ("interrupted_positive_retry" if normal.get("retry_submission_pending", False)
+                                             else "interrupted_low_grid_alignment" if normal.get("alignment_pending", False)
                                              else "interrupted_normal_response")
                 if normal.get("retry_submission_pending", False) or not self._uncertainty_stop_recorded:
                     self._uncertainty_stops = min(3, self._uncertainty_stops + 1)
@@ -1355,8 +1511,9 @@ class OneFuseRegulator:
             self._restart_required = True
             self._normal_shed_failure = "obsolete_positive_retry_reply"
             return
-        if (decision.mode == "normal_shedding" and decision.current_p1 > 0
-                and (self._normal_shed_failure is not None
+        if (decision.mode in {"normal_shedding", "low_grid_alignment"} and decision.current_p1 > 0
+                and ((self._normal_shed_failure is not None if decision.mode == "normal_shedding"
+                      else self._low_grid_failure is not None)
                      or decision.nominal_response_deadline_ts is None
                      or isinstance(now_ts, bool) or _valid_number(now_ts) is None
                      or now_ts >= decision.nominal_response_deadline_ts)):
@@ -1378,6 +1535,12 @@ class OneFuseRegulator:
             changed = old_target != target
             same_cap_restart = not changed and target > 0 and self._restart_required
             accepted_restart = target > 0 and self._restart_required
+            self._accepted_control_source_id = self._last_input_control_source_id
+            if changed or accepted_restart:
+                self._accepted_control_ev_ts = self._last_input_charger_ts
+            if (accepted_restart or (changed and target > 0 and self._low_grid_cap is not None
+                                     and target != self._low_grid_cap)):
+                self._clear_low_grid_alignment()
             positive_shedding_budget = None
             if (changed and target > 0 and old_target is not None and target < old_target
                     and self._positive_cap == old_target and self._positive_skew_since is not None):
@@ -1763,6 +1926,12 @@ class OneFuseRegulator:
         self._last_input_charger_ts = (None if isinstance(inp.charger_report_ts, bool) else _valid_number(inp.charger_report_ts))
         self._last_input_wall_now_ts = (None if isinstance(inp.wall_now_ts, bool) else _valid_number(inp.wall_now_ts))
         self._last_input_current_trusted = inp.charger_current_trusted is True
+        source_id = inp.control_source_id
+        self._last_input_control_source_id = source_id if (
+            isinstance(source_id, str) and bool(source_id.strip()) or
+            isinstance(source_id, tuple) and bool(source_id) and all(
+                isinstance(part, (str, int)) and not isinstance(part, bool) and part != ""
+                for part in source_id)) else None
         # Some protective branches retire their context before constructing
         # the zero decision. Retain only the cause, not any positive authority.
         measurement_conflict = bool(grid is not None and current is not None
@@ -1868,10 +2037,13 @@ class OneFuseRegulator:
                 measurement_uncertainty_stops=self._uncertainty_stops,
                 measurement_recovery_wait_seconds=(max(0.0, self._uncertainty_retry_after - now)
                     if self._uncertainty_retry_after is not None else 0.0),
-                nominal_response_remaining_seconds=(max(0.0, self._normal_shed_deadline - now)
+                nominal_response_remaining_seconds=(max(0.0, self._low_grid_deadline - now)
+                    if self._low_grid_pending and self._low_grid_failure is None else
+                    max(0.0, self._normal_shed_deadline - now)
                     if self._normal_shed_deadline is not None and self._normal_shed_failure is None else None),
-                nominal_response_deadline_ts=(self._normal_shed_deadline
-                    if self._normal_shed_failure is None else None),
+                nominal_response_deadline_ts=(self._low_grid_deadline
+                    if self._low_grid_pending and self._low_grid_failure is None else
+                    self._normal_shed_deadline if self._normal_shed_failure is None else None),
                 recovery_submission_ts=recovery_submission_ts,
             )
 
@@ -1887,6 +2059,13 @@ class OneFuseRegulator:
         if not self._observe_overload_time(observed_now, grid, not bool(error)):
             error = "Controller time is invalid or moved backwards."
         if error:
+            if self._low_grid_pending:
+                self._low_grid_failure = "source_invalid"
+                self._low_grid_pending = False
+                self._awaiting_reduction_target = None
+                self._house_before_reduction = None
+                self._settle_started = None
+                self._clear_partial_reduction_alignment()
             if self._normal_shed_deadline is not None and self._normal_shed_failure is None:
                 self._normal_shed_failure = "source_invalid"
             if s.overload_enabled and (self._overload_transition_started is not None or self._overload_hold_active):
@@ -1919,10 +2098,25 @@ class OneFuseRegulator:
             self._waiting_for_vehicle_since = None
             self._clear_measurement_uncertainty()
             self._clear_bounded_nominal_shedding()
+            self._clear_low_grid_alignment()
             return decision("idle", f"Status '{status}' does not require charge control.")
 
         assert grid is not None
         assert current is not None
+        low_grid_plan = self._low_grid_alignment_plan(now, grid, current, status)
+        if low_grid_plan is not None:
+            mode, reason, cap, house = low_grid_plan
+            available, _ = self.calculate_available_l1(grid, 0.0)
+            house_basis = "verified_import_only_low_grid_bound"
+            refresh_required = mode == "low_grid_alignment"
+            result = decision(mode, reason, "set_limit", cap, emergency=True)
+            if mode == "low_grid_alignment" and result.should_call_service:
+                if (self._low_grid_attempt_at is not None
+                        and now - self._low_grid_attempt_at < s.min_seconds_between_actions):
+                    result.should_call_service = False
+                elif not result.dry_run:
+                    self._low_grid_attempt_at = now
+            return result
         bounded_plan = self._bounded_normal_shedding_plan(now, grid, current, house, status)
         if bounded_plan is not None:
             mode, reason, command, cap, house, ttl = bounded_plan

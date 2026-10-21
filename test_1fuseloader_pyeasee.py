@@ -1,7 +1,7 @@
 """Offline contract tests against the real, pinned pyeasee implementation.
 
 Only the HTTP transport's get/post methods are replaced. Site, Circuit, Charger and
-their public methods are real pyeasee 0.8.17 objects. No credentials, HA instance
+their public methods are real audited pyeasee objects. No credentials, HA instance
 or network connection are used. Optional locally; CI sets
 ONEFUSE_REQUIRE_PYEASEE_CONTRACT=1 so a missing dependency is a failure.
 """
@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 import os
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
+from unittest.mock import patch
 
 REQUIRE_PYEASEE = os.environ.get("ONEFUSE_REQUIRE_PYEASEE_CONTRACT") == "1"
 
@@ -30,7 +32,7 @@ except ModuleNotFoundError as error:
     # an optional local skip. Only absence of pyeasee itself may be skipped.
     if error.name != "pyeasee" or REQUIRE_PYEASEE:
         raise RuntimeError(
-            "The required pyeasee 0.8.17 contract dependency could not be imported."
+            "The required audited pyeasee contract dependency could not be imported."
         ) from error
     PYEASEE_AVAILABLE = False
 else:
@@ -39,7 +41,7 @@ else:
 
 @unittest.skipUnless(
     PYEASEE_AVAILABLE,
-    "Optional local contract test: pyeasee 0.8.17 is not installed.",
+    "Optional local contract test: audited pyeasee is not installed.",
 )
 class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -74,7 +76,10 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         self.charger = self.circuit.get_chargers()[0]
 
     async def test_exact_target_version_and_real_ownership_links(self):
-        self.assertEqual(pyeasee.__version__, "0.8.17")
+        self.assertIn(pyeasee.__version__, {"0.8.17", "0.8.19"})
+        expected = os.environ.get("ONEFUSE_EXPECT_PYEASEE_VERSION")
+        if expected:
+            self.assertEqual(pyeasee.__version__, expected)
         self.assertIs(self.charger.circuit, self.circuit)
         self.assertIs(self.charger.site, self.site)
         self.assertIs(self.charger.easee, self.transport)
@@ -153,6 +158,9 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
             await self.circuit.set_dynamic_current(0, 0, 0, 1)
 
     async def test_raw_state_get_uses_public_endpoint_and_mapping_contract(self):
+        if pyeasee.__version__ == "0.8.19":
+            self.assertFalse(hasattr(self.charger, "get_state"))
+            return  # The audited new SDK removes this deprecated endpoint.
         state = await self.charger.get_state(raw=True)
         self.assertIsInstance(state, Mapping)
         self.assertEqual(state.get("inCurrentT2"), 0.012)
@@ -175,6 +183,7 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         fixture = adapter_tests.SnapshotAdapterTests(methodName="runTest")
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        sys.modules["pyeasee"].__version__ = pyeasee.__version__
         fixture.product.product = self.charger
         fixture.controller.get_chargers.return_value = [self.charger]
         fixture.device.identifiers = {("easee", self.charger.id)}
@@ -227,6 +236,9 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         self.transport.post.assert_not_awaited()
 
     async def test_default_state_converts_mode_while_raw_preserves_numeric_mode(self):
+        if pyeasee.__version__ == "0.8.19":
+            self.assertFalse(hasattr(self.charger, "get_state"))
+            return
         for mode, expected in ((0, "OFFLINE"), (4, "COMPLETED"), (5, "ERROR"), (106, "AWAITING_SCHEDULED_START"), (160, "ERROR_OVERCURRENT")):
             with self.subTest(mode=mode):
                 self.state_response.json.return_value = {
@@ -239,11 +251,17 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         self.transport.post.assert_not_awaited()
 
     async def test_raw_state_get_server_failure_returns_none(self):
+        if pyeasee.__version__ == "0.8.19":
+            self.assertFalse(hasattr(self.charger, "get_state"))
+            return
         self.transport.get.side_effect = ServerFailureException("offline test")
         self.assertIsNone(await self.charger.get_state(raw=True))
         self.transport.post.assert_not_awaited()
 
     async def test_raw_state_get_other_failures_and_cancellation_propagate(self):
+        if pyeasee.__version__ == "0.8.19":
+            self.assertFalse(hasattr(self.charger, "get_state"))
+            return
         for error in (BadRequestException({"title": "Offline contract failure"}), asyncio.CancelledError()):
             with self.subTest(error=type(error).__name__):
                 self.transport.get.side_effect = error
@@ -251,6 +269,58 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
                     await self.charger.get_state(raw=True)
                 self.assertIs(raised.exception, error)
         self.transport.post.assert_not_awaited()
+
+    async def test_real_sdk_queue_timeout_cancels_before_any_late_write(self):
+        # The twelve calls represent another user of the shared public SDK.
+        # Our local reserve cannot inspect/bypass that opaque SDK queue.
+        for _ in range(12):
+            await self.circuit.set_dynamic_current(16, 0, 0, 1)
+        import test_1fuseloader_adapter as adapter_tests
+        fixture = adapter_tests.AdapterTests(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        sys.modules["pyeasee"].__version__ = pyeasee.__version__
+        fixture.product.product = self.charger
+        fixture.controller.get_chargers.return_value = [self.charger]
+        fixture.device.identifiers = {("easee", self.charger.id)}
+        with patch.object(adapter_tests.adapter, "REQUEST_TIMEOUT_SECONDS", 0.02):
+            if pyeasee.__version__ == "0.8.19":
+                with self.assertRaisesRegex(adapter_tests.adapter.EaseeAdapterError, "TimeoutError"):
+                    await fixture.client.async_execute(adapter_tests.decision(amps=0))
+                self.assertEqual(self.transport.post.await_count, 12)
+                self.assertEqual(fixture.client._pending_requests, set())
+            else:
+                await fixture.client.async_execute(adapter_tests.decision(amps=0))
+                self.assertEqual(self.transport.post.await_count, 13)
+
+    async def test_actual_supported_signalr_on_adds_delivery_listener_without_replacing_native(self):
+        from pysignalr.client import SignalRClient
+        from pysignalr.messages import InvocationMessage
+        import test_1fuseloader_adapter as adapter_tests
+        fixture = adapter_tests.AdapterTests(methodName="runTest")
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        connection = SignalRClient("https://example.invalid/hub")
+        native = AsyncMock(return_value=None)
+        connection.on("CommandResponse", native)
+        native_update = AsyncMock(return_value=None)
+        connection.on("ProductUpdate", native_update)
+        fixture.charger.easee = SimpleNamespace(sr_connection=connection)
+        events = []
+        fixture.client.set_delivery_callback(events.append)
+        # Inject a decoded offline server frame into the actual SDK dispatcher.
+        message = InvocationMessage(None, "CommandResponse", [fixture.delivery()])
+        await connection._on_message(message)
+        native.assert_awaited_once()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].command_type, 22)
+        for phase in (1, 2, 3):
+            fixture.product.state[f"dynamicCircuitCurrentP{phase}"] = 0
+        await connection._on_message(InvocationMessage(None, "ProductUpdate", [
+            {"mid": fixture.charger.id, "id": 111, "dataType": 3, "value": "0.0"},
+        ]))
+        native_update.assert_awaited_once()
+        self.assertIsNotNone(fixture.client.reported_limit_receipts[0])
 
 
 if __name__ == "__main__":

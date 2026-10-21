@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.0b19
+
+- Correlate bounded HTTP receipts with exact Easee CommandResponse IDs, and
+  observe selected native circuit-limit events separately from cached reads.
+  Fence callbacks and late replies across connection/controller replacement.
+- Cancel superseded positive requests for new protective conditions, reserve
+  SDK rate capacity for protection, and confirm zero ordering before a new
+  offer. Suppress only a conservatively confirmed redundant zero; never renew
+  response, lease or overload accounting from diagnostic receipts.
+- Add a source-bound, fixed low-grid alignment window behind the existing
+  verified-import option. Reduce a live higher cap to 7 A when its entire
+  offer fits the normal raw-grid budget. Persist interrupted alignment and
+  retain the original deadline and existing bounded retry family.
+- Audit both pyeasee 0.8.17 and 0.8.19, including SDK throttling/cancellation,
+  and test both against Home Assistant 2026.10.1 and 2026.10.2. Coordinate the
+  native Easee update to upstream PR 701 for the transport-cookie fix.
+- Preserve spent experimental time and failure latches. Offline validation
+  does not establish physical charger response; normal-load verification
+  remains required after activation.
+
 ## 0.4.0b18
 
 - Add an explicit default-off, sample-aged lower-current response trial for
