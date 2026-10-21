@@ -344,6 +344,19 @@ class NormalSheddingTests(unittest.TestCase):
         self.assertFalse(r._uncertainty_retry_submission_pending)
         self.assertFalse(r._restart_required)
 
+    def test_protective_replacement_ack_is_not_an_obsolete_positive_reply(self):
+        r = self.pending()
+        self.sample(r, 50, 26.1, 16.2, et=-10)
+        self.sample(r, 51, 3, .023, status="awaiting_start")
+        retry = self.sample(r, 111, 3, .023, status="awaiting_start", accept=False)
+        r.reject_submission(retry, 112)
+        zero = replace(retry, mode="unavailable", current_p1=0)
+        r.acknowledge(zero, 113)
+        self.assertEqual(r._normal_shed_failure, "positive_retry_submission_failed")
+        pause = replace(retry, mode="pause", command="pause", current_p1=0)
+        r.acknowledge(pause, 114)
+        self.assertTrue(r.paused_by_us)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1342,7 +1342,8 @@ class OneFuseRegulator:
         """Commit bookkeeping after API submission succeeds, never before it."""
         if not decision.should_call_service or decision.dry_run or decision.command is None:
             return
-        if (decision.recovery_submission_ts is not None
+        if (decision.command == "set_limit" and decision.current_p1 > 0
+                and decision.recovery_submission_ts is not None
                 and (not self._uncertainty_retry_submission_pending
                      or decision.recovery_submission_ts != self._uncertainty_last_attempt)):
             # A reply from a different recovery attempt must not retire the
