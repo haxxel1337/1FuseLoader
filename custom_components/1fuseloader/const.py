@@ -48,6 +48,7 @@ OPT_ACTIVE_CONTROL = "active_control"
 OPT_DRY_RUN = "dry_run"
 OPT_FAST_RECOVERY = "fast_recovery"
 OPT_NOMINAL_IMPORT_ONLY_FALLBACK = "nominal_import_only_fallback"
+OPT_BOUNDED_NOMINAL_SHEDDING = "bounded_nominal_shedding"
 OPT_ENABLE_DYNAMIC_LIMIT = "enable_dynamic_limit"
 OPT_ENABLE_SOFT_GUARD = "enable_soft_guard"
 OPT_ENABLE_PAUSE_RESUME = "enable_pause_resume"
@@ -89,6 +90,8 @@ DEFAULT_OPTIONS = {
     # Requires an explicitly verified import-only, same-phase installation.
     # A delayed EV observation must not silently imply this topology.
     OPT_NOMINAL_IMPORT_ONLY_FALLBACK: False,
+    # Explicit local response trial, never a replenished overload allowance.
+    OPT_BOUNDED_NOMINAL_SHEDDING: False,
     OPT_ENABLE_DYNAMIC_LIMIT: True,
     OPT_ENABLE_SOFT_GUARD: True,
     OPT_ENABLE_PAUSE_RESUME: True,

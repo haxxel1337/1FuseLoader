@@ -46,6 +46,7 @@ class RegulatorSettings:
     fast_recovery: bool = True
     # Explicit installation assumption; never infer it from a GET receipt.
     nominal_import_only_fallback: bool = False
+    bounded_nominal_shedding: bool = False
     minimum_reserve_amps: float = 0.5
     increase_stable_seconds: int = 30
     increase_interval_seconds: int = 15
@@ -143,6 +144,9 @@ class RegulatorDecision:
     measurement_uncertainty_cap: Optional[int] = None
     measurement_uncertainty_stops: int = 0
     measurement_recovery_wait_seconds: float = 0.0
+    nominal_response_remaining_seconds: Optional[float] = None
+    nominal_response_deadline_ts: Optional[float] = None
+    recovery_submission_ts: Optional[float] = None
 
 
 class OneFuseRegulator:
@@ -167,6 +171,8 @@ class OneFuseRegulator:
             raise ValueError("Fast recovery must be a boolean")
         if type(settings.nominal_import_only_fallback) is not bool:
             raise ValueError("Nominal import-only fallback must be a boolean")
+        if type(settings.bounded_nominal_shedding) is not bool:
+            raise ValueError("Bounded nominal shedding must be a boolean")
         overload_values = (
             settings.overload_margin_amps, settings.overload_budget_seconds,
             settings.overload_transition_limit_amps, settings.overload_response_seconds,
@@ -198,6 +204,14 @@ class OneFuseRegulator:
 
     def reset(self) -> None:
         # Routine controller resets must not grant another overload budget.
+        preserve_normal = None
+        if (getattr(self, "_normal_shed_deadline", None) is not None
+                or getattr(self, "_uncertainty_stops", 0) > 0) or (
+                getattr(self, "_uncertainty_ceiling", None) is not None
+                and getattr(self, "settings", None) is not None and self.settings.bounded_nominal_shedding):
+            preserve_normal = {key: value for key, value in vars(self).items()
+                               if key.startswith("_normal_shed_") or key.startswith("_uncertainty_")
+                               or key == "_restored_normal_wait"}
         if getattr(self, "_overload_transition_started", None) is not None:
             self._fail_overload("interrupted_transition")
         self._clear_overload_transition()
@@ -233,7 +247,152 @@ class OneFuseRegulator:
         self._nominal_overload_blocked = False
         self._nominal_rejection_code: Optional[str] = None
         self._clear_measurement_uncertainty()
+        self._clear_bounded_nominal_shedding()
         self._clear_positive_alignment()
+        if preserve_normal:
+            for key, value in preserve_normal.items():
+                setattr(self, key, value)
+            # A routine reset cannot recreate positive ownership or a new
+            # response attempt from an already running monotonic deadline.
+            if self._normal_shed_deadline is not None:
+                self._normal_shed_failure = "controller_reset_during_response"
+            self._restart_required = True
+
+    def _clear_bounded_nominal_shedding(self) -> None:
+        self._normal_shed_origin: Optional[float] = None
+        self._normal_shed_deadline: Optional[float] = None
+        self._normal_shed_cap: Optional[int] = None
+        self._normal_shed_previous: Optional[int] = None
+        self._normal_shed_grid_floor: Optional[float] = None
+        self._normal_shed_ev_floor: Optional[float] = None
+        self._normal_shed_accepted_at: Optional[float] = None
+        self._normal_shed_response_ts: Optional[float] = None
+        self._normal_shed_attempt_at: Optional[float] = None
+        self._normal_shed_failure: Optional[str] = None
+
+    def _bounded_normal_shedding_plan(self, now: float, grid: float, current: float,
+                                      house: float, status: str):
+        """Reduce existing authority inside one sample-aged response window.
+
+        Entry credits no EV current. The old experimental failure/budget stay
+        intact. A new post-ACK EV event and later grid must prove nominal
+        response, unless the separate verified raw/import contract proves it.
+        """
+        s = self.settings
+        pending = self._normal_shed_deadline is not None and self._normal_shed_failure is None
+
+        def stop(code: str):
+            if self._uncertainty_ceiling is None and self.last_target is not None:
+                self._uncertainty_ceiling = min(self.last_target[0], self.startup_current)
+                self._uncertainty_previous_offer = self.last_target[0]
+            self._normal_shed_failure = code
+            self.reset_timers()
+            self._clear_positive_alignment()
+            self._restart_required = True
+            return ("normal_shedding_stop", f"Bounded nominal reduction failed: {code}; requesting 0 A. Experimental budget and failure remain unchanged.",
+                    "set_limit", 0, grid, s.normal_ttl_seconds)
+
+        if self._normal_shed_failure is not None:
+            return None
+        if not pending and not (s.bounded_nominal_shedding and s.overload_enabled
+                and s.enable_dynamic_limit and status == "charging" and current >= 1
+                and self._last_input_current_trusted and not self._restart_required
+                and not self.paused_by_us and self.last_target is not None
+                and self.last_target[0] > self.startup_current
+                and self._overload_transition_started is None and not self._overload_hold_active
+                and self._overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
+                and (self._overload_failure_reason is not None
+                     or self._overload_used_seconds >= s.overload_budget_seconds)
+                and grid > s.main_fuse_amps):
+            return None
+        wall, grid_ts, ev_ts = (self._last_input_wall_now_ts, self._last_input_grid_ts,
+                                self._last_input_charger_ts)
+        valid_source = bool(wall is not None and grid_ts is not None and ev_ts is not None
+            and self._last_input_now_ts is not None and self._last_input_current_trusted
+            and _valid_number(s.max_sensor_age_seconds) is not None
+            and 0 <= wall - grid_ts <= s.max_sensor_age_seconds and ev_ts <= wall + 2)
+        accepted = self.last_target[0] if self.last_target is not None else None
+        live_lease = bool(self.last_target is not None and self.last_set_limit_ts is not None
+                          and 0 <= now - self.last_set_limit_ts < self.last_target[3])
+        guards_valid = bool(s.bounded_nominal_shedding and s.overload_enabled and s.enable_dynamic_limit
+            and not self._restart_required and not self.paused_by_us and status == "charging"
+            and self._overload_transition_started is None and not self._overload_hold_active
+            and self._overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
+            and accepted is not None and s.min_charge_amps <= accepted <= s.max_charge_amps
+            and current >= 1 and current <= min(s.max_charge_amps,
+                self._normal_shed_previous if pending else accepted or 0) + .5)
+        if not pending:
+            # An invalid entry must not create new positive authority. The
+            # existing protective path still determines its zero diagnosis.
+            if grid > min(38, s.overload_transition_limit_amps):
+                return None
+            if not valid_source or not live_lease or not guards_valid:
+                return stop("source_or_prior_control_invalid")
+            age = wall - grid_ts
+            deadline = now - age + min(10, s.overload_response_seconds)
+            if deadline <= now:
+                return None
+            self._normal_shed_deadline = deadline
+            self._normal_shed_origin = now - age
+            self._normal_shed_cap = self.startup_current
+            self._normal_shed_previous = accepted
+            self._normal_shed_grid_floor = grid_ts
+            self._normal_shed_ev_floor = ev_ts
+            self._uncertainty_ceiling = min(self._uncertainty_ceiling or accepted, self.startup_current)
+            self._uncertainty_previous_offer = max(self._uncertainty_previous_offer or accepted, accepted)
+            pending = True
+        assert self._normal_shed_deadline is not None and self._normal_shed_cap is not None
+        if self._normal_shed_origin is not None:
+            self._normal_shed_deadline = min(self._normal_shed_deadline,
+                self._normal_shed_origin + min(10, s.overload_response_seconds))
+        cap = self._normal_shed_cap
+        if (not valid_source or not guards_valid or not live_lease
+                or not s.min_charge_amps <= cap <= s.max_charge_amps
+                or accepted not in {cap, self._normal_shed_previous}
+                or grid_ts < self._normal_shed_grid_floor):
+            return stop("source_or_control_invalid")
+        if grid > min(38, s.overload_transition_limit_amps):
+            return stop("raw_peak_exceeded")
+        if now >= self._normal_shed_deadline:
+            return stop("response_timeout")
+        soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+        pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+        self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+        if s.enable_pause_resume and pause:
+            self._normal_shed_failure = "pause_guard"
+            self._restart_required = True
+            return ("pause", "Pause guard overrides bounded nominal reduction.", "pause", 0, grid, s.normal_ttl_seconds)
+        if s.enable_soft_guard and soft and s.soft_current_amps < cap:
+            # A distinct stronger protection must not inherit a fresh grace.
+            return stop("soft_guard")
+        self._increase_since = None
+        if self._normal_shed_accepted_at is not None and accepted == cap:
+            response_valid = bool(self._normal_shed_ev_floor is not None
+                and ev_ts > self._normal_shed_ev_floor and -2 <= wall - ev_ts <= s.max_sensor_age_seconds
+                and 1 <= current <= cap + .5)
+            if response_valid:
+                if self._normal_shed_response_ts is None:
+                    self._normal_shed_response_ts = ev_ts
+            elif current > cap + .5:
+                self._normal_shed_response_ts = None
+            response = self._normal_shed_response_ts
+            ev_proof = bool(response is not None and response_valid and grid_ts > ev_ts
+                            and grid_ts > self._normal_shed_grid_floor and current <= grid + 1
+                            and grid - current + cap <= s.main_fuse_amps - s.buffer_amps)
+            raw_proof = bool(s.nominal_import_only_fallback and grid_ts > self._normal_shed_grid_floor
+                             and grid + cap <= s.main_fuse_amps - s.buffer_amps)
+            if ev_proof or raw_proof:
+                basis = max(0.0, grid - current) if ev_proof else grid
+                self._awaiting_reduction_target = None
+                self._house_before_reduction = None
+                self._settle_started = None
+                self._clear_partial_reduction_alignment()
+                self._clear_positive_alignment()
+                self._clear_bounded_nominal_shedding()
+                return ("normal_shedding_complete", "Lower accepted offer has fresh nominal response evidence; experimental allowance remains blocked.",
+                        "set_limit", cap, basis, s.normal_ttl_seconds)
+        return ("normal_shedding", "Requesting only a lower accepted offer inside the original sample-aged response deadline; no EV credit, increase, resume or new overload budget.",
+                "set_limit", cap, grid, s.normal_ttl_seconds)
 
     def _clear_measurement_uncertainty(self) -> None:
         """Only session/reset or sustained source recovery retires this mode."""
@@ -249,6 +408,8 @@ class OneFuseRegulator:
         self._uncertainty_restart = False
         self._uncertainty_last_attempt: Optional[float] = None
         self._uncertainty_last_attempt_cap: Optional[int] = None
+        self._uncertainty_retry_submission_pending = False
+        self._restored_normal_wait = 0.0
 
     def _record_uncertainty_stop(self, now: float) -> None:
         if self._uncertainty_ceiling is None or self._uncertainty_stop_recorded:
@@ -918,6 +1079,20 @@ class OneFuseRegulator:
             "transition_pending": self._overload_transition_started is not None,
             "minimum_held": self._overload_hold_active,
             "failure_reason": self._overload_failure_reason,
+            "normal_control": {
+                "version": 1,
+                "response_pending": self._normal_shed_deadline is not None and self._normal_shed_failure is None,
+                "cap": self._uncertainty_ceiling,
+                "previous_offer": self._uncertainty_previous_offer,
+                "stops": self._uncertainty_stops,
+                "stop_recorded": self._uncertainty_stop_recorded,
+                "restart": self._uncertainty_restart,
+                "retry_wait_seconds": min(600, max(self._restored_normal_wait,
+                    max(0.0, self._uncertainty_retry_after - (self._last_input_now_ts or 0.0))
+                    if self._uncertainty_retry_after is not None else 0.0)),
+                "response_failure": self._normal_shed_failure,
+                "retry_submission_pending": self._uncertainty_retry_submission_pending,
+            },
         }
 
     def import_overload_state(self, state: object, elapsed_seconds: float = 0.0) -> bool:
@@ -951,6 +1126,50 @@ class OneFuseRegulator:
         self._overload_failure_reason = state.get("failure_reason")
         if state["transition_pending"]:
             self._fail_overload("interrupted_transition")
+        normal = state.get("normal_control")
+        if normal is not None:
+            wait = _valid_number(normal.get("retry_wait_seconds")) if isinstance(normal, dict) else None
+            valid_normal = bool(isinstance(normal, dict) and normal.get("version") == 1
+                and type(normal.get("response_pending")) is bool
+                and type(normal.get("stops")) is int and 0 <= normal["stops"] <= 3
+                and type(normal.get("stop_recorded")) is bool and type(normal.get("restart")) is bool
+                and type(normal.get("retry_submission_pending", False)) is bool
+                and (normal.get("cap") is None or type(normal["cap"]) is int and 6 <= normal["cap"] <= 32)
+                and (normal.get("previous_offer") is None or type(normal["previous_offer"]) is int
+                     and 6 <= normal["previous_offer"] <= 32)
+                and wait is not None and not isinstance(normal.get("retry_wait_seconds"), bool) and 0 <= wait <= 600
+                and (normal.get("response_failure") is None or isinstance(normal["response_failure"], str))
+                and (not (normal["response_pending"] or normal["stops"] or normal["restart"])
+                     or normal.get("cap") is not None)
+                and (not normal.get("retry_submission_pending", False)
+                     or normal["restart"] and normal["stops"] >= 1 and not normal["response_pending"]))
+            self._clear_bounded_nominal_shedding()
+            if not valid_normal:
+                self._uncertainty_ceiling = self.startup_current
+                self._uncertainty_stops = 3
+                self._uncertainty_restart = self._uncertainty_stop_recorded = True
+                self._normal_shed_failure = "invalid_persisted_normal_control"
+                self._restart_required = True
+                return False
+            self._uncertainty_ceiling = normal["cap"]
+            self._uncertainty_previous_offer = normal["previous_offer"]
+            self._uncertainty_stops = normal["stops"]
+            self._uncertainty_stop_recorded = normal["stop_recorded"]
+            self._uncertainty_restart = normal["restart"]
+            self._normal_shed_failure = normal["response_failure"]
+            self._restored_normal_wait = wait
+            self._uncertainty_retry_submission_pending = False
+            if normal["response_pending"] or normal.get("retry_submission_pending", False):
+                self._normal_shed_failure = ("interrupted_positive_retry" if normal.get("retry_submission_pending", False)
+                                             else "interrupted_normal_response")
+                if normal.get("retry_submission_pending", False) or not self._uncertainty_stop_recorded:
+                    self._uncertainty_stops = min(3, self._uncertainty_stops + 1)
+                self._uncertainty_stop_recorded = True
+                self._uncertainty_restart = True
+                self._restored_normal_wait = max(wait, min(600,
+                    self.settings.restart_stable_seconds * 2 ** min(self._uncertainty_stops - 1, 3)))
+            if self._uncertainty_ceiling is not None:
+                self._restart_required = True
         return True
 
     def _observe_overload_time(self, now: Optional[float], grid: Optional[float], valid: bool) -> bool:
@@ -1091,9 +1310,65 @@ class OneFuseRegulator:
         return ("overload_shedding", "Requesting minimum current; a bounded transition starts now, including API latency.",
                 s.min_charge_amps, house)
 
+    def reject_submission(self, decision: RegulatorDecision, now_ts: float) -> bool:
+        """Debit a failed/aborted reserved recovery without inventing an ACK.
+
+        The controller calls this for a failed, ambiguous or aborted positive
+        retry. Without any outcome, its single-flight reservation stays closed.
+        The PRE checkpoint already makes a crash at either point conservative.
+        """
+        if (not self._uncertainty_retry_submission_pending or not self._uncertainty_restart
+                or decision.command != "set_limit" or decision.current_p1 <= 0
+                or decision.recovery_submission_ts is None
+                or decision.recovery_submission_ts != self._uncertainty_last_attempt):
+            return False
+        now = None if isinstance(now_ts, bool) else _valid_number(now_ts)
+        self._uncertainty_retry_submission_pending = False
+        self._uncertainty_stops = min(3, self._uncertainty_stops + 1)
+        self._uncertainty_stop_recorded = True
+        self._uncertainty_recovery_since = None
+        self._uncertainty_recovery_epochs = 0
+        self._normal_shed_failure = "positive_retry_submission_failed"
+        if now is None:
+            self._uncertainty_stops = 3
+        else:
+            self._uncertainty_retry_after = now + min(600,
+                self.settings.restart_stable_seconds * 2 ** min(self._uncertainty_stops - 1, 3))
+        self._restart_required = True
+        self._restart_ready_since = None
+        return True
+
     def acknowledge(self, decision: RegulatorDecision, now_ts: float) -> None:
         """Commit bookkeeping after API submission succeeds, never before it."""
         if not decision.should_call_service or decision.dry_run or decision.command is None:
+            return
+        if (decision.command == "set_limit" and decision.current_p1 > 0
+                and decision.recovery_submission_ts is not None
+                and (not self._uncertainty_retry_submission_pending
+                     or decision.recovery_submission_ts != self._uncertainty_last_attempt)):
+            # A reply from a different recovery attempt must not retire the
+            # current reservation or bypass its terminal restart requirement.
+            self.last_action_ts = self.last_set_limit_ts = now_ts
+            self.last_command = "set_limit"
+            self.last_target = (decision.current_p1, decision.current_p2,
+                                decision.current_p3, decision.ttl_seconds)
+            self._restart_required = True
+            self._normal_shed_failure = "obsolete_positive_retry_reply"
+            return
+        if (decision.mode == "normal_shedding" and decision.current_p1 > 0
+                and (self._normal_shed_failure is not None
+                     or decision.nominal_response_deadline_ts is None
+                     or isinstance(now_ts, bool) or _valid_number(now_ts) is None
+                     or now_ts >= decision.nominal_response_deadline_ts)):
+            # A late reply to an OLD reduction is not a qualified restart.
+            # Record the accepted lease truthfully, but preserve the terminal
+            # zero/restart requirement even if that zero's HTTP call failed.
+            self.last_action_ts = self.last_set_limit_ts = now_ts
+            self.last_command = "set_limit"
+            self.last_target = (decision.current_p1, decision.current_p2,
+                                decision.current_p3, decision.ttl_seconds)
+            self._normal_shed_failure = "ack_after_deadline_or_terminal_stop"
+            self._restart_required = True
             return
         self.last_action_ts = now_ts
         self.last_command = decision.command
@@ -1102,6 +1377,7 @@ class OneFuseRegulator:
             target = decision.current_p1
             changed = old_target != target
             same_cap_restart = not changed and target > 0 and self._restart_required
+            accepted_restart = target > 0 and self._restart_required
             positive_shedding_budget = None
             if (changed and target > 0 and old_target is not None and target < old_target
                     and self._positive_cap == old_target and self._positive_skew_since is not None):
@@ -1262,6 +1538,26 @@ class OneFuseRegulator:
                 self._uncertainty_restart = False
                 self._uncertainty_stop_recorded = False
                 self._uncertainty_last_attempt = self._uncertainty_last_attempt_cap = None
+                self._uncertainty_retry_submission_pending = False
+            if accepted_restart:
+                self._clear_bounded_nominal_shedding()
+            elif (self._normal_shed_deadline is not None and self._normal_shed_failure is None
+                    and self._normal_shed_accepted_at is None and decision.mode == "normal_shedding"
+                    and target == self._normal_shed_cap):
+                accepted_now = None if isinstance(now_ts, bool) else _valid_number(now_ts)
+                if accepted_now is None or accepted_now >= self._normal_shed_deadline:
+                    self._normal_shed_failure = "ack_after_deadline"
+                    self._restart_required = True
+                else:
+                    self._normal_shed_accepted_at = accepted_now
+                    # A local HTTP receipt is not an EV source event. Only a
+                    # later event can prove the physical lower-current state.
+                    if (self._last_input_wall_now_ts is not None and self._last_input_now_ts is not None
+                            and accepted_now >= self._last_input_now_ts):
+                        self._normal_shed_ev_floor = max(self._normal_shed_ev_floor or 0.0,
+                            self._last_input_wall_now_ts + accepted_now - self._last_input_now_ts)
+                    else:
+                        self._normal_shed_ev_floor = None
             self.last_set_limit_ts = now_ts
             self.last_target = (
                 decision.current_p1, decision.current_p2, decision.current_p3, decision.ttl_seconds
@@ -1450,6 +1746,9 @@ class OneFuseRegulator:
         observed_now = _valid_number(inp.now_ts)
         now = observed_now if observed_now is not None else 0.0
         self._last_input_now_ts = None if isinstance(inp.now_ts, bool) else observed_now
+        if self._restored_normal_wait > 0 and self._last_input_now_ts is not None:
+            self._uncertainty_retry_after = now + self._restored_normal_wait
+            self._restored_normal_wait = 0.0
         status = (inp.status or "").strip().lower()
         self._fast_recovery_wait = None
         self._nominal_overload_blocked = False
@@ -1480,12 +1779,15 @@ class OneFuseRegulator:
 
         def decision(mode: str, reason: str, command: str | None = None,
                      target: int = 0, ttl: int | None = None, emergency: bool = False) -> RegulatorDecision:
+            family_rejection = bool(s.bounded_nominal_shedding and mode == "overload_stop"
+                and self._nominal_rejection_code in {"charger_receipt_stale", "report_skew_exceeds_alignment_window",
+                                                     "not_meaningfully_charging"})
             if (command == "set_limit" and target == 0 and mode in {"unavailable", "overload_stop"}
                     and self._uncertainty_ceiling is None and self.last_target is not None
                     and self.last_target[0] > 0 and inp.data_valid and not inp.data_error
                     and status == "charging" and grid is not None and current is not None
                     and current <= s.max_charge_amps + 0.5
-                    and measurement_conflict):
+                    and (measurement_conflict or family_rejection)):
                 self._uncertainty_ceiling = min(self.last_target[0], s.max_charge_amps)
                 self._uncertainty_previous_offer = self.last_target[0]
             if self._uncertainty_ceiling is not None and command in {"set_limit", "resume"}:
@@ -1496,7 +1798,7 @@ class OneFuseRegulator:
                     self._record_uncertainty_stop(now)
                     if self._uncertainty_stops >= 3:
                         mode = "measurement_recovery_blocked"
-                        reason += " Repeated measurement recovery failed; needs attention. Reconnect or explicitly reset controller state after diagnosis."
+                        reason += " Repeated measurement recovery failed; needs attention. Reconnect after diagnosis; reload/reset does not grant new attempts."
             ttl_value = s.normal_ttl_seconds if ttl is None else ttl
             should_call = s.active_control and command is not None
             if command == "set_limit":
@@ -1508,6 +1810,23 @@ class OneFuseRegulator:
                 should_call = should_call and (emergency or reduction or change_allowed)
             else:
                 should_call = should_call and ((emergency and command == "pause") or self._action_allowed(now))
+            recovery_submission_ts = None
+            if (self._uncertainty_restart and command == "set_limit" and target > 0 and should_call):
+                if self._uncertainty_retry_submission_pending:
+                    should_call = False
+                    mode = "waiting_for_command_result"
+                    reason = "A positive recovery submission has no verified outcome; no second retry is permitted."
+                elif (self._uncertainty_last_attempt is not None
+                        and now - self._uncertainty_last_attempt < s.min_seconds_between_actions):
+                    should_call = False
+                elif not s.dry_run:
+                    # Reserved BEFORE the controller's durable precommand
+                    # checkpoint. An ambiguous ACK/crash must spend an attempt
+                    # on restore, rather than replaying the same retry forever.
+                    self._uncertainty_retry_submission_pending = True
+                    self._uncertainty_last_attempt = now
+                    self._uncertainty_last_attempt_cap = target
+                    recovery_submission_ts = now
             return RegulatorDecision(
                 mode=f"dry_run_{mode}" if s.dry_run and mode not in {"idle", "unavailable"} else mode,
                 reason=reason, command=command,
@@ -1549,6 +1868,11 @@ class OneFuseRegulator:
                 measurement_uncertainty_stops=self._uncertainty_stops,
                 measurement_recovery_wait_seconds=(max(0.0, self._uncertainty_retry_after - now)
                     if self._uncertainty_retry_after is not None else 0.0),
+                nominal_response_remaining_seconds=(max(0.0, self._normal_shed_deadline - now)
+                    if self._normal_shed_deadline is not None and self._normal_shed_failure is None else None),
+                nominal_response_deadline_ts=(self._normal_shed_deadline
+                    if self._normal_shed_failure is None else None),
+                recovery_submission_ts=recovery_submission_ts,
             )
 
         error = inp.data_error
@@ -1563,6 +1887,8 @@ class OneFuseRegulator:
         if not self._observe_overload_time(observed_now, grid, not bool(error)):
             error = "Controller time is invalid or moved backwards."
         if error:
+            if self._normal_shed_deadline is not None and self._normal_shed_failure is None:
+                self._normal_shed_failure = "source_invalid"
             if s.overload_enabled and (self._overload_transition_started is not None or self._overload_hold_active):
                 self._fail_overload("invalid_telemetry_during_overload")
                 self._clear_overload_transition()
@@ -1592,10 +1918,25 @@ class OneFuseRegulator:
             self._clear_positive_alignment()
             self._waiting_for_vehicle_since = None
             self._clear_measurement_uncertainty()
+            self._clear_bounded_nominal_shedding()
             return decision("idle", f"Status '{status}' does not require charge control.")
 
         assert grid is not None
         assert current is not None
+        bounded_plan = self._bounded_normal_shedding_plan(now, grid, current, house, status)
+        if bounded_plan is not None:
+            mode, reason, command, cap, house, ttl = bounded_plan
+            house_basis = ("nominal_response_verified" if mode == "normal_shedding_complete"
+                           else "raw_grid_bounded_normal_response")
+            refresh_required = mode == "normal_shedding"
+            result = decision(mode, reason, command, cap, ttl, emergency=True)
+            if mode == "normal_shedding" and result.should_call_service:
+                if (self._normal_shed_attempt_at is not None
+                        and now - self._normal_shed_attempt_at < s.min_seconds_between_actions):
+                    result.should_call_service = False
+                elif not result.dry_run:
+                    self._normal_shed_attempt_at = now
+            return result
         if (self._uncertainty_ceiling is not None and not self._restart_required
                 and self.last_target is not None and self.last_target[0] > 0
                 and (self.last_set_limit_ts is None

@@ -98,6 +98,7 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(settings.force_min_when_available_too_low)
         self.assertTrue(settings.fast_recovery)
         self.assertFalse(settings.nominal_import_only_fallback)
+        self.assertFalse(settings.bounded_nominal_shedding)
 
     async def test_long_incident_reason_is_valid_ha_state_with_complete_attribute(self):
         module = importlib.import_module("custom_components.1fuseloader.sensor")
@@ -129,6 +130,24 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         for name in ("strings.json", "translations/en.json", "translations/sv.json"):
             content = json.loads((Path(__file__).parent / "custom_components" / "1fuseloader" / name).read_text(encoding="utf-8"))
             self.assertTrue(content["options"]["step"]["init"]["data"]["nominal_import_only_fallback"])
+
+    async def test_bounded_response_trial_is_explicit_validated_and_translated(self):
+        self.hass.config_entries = SimpleNamespace(async_get_known_entry=lambda _: self.entry)
+        flow = self.flow_module.OneFuseLoaderOptionsFlow()
+        flow.hass = self.hass
+        flow.handler = self.entry.entry_id
+        result = await flow.async_step_init()
+        fields = result["data_schema"].schema
+        marker = next(key for key in fields if str(key.schema) == "bounded_nominal_shedding")
+        self.assertFalse(marker.default())
+        self.assertIs(fields[marker], bool)
+        rejected = await flow.async_step_init({"bounded_nominal_shedding": "true"})
+        self.assertEqual(rejected["errors"].get("base"), "invalid_settings")
+        accepted = await flow.async_step_init({"bounded_nominal_shedding": True, "overload_enabled": True})
+        self.assertTrue(accepted["data"]["bounded_nominal_shedding"])
+        for name in ("strings.json", "translations/en.json", "translations/sv.json"):
+            content = json.loads((Path(__file__).parent / "custom_components" / "1fuseloader" / name).read_text(encoding="utf-8"))
+            self.assertTrue(content["options"]["step"]["init"]["data"]["bounded_nominal_shedding"])
 
     async def test_fast_recovery_options_field_is_a_validated_boolean(self):
         self.hass.config_entries = SimpleNamespace(async_get_known_entry=lambda _: self.entry)

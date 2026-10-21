@@ -77,10 +77,10 @@ stale grid measurements and existing overload-response limits still apply.
 
 Recovery does not repeatedly offer the car maximum after a telemetry stop.
 It uses bounded attempts and a conservative startup offer. A measurement
-recovery block requires attention, a new physical session or the existing
-explicit state reset; an HA restart also clears this memory-only recovery
-state. The separate persistent overload budget and failure latch are never
-cleared by this path.
+recovery block requires attention or a new physical session. Recovery caps,
+failure attempts and backoff are checkpointed with the operational ledger;
+an HA restart cannot grant fresh attempts. The separate persistent overload
+budget and failure latch are never cleared by this path.
 
 Source Health exposes recent command and stop receipts. On each new stop,
 bounded evidence is saved by the integration to its local
@@ -89,6 +89,35 @@ data, not a control input. It distinguishes proposed limits, API acceptance,
 cached readback and reported physical current. Offline process tests cover
 transport ordering separately from physical EV response; actual charging must
 still be verified under supervision after activation.
+
+### Bounded lower-current trial (b18)
+
+The separate **Bounded lower-current trial after overload lockout** option is
+off by default. It requires the experimental profile to be enabled. When an
+old response timeout or spent experimental budget would block continued
+overload, a healthy charging session with a live accepted higher cap may
+instead try a strictly lower startup-current cap. This is a short response
+trial, not another sustained-overload allowance.
+
+The first qualifying grid sample anchors one fixed deadline, at most ten
+seconds and at most the configured response window. Its age, checkpoint
+verification and command dispatch consume that same window. API acceptance,
+cached readback, GET receipts, new load samples and setting changes cannot
+renew it. A newer post-acceptance EV observation at the lower current and a
+still later grid observation must establish buffered normal operation. The
+separate verified-import fallback can instead prove a conservative raw-grid
+envelope; it remains its own explicit opt-in.
+
+Missing response, excess peak current, unhealthy sources or conflicting new
+EV observations request zero. Recovery remains capped at startup current,
+backs off, and stops automatic attempts after two retries. An interrupted
+persisted response is failed on restore, rather than restarted with a fresh
+window. Neither the prior experimental failure nor consumed time is erased.
+
+This deadline bounds local decisions. Easee rounds positive TTL to at least
+one minute and the cloud command is best effort; physical reduction or stop
+within ten seconds is not guaranteed. Do not use a blown fuse to calibrate a
+cooling model. This version introduces no automatic thermal-budget reset.
 
 Same base formula as the old `sensor.easee_max_available_l1_v2`:
 
