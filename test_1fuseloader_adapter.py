@@ -276,6 +276,235 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.product.state["latestPulse"] = pulse
                 self.assertEqual(self.client.telemetry_block_reason, reason)
 
+    async def test_audited_new_sdk_is_allowed_other_versions_stay_closed(self):
+        self.pyeasee_module.__version__ = "0.8.19"
+        await self.client.async_execute(decision())
+        self.circuit.set_dynamic_current.assert_awaited_once_with(12, 0, 0, 1)
+
+    async def test_receipt_only_retains_valid_matching_correlation_and_no_body(self):
+        self.response.json = AsyncMock(return_value=[
+            {"commandId": 22, "ticks": 639281732354474790, "device": "PRIVATE"},
+            {"commandId": 22, "ticks": "639281732354474790"},
+            {"commandId": 48, "ticks": 123},
+            {"commandId": True, "ticks": 456},
+            {"commandId": 22, "ticks": "token-secret"},
+        ])
+        receipt = await self.client.async_execute(decision())
+        self.assertEqual(receipt.correlation_ids, ((22, "639281732354474790"),))
+        self.assertEqual(receipt.requested_phases, (12, 0, 0))
+        self.assertEqual(receipt.http_status, 202)
+        self.assertIsNotNone(receipt.accepted_at.tzinfo)
+        self.assertLessEqual(receipt.request_started_monotonic, receipt.request_completed_monotonic)
+        self.assertIs(receipt, self.client.last_submission_receipt)
+        self.assertNotIn("PRIVATE", repr(receipt))
+        self.assertNotIn("secret", repr(receipt))
+        self.response.release.assert_called_once()
+
+    async def test_200_204_and_malformed_202_are_unverified_not_delivery(self):
+        for status, body in ((200, {"commandId": 22, "ticks": 123}),
+                             (204, {"commandId": 22, "ticks": 123}),
+                             (202, {"unknown": "private token"})):
+            self.response.status = status
+            self.response.json = AsyncMock(return_value=body)
+            receipt = await self.client.async_execute(decision())
+            self.assertEqual(receipt.correlation_ids, ())
+            if status != 202:
+                self.response.json.assert_not_awaited()
+
+    async def test_bounded_body_reader_drops_oversized_metadata(self):
+        self.response.content = SimpleNamespace(read=AsyncMock(return_value=b"x" * 8193))
+        receipt = await self.client.async_execute(decision())
+        self.assertEqual(receipt.correlation_ticks, ())
+        self.response.content.read.assert_awaited_once_with(8193)
+        self.response.release.assert_called_once()
+
+    async def test_nonzero_admission_includes_reductions_and_reserves_zero(self):
+        for amps in (16, 15, 14, 13, 12, 11, 10, 9):
+            await self.client.async_execute(decision(amps=amps))
+        with self.assertRaisesRegex(adapter.EaseeAdapterError, "positive_rate_capacity_exhausted"):
+            await self.client.async_execute(decision(amps=7))
+        await self.client.async_execute(decision(amps=0))
+        self.assertEqual(self.circuit.set_dynamic_current.await_count, 9)
+        self.circuit.set_dynamic_current.assert_awaited_with(0, 0, 0, 1)
+
+    async def test_expired_admission_history_reopens_without_background_work(self):
+        with patch.object(adapter, "_monotonic", return_value=100):
+            for _ in range(8):
+                await self.client.async_execute(decision())
+            with self.assertRaisesRegex(adapter.EaseeAdapterError, "positive_rate_capacity_exhausted"):
+                await self.client.async_execute(decision())
+        with patch.object(adapter, "_monotonic", return_value=161):
+            await self.client.async_execute(decision())
+        self.assertEqual(self.circuit.set_dynamic_current.await_count, 9)
+
+    async def test_close_cancels_queued_sdk_write_no_late_positive(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        actual_writes = []
+
+        async def queued(*args):
+            started.set()
+            await release.wait()
+            actual_writes.append(args)
+            return self.response
+
+        self.circuit.set_dynamic_current.side_effect = queued
+        request = asyncio.create_task(self.client.async_execute(decision()))
+        await started.wait()
+        await self.client.async_close()
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await request
+        self.assertEqual(actual_writes, [])
+        self.assertEqual(self.client.control_block_reason, "easee_adapter_closed")
+
+    def attach_stream(self):
+        callbacks = []
+        self._cap_callbacks = []
+        stream = SimpleNamespace(on=lambda event, cb: (callbacks if event == "CommandResponse"
+                                                      else self._cap_callbacks).append(cb))
+        self.charger.easee = SimpleNamespace(sr_connection=stream)
+        return callbacks
+
+    def delivery(self, **updates):
+        result = {"serialNumber": "selected-charger", "id": 22,
+                  "ticks": 639281732354474790, "wasAccepted": True,
+                  "resultCode": None, "timestamp": "2026-01-01T00:00:00Z",
+                  "deliveredAt": "2026-01-01T00:00:01Z", "comment": "PRIVATE"}
+        result.update(updates)
+        return result
+
+    async def test_public_hook_preserves_early_delivery_before_http_receipt(self):
+        callbacks = self.attach_stream()
+        events = []
+        unsubscribe = self.client.set_delivery_callback(events.append)
+        self.assertTrue(self.client.delivery_listener_available)
+        self.assertEqual(len(callbacks), 1)
+
+        async def submit(*args):
+            await callbacks[0]([self.delivery()])
+            self.assertEqual(len(events), 1)
+            self.assertIsNone(self.client.last_submission_receipt)
+            return self.response
+
+        self.circuit.set_dynamic_current.side_effect = submit
+        self.response.json = AsyncMock(return_value={"commandId": 22, "ticks": 639281732354474790})
+        receipt = await self.client.async_execute(decision())
+        self.assertEqual(events[0].ticks, receipt.correlation_ticks[0])
+        self.assertNotIn("PRIVATE", repr(events[0]))
+        self.assertNotIn("selected-charger", repr(events[0]))
+        unsubscribe()
+        await callbacks[0]([self.delivery()])
+        self.assertEqual(len(events), 1)
+
+    async def test_foreign_malformed_and_stale_connection_delivery_cannot_confirm(self):
+        old_callbacks = self.attach_stream()
+        events = []
+        self.client.set_delivery_callback(events.append)
+        for change in ({"serialNumber": "other"}, {"ticks": True}, {"wasAccepted": 1},
+                       {"ticks": "private"}, {"resultCode": "private"}):
+            await old_callbacks[0]([self.delivery(**change)])
+        self.assertEqual(events, [])
+        new_callbacks = self.attach_stream()
+        self.assertTrue(self.client.delivery_listener_available)
+        await old_callbacks[0]([self.delivery()])
+        self.assertEqual(events, [])
+        await new_callbacks[0]([self.delivery()])
+        self.assertEqual(len(events), 1)
+        await self.client.async_close()
+        await new_callbacks[0]([self.delivery()])
+        self.assertEqual(len(events), 1)
+
+    async def test_readback_zero_validation_is_strict_and_not_a_health_override(self):
+        self.assertIsNone(self.client.reported_limits)
+        for phase in (1, 2, 3):
+            self.product.state[f"dynamicCircuitCurrentP{phase}"] = 0
+            self.product.state[f"offlineMaxCircuitCurrentP{phase}"] = 0
+        self.assertEqual(self.client.reported_limits, (0, 0, 0))
+        self.assertTrue(self.client.offline_limits_verified_zero)
+        self.product.state["offlineMaxCircuitCurrentP2"] = False
+        self.assertFalse(self.client.offline_limits_verified_zero)
+        self.product.state["signalRConnected"] = False
+        self.assertEqual(self.client.telemetry_block_reason, "easee_stream_disconnected")
+
+    async def test_reload_same_connection_fences_old_hook_and_control_identity(self):
+        callbacks = self.attach_stream()
+        events = []
+        self.client.set_delivery_callback(events.append)
+        first = self.client.control_identity
+        self.hass.data["easee"]["controller"] = SimpleNamespace(
+            get_chargers=lambda: [self.charger], chargers_data=[self.product])
+        second = self.client.control_identity
+        self.assertNotEqual(first, second)
+        self.assertEqual(len(callbacks), 2)
+        await callbacks[0]([self.delivery()])
+        self.assertEqual(events, [])
+        await callbacks[1]([self.delivery()])
+        self.assertEqual(len(events), 1)
+
+    async def test_delivery_sink_exception_does_not_break_native_dispatch(self):
+        callbacks = self.attach_stream()
+        self.client.set_delivery_callback(Mock(side_effect=ValueError("private error")))
+        await callbacks[0]([self.delivery()])
+
+    async def test_timed_out_sdk_queue_cannot_write_after_gate_opens(self):
+        gate = asyncio.Event()
+        actual_writes = []
+
+        async def queued(*args):
+            await gate.wait()
+            actual_writes.append(args)
+            return self.response
+
+        self.circuit.set_dynamic_current.side_effect = queued
+        with patch.object(adapter, "REQUEST_TIMEOUT_SECONDS", 0.01):
+            with self.assertRaisesRegex(adapter.EaseeAdapterError, "TimeoutError"):
+                await self.client.async_execute(decision())
+        gate.set()
+        await asyncio.sleep(0)
+        self.assertEqual(actual_writes, [])
+        self.assertEqual(self.client._pending_requests, set())
+
+    async def test_native_phase_receipt_only_changes_on_selected_valid_product_event(self):
+        self.attach_stream()
+        self.client.set_delivery_callback(lambda event: None)
+        for phase in (1, 2, 3):
+            self.product.state[f"dynamicCircuitCurrentP{phase}"] = 0
+        self.assertEqual(self.client.reported_limit_receipts, (None, None, None))
+        frame = {"mid": "selected-charger", "id": 111, "dataType": 3, "value": "0.0"}
+        for update in ({"mid": "other"}, {"value": True}, {"value": "NaN"},
+                       {"dataType": True}, {"id": 109}, {"value": "private"}):
+            await self._cap_callbacks[0]([{**frame, **update}])
+        self.assertEqual(self.client.reported_limit_receipts, (None, None, None))
+        with patch.object(adapter, "_monotonic", return_value=100):
+            await self._cap_callbacks[0]([frame])
+        self.assertEqual(self.client.reported_limit_receipts, (100, None, None))
+        with patch.object(adapter, "_monotonic", return_value=101):
+            # A newly received unchanged-zero event is distinct from merely
+            # rereading a cached HA value; it still is not acquisition proof.
+            await self._cap_callbacks[0]([frame])
+        self.assertEqual(self.client.reported_limit_receipts, (101, None, None))
+        self.product.state["dynamicCircuitCurrentP1"] = 7
+        self.assertEqual(self.client.reported_limit_receipts, (None, None, None))
+
+    async def test_cap_receipts_reset_and_old_stream_cannot_repopulate_them(self):
+        self.attach_stream()
+        self.client.set_delivery_callback(lambda event: None)
+        old = self._cap_callbacks[0]
+        for phase in (1, 2, 3):
+            self.product.state[f"dynamicCircuitCurrentP{phase}"] = 0
+        frame = {"mid": "selected-charger", "id": 111, "dataType": 4, "value": 0}
+        await old([frame])
+        self.assertIsNotNone(self.client.reported_limit_receipts[0])
+        self.attach_stream()
+        self.assertEqual(self.client.reported_limit_receipts, (None, None, None))
+        await old([frame])
+        self.assertEqual(self.client.reported_limit_receipts, (None, None, None))
+        await self._cap_callbacks[0]([frame])
+        self.assertIsNotNone(self.client.reported_limit_receipts[0])
+        await self.client.async_close()
+        self.assertEqual(self.client.reported_limit_receipts, (None, None, None))
+
 
 if __name__ == "__main__":
     unittest.main()

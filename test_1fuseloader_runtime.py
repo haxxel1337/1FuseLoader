@@ -606,7 +606,10 @@ class ControllerTests(unittest.IsolatedAsyncioTestCase):
         await first
         await refresh
         self.assertEqual(len(self.adapter.calls), 2)
-        self.assertEqual(self.adapter.calls[-1].current_p1, 6)
+        # A new grid value above the ordinary (non-experimental) fuse ceiling
+        # supersedes the in-flight positive request. Its uncertain delivery
+        # must not authorize another positive offer before protection.
+        self.assertEqual(self.adapter.calls[-1].current_p1, 0)
         self.assertIsNone(self.controller._refresh_task)
 
     async def test_disable_invalidates_a_waiting_source_refresh(self):

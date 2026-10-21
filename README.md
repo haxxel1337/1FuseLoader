@@ -9,7 +9,7 @@ This is a **soft load balancer** for an Easee charger where a BMW is effectively
 ## Target
 
 - Home Assistant Core: **2026.10.1** (minimum and CI target)
-- Compatibility adapter: **Easee 0.9.74 / pyeasee 0.8.17**; unsupported versions block writes
+- Compatibility adapter: **Easee 0.9.74 / pyeasee 0.8.17 or 0.8.19**; unsupported versions block writes. The audited upstream revision with 0.8.19 is `397eaedd1a56a95e81bfa37d45130349ba3de7a8` (the version label alone does not identify this revision).
 - HACS/custom repository layout
 - UI setup through config flow
 - Runtime tuning through options flow and Number/Switch entities
@@ -49,6 +49,39 @@ These defaults match the original installation and can be changed in the setup U
 The Easee `device_id` is **not** hard-coded because it is specific to each Home Assistant installation. Enter your own Easee device ID during setup.
 
 ## Logic
+
+### Command delivery and low-grid alignment (b19)
+
+Each command records HTTP acceptance separately from an exactly correlated
+Easee CommandResponse and native circuit-limit observations. A missing or
+ambiguous correlation remains unverified. Vendor clocks are not used to
+match requests. None of these receipts establishes physical current or TTL.
+Old callbacks and late superseded replies cannot confirm a newer command.
+Positive requests are serialized, and a new protective source condition can
+cancel a waiting positive request. Cancellation cannot undo an already sent
+cloud command; a subsequent zero is confirmed before another offer. Repeated
+zero writes are suppressed only with healthy sources, offline limits zero,
+post-request native zero evidence and a fresh trusted zero-current event.
+
+Nonzero limit writes reserve capacity in the new SDK's shared rate limiter.
+The entire queue/request wait consumes the local deadline; urgent zero still
+depends on the shared SDK, network and cloud. No physical ten-second delivery
+guarantee is made.
+
+With the existing default-off **verified import-only** option enabled, a
+source-bound low-grid/EV conflict can reduce a live accepted cap to 7 A for
+one fixed window of at most ten seconds. The whole 7 A offer must fit below
+the fresh raw-grid normal ceiling without subtracting EV current. A genuinely
+advanced EV event and later coherent grid event complete alignment. GETs,
+renewals, changing measurements and restarts cannot grant a new window.
+Interrupted alignment is checkpointed and uses the existing bounded recovery
+policy. Experimental exposure and failure latches remain preserved.
+
+Upgrade the native Easee integration as a complete audited component, not
+by editing its dependency manifest alone. Native upstream PR 701 updates
+pyeasee/pysignalr for connection-cookie fixes. This addresses the known
+transport failure; it does not prove that every physical charge stop is fixed.
+Verify sustained physical charging under normal load before any stress test.
 
 ### Delayed observations and bounded recovery (b17)
 

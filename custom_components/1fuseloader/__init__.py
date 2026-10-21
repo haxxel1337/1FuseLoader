@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 from collections import deque
@@ -24,6 +25,7 @@ from .const import (
     DOMAIN, PLATFORMS, validate_options,
 )
 from .easee_adapter import EaseeCommandAdapter
+from .command_delivery import CommandDeliveryTracker
 from .bmw_context import BMWContext
 from .logic import ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, START_ALLOWED_STATUSES, OneFuseRegulator, RegulatorInput, RegulatorSettings
 from .overload_persistence import OverloadBudgetStore
@@ -86,6 +88,16 @@ class OneFuseLoaderController:
         self.last_stop_context: dict[str, Any] | None = None
         self.last_stop_nominal_diagnostics: dict[str, Any] | None = None
         self._recent_commands: deque[dict[str, Any]] = deque(maxlen=32)
+        self._delivery = CommandDeliveryTracker()
+        self._delivery_unsub = None
+        self._control_identity = None
+        self._delivery_binding = None
+        self._positive_retry_after = 0.0
+        self._dispatch_task: asyncio.Task | None = None
+        self._dispatch_input: RegulatorInput | None = None
+        self._dispatch_positive = False
+        self._dispatch_superseded = False
+        self._protective_zero_pending = False
         self._recent_stop_contexts: deque[dict[str, Any]] = deque(maxlen=8)
         self._incident_journal_pending: dict[str, Any] | None = None
         self._incident_journal_task: asyncio.Task | None = None
@@ -207,6 +219,7 @@ class OneFuseLoaderController:
 
     async def async_set_option(self, key: str, value: Any) -> None:
         self._generation += 1
+        self._cancel_positive_dispatch()
         self._cancel_snapshot_refresh(cancel_request=True)
         async with self._lock:
             options = dict(self.entry.options or {})
@@ -222,6 +235,7 @@ class OneFuseLoaderController:
 
     async def async_reconfigure(self) -> None:
         self._generation += 1
+        self._cancel_positive_dispatch()
         self._cancel_snapshot_refresh(cancel_request=True)
         async with self._lock:
             changed = self._reload_settings_locked()
@@ -233,6 +247,7 @@ class OneFuseLoaderController:
 
     async def async_reset_state(self) -> None:
         self._generation += 1
+        self._cancel_positive_dispatch()
         self._cancel_snapshot_refresh(cancel_request=True)
         async with self._lock:
             self.regulator.reset()
@@ -286,6 +301,11 @@ class OneFuseLoaderController:
                 _LOGGER.warning("1FuseLoader adapter initialization failed (%s)", type(err).__name__)
             if self._stopped:
                 return
+            subscribe = getattr(self._adapter, "set_delivery_callback", None)
+            if callable(subscribe):
+                if self._delivery_unsub is not None:
+                    self._delivery_unsub()
+                self._delivery_unsub = subscribe(self._handle_delivery)
             await self._async_tick_locked()
             # async_stop marks stopped before waiting for this lock. It may
             # already have removed listeners while any startup await yielded;
@@ -369,10 +389,39 @@ class OneFuseLoaderController:
         return True
 
     @callback
+    def _handle_delivery(self, event: Any) -> None:
+        if self._stopped:
+            return
+        if self._delivery.delivery(event, self.hass.loop.time()):
+            if self._delivery.latest is not None and self._delivery.latest.vendor_accepted is False:
+                self._protective_zero_pending = True
+            self._handle_source_change(None)
+            self.notify()
+
+    def _cancel_positive_dispatch(self) -> None:
+        if self._dispatch_positive and self._dispatch_task is not None and not self._dispatch_task.done():
+            self._dispatch_superseded = True
+            self._protective_zero_pending = True
+            self._dispatch_task.cancel()
+
+    @callback
     def _handle_source_change(self, _event: Any) -> None:
         """One coalesced refresh follows the newest local/Easee telemetry."""
         if self._stopped:
             return
+        if self._dispatch_positive and self._dispatch_input is not None:
+            latest = self._read_input()
+            try:
+                grid = float(latest.grid_l1)
+                planned_grid = float(self._dispatch_input.grid_l1)
+                ceiling = (self.settings.overload_transition_limit_amps if self.settings.overload_enabled
+                           else self.settings.main_fuse_amps)
+                rising_load = grid > ceiling and grid > planned_grid
+            except (TypeError, ValueError, OverflowError):
+                rising_load = True
+            if (not latest.data_valid or latest.status.strip().lower() not in START_ALLOWED_STATUSES
+                    or latest.control_source_id != self._dispatch_input.control_source_id or rising_load):
+                self._cancel_positive_dispatch()
         self._pending_refresh = True
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = self.hass.async_create_task(self._async_process_refreshes())
@@ -394,6 +443,10 @@ class OneFuseLoaderController:
         # coalesce instead of queuing; none can submit after this method returns.
         self._stopped = True
         self._generation += 1
+        self._cancel_positive_dispatch()
+        if self._delivery_unsub is not None:
+            self._delivery_unsub()
+            self._delivery_unsub = None
         self._pending_refresh = False
         snapshot_task = self._charger_snapshot_task
         self._cancel_snapshot_refresh(cancel_request=True)
@@ -416,6 +469,9 @@ class OneFuseLoaderController:
             self._unsub_deadline = None
         async with self._lock:
             pass
+        close = getattr(self._adapter, "async_close", None)
+        if callable(close):
+            await close()
         try:
             await asyncio.wait_for(self._budget_store.async_wait_pending(), EXPOSURE_STORE_TIMEOUT_SECONDS)
         except Exception:
@@ -838,7 +894,68 @@ class OneFuseLoaderController:
             wall_now_ts=datetime.now(timezone.utc).timestamp(),
             charger_snapshot_verified=snapshot_used,
             charger_current_trusted=current_trusted,
+            control_source_id=self._configured_control_identity(),
         )
+
+    def _configured_control_identity(self) -> str | None:
+        """Stable verified source binding; never include secrets or SDK objects."""
+        try:
+            registry = er.async_get(self.hass)
+            data = self.entry.data
+            selected_device = data.get(CONF_DEVICE_ID)
+            if not selected_device:
+                return None
+            values = [selected_device, data.get(CONF_CONTROLLED_PHASE, "L1")]
+            for key in (CONF_L1_ENTITY, CONF_CHARGER_CURRENT_ENTITY, CONF_STATUS_ENTITY):
+                entity_id = data.get(key)
+                entity = registry.async_get(entity_id)
+                if entity is None or not entity.unique_id or entity.disabled_by:
+                    return None
+                if key != CONF_L1_ENTITY and (entity.platform != "easee" or entity.device_id != selected_device):
+                    return None
+                values.extend((entity_id, entity.platform, entity.unique_id, entity.device_id))
+            values.append(repr(self._l1_source_config))
+            return hashlib.sha256(repr(tuple(values)).encode()).hexdigest()
+        except Exception:
+            return None
+
+    def _sync_command_identity(self) -> None:
+        identity = getattr(self._adapter, "control_identity", None)
+        if identity != self._control_identity:
+            binding = self._configured_control_identity()
+            latest = self._delivery.latest
+            unresolved_zero = self._delivery.unresolved_correlated_zero or (
+                    latest is not None and latest.phases == (0, 0, 0))
+            same_or_unknown_binding = binding is None or self._delivery_binding is None or binding == self._delivery_binding
+            if self._control_identity is not None and unresolved_zero and same_or_unknown_binding:
+                self._protective_zero_pending = True
+                # A new stream is not proof that the same charger's cloud
+                # queue drained. Keep exact unresolved IDs for later replies.
+            elif not same_or_unknown_binding or not unresolved_zero:
+                self._delivery.reset()
+            self._control_identity = identity
+            self._delivery_binding = binding
+
+    def _zero_readback_evidence(self, inp: RegulatorInput, *, require_new_current: bool = True) -> dict[str, Any]:
+        record = self._delivery.latest
+        reported = tuple(self.source_diagnostics.get(f"reported_circuit_p{phase}") for phase in (1, 2, 3))
+        receipts = getattr(self._adapter, "reported_limit_receipts", (None, None, None))
+        transition = receipts[0] if isinstance(receipts, tuple) and len(receipts) == 3 else None
+        if type(transition) not in (int, float) or not isfinite(transition):
+            transition = None
+        after = bool(record and transition is not None and transition >= record.started)
+        age = self.hass.loop.time() - transition if transition is not None else None
+        # A GET receipt cannot turn an old 0 A current event into fresh proof.
+        accepted = self.last_accepted_limit
+        started = self._utc_time(accepted.get("started_at_utc")) if accepted else None
+        fresh_ev = bool(inp.charger_current_trusted and (not require_new_current or (
+                        started is not None and inp.charger_report_ts is not None
+                        and inp.charger_report_ts > started.timestamp())))
+        return dict(phases=reported if self.source_diagnostics.get("reported_circuit_available") else None,
+                    after_submission=after, report_age=age,
+                    ev_current=inp.charger_current if fresh_ev else None,
+                    healthy=inp.data_valid, offline_zero=bool(getattr(self._adapter, "offline_limits_verified_zero", False)),
+                    max_age=self.settings.max_sensor_age_seconds)
 
     @staticmethod
     def _report_timestamp(state: Any) -> float | None:
@@ -957,6 +1074,8 @@ class OneFuseLoaderController:
                 post_acceptance = report_time >= accepted_time
         return {
             **self.source_diagnostics,
+            **self._delivery.diagnostics(),
+            "zero_confirmation_scope": "native_ProductUpdate_receipt_and_correlated_delivery_not_physical_response",
             "last_command_attempt": dict(self.last_command_attempt) if self.last_command_attempt else None,
             "last_accepted_command": dict(self.last_accepted_command) if self.last_accepted_command else None,
             "last_accepted_limit": dict(accepted) if accepted else None,
@@ -993,11 +1112,18 @@ class OneFuseLoaderController:
                 return
             await self._async_tick_locked()
 
-    @staticmethod
-    def _input_revision(inp: RegulatorInput) -> tuple:
+    def _input_revision(self, inp: RegulatorInput) -> tuple:
+        def age_class(report: float | None) -> tuple | None:
+            if report is None or inp.wall_now_ts is None:
+                return None
+            age = inp.wall_now_ts - report
+            return (age < 0, age < -5,
+                    age <= self.settings.measurement_settle_seconds,
+                    age <= self.settings.max_sensor_age_seconds)
         return (inp.status, inp.grid_l1, inp.charger_current, inp.data_valid, inp.data_error,
                 inp.grid_report_ts, inp.charger_report_ts, inp.charger_snapshot_verified,
-                inp.charger_current_trusted)
+                inp.charger_current_trusted, inp.control_source_id,
+                age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
     async def _async_tick_locked(self) -> None:
         generation = self._generation
@@ -1012,6 +1138,7 @@ class OneFuseLoaderController:
             self.bmw_context = self._bmw_context.snapshot()
         except Exception:
             self.bmw_context = {}
+        self._sync_command_identity()
         inp = self._read_input()
         self._schedule_current_snapshot(inp)
         plan_source_diagnostics = dict(self.source_diagnostics)
@@ -1020,12 +1147,18 @@ class OneFuseLoaderController:
             if offline_problem or self._budget_error:
                 inp = replace(inp, data_valid=False, data_error=self._budget_error or offline_problem)
         decision = self.regulator.evaluate(inp)
+        if self._protective_zero_pending and self.settings.active_control and not self.settings.dry_run:
+            self.regulator.reject_submission(decision, self.hass.loop.time())
+            decision = replace(decision, command="set_limit", current_p1=0, current_p2=0, current_p3=0,
+                               should_call_service=True, mode="command_protection",
+                               reason="A positive request was superseded or could not be admitted; confirming 0 A before a new offer.")
         if decision.current_refresh_required:
             self._request_current_snapshot()
         exposure = self.regulator.export_overload_state()
         normal_control = exposure.get("normal_control", {})
         normal_active = bool(normal_control.get("cap") is not None
                              or normal_control.get("response_pending")
+                             or normal_control.get("alignment_pending")
                              or normal_control.get("stops")
                              or normal_control.get("response_failure"))
         if normal_active:
@@ -1057,9 +1190,9 @@ class OneFuseLoaderController:
                 self._budget_retry_at = 0.0
         if self._stopped or generation != self._generation:
             return
-        if self.settings.overload_enabled and decision.current_p1 > 0 and (
+        if decision.current_p1 > 0 and (
             self._budget_error or (
-                decision.mode.removeprefix("dry_run_").startswith("overload")
+                self.settings.overload_enabled and decision.mode.removeprefix("dry_run_").startswith("overload")
                 and (decision.overload_remaining_seconds < OVERLOAD_LEASE_RESERVE_SECONDS
                      or (self._overload_restore_receipt_floor is not None and (
                          inp.grid_report_ts is None or inp.charger_report_ts is None
@@ -1148,6 +1281,36 @@ class OneFuseLoaderController:
                 self._handle_source_change(None)
                 self.notify()
                 return
+        evidence = self._zero_readback_evidence(inp)
+        self._delivery.observe(evidence["phases"], evidence["after_submission"])
+        latest_receipt = self._delivery.latest
+        confirmed_zero = self._delivery.can_skip_zero(**evidence)
+        # Unchanged trusted EV=0 is allowed for command ordering only. Requiring
+        # a newly changed EV event here could deadlock a car already at zero.
+        # A fresh native cap event and matching delivery (when correlatable)
+        # still precede a new offer. This makes no physical-response claim.
+        ordered_zero = self._delivery.can_skip_zero(**self._zero_readback_evidence(inp, require_new_current=False))
+        if (decision.command == "set_limit" and decision.current_p1 == 0 and confirmed_zero):
+            # No API call and no acknowledge: a cached zero must never renew
+            # a lease, a response timer, or a thermal allowance.
+            self._protective_zero_pending = False
+            self.last_service_result = "not_sent_confirmed_zero"
+            self.last_service_error = None
+            self.notify()
+            return
+        zero_barrier = bool(latest_receipt and latest_receipt.phases == (0, 0, 0)
+                            and (latest_receipt.http_status is not None or latest_receipt.state in {
+                                "submission_failed_unverified", "superseded_unverified", "vendor_rejected"})
+                            and not ordered_zero)
+        zero_barrier = zero_barrier or self._delivery.unresolved_correlated_zero
+        if positive_submission and (zero_barrier or self.hass.loop.time() < self._positive_retry_after):
+            self.regulator.reject_submission(decision, self.hass.loop.time())
+            self.last_decision = replace(decision, should_call_service=False, mode="waiting_for_zero_confirmation",
+                reason="Waiting for the preceding 0 A command and a fresh native zero transition before offering current.")
+            self.last_service_result = "not_sent_waiting_for_zero_confirmation"
+            self._request_current_snapshot()
+            self.notify()
+            return
         attempt = {
             "started_at_utc": datetime.now(timezone.utc).isoformat(),
             "completed_at_utc": None, "command": decision.command,
@@ -1205,12 +1368,36 @@ class OneFuseLoaderController:
             }
             self._stop_context_armed = False
         self.last_service_error = None
+        receipt_record = self._delivery.begin(decision.command,
+            (decision.current_p1, decision.current_p2, decision.current_p3), self.hass.loop.time())
+        self._dispatch_input = inp
+        self._dispatch_positive = positive_submission
+        self._dispatch_superseded = False
         try:
             action_timeout = ACTION_TIMEOUT_SECONDS
             if positive_submission and response_deadline is not None:
                 action_timeout = min(action_timeout, max(0.001, response_deadline - self.hass.loop.time()))
-            await asyncio.wait_for(self._adapter.async_execute(decision), action_timeout)
+            self._dispatch_task = self.hass.async_create_task(self._adapter.async_execute(decision))
+            receipt = await asyncio.wait_for(self._dispatch_task, action_timeout)
+            if self._dispatch_superseded or self._stopped or generation != self._generation:
+                raise RuntimeError("superseded_command_completion")
+        except asyncio.CancelledError:
+            if not self._dispatch_superseded:
+                raise
+            self._delivery.failed(receipt_record, superseded=True)
+            self.regulator.reject_submission(decision, self.hass.loop.time())
+            self.last_service_result = "superseded_unverified"
+            attempt.update(result="superseded_unverified", error="source_changed_during_dispatch")
+            self.last_service_error = "source_changed_during_dispatch"
+            self._handle_source_change(None)
         except Exception as err:
+            self._delivery.failed(receipt_record, superseded=self._dispatch_superseded)
+            if positive_submission:
+                self._protective_zero_pending = True
+            if decision.command == "set_limit" and decision.current_p1 == 0:
+                # A timed-out zero can still arrive at the device later.
+                # Confirm another zero before allowing a subsequent positive.
+                self._protective_zero_pending = True
             rejected_retry = self.regulator.reject_submission(decision, self.hass.loop.time())
             self.last_service_result = "error"
             self.last_service_error = type(err).__name__
@@ -1219,14 +1406,26 @@ class OneFuseLoaderController:
                 decision, reason=f"Command submission failed ({type(err).__name__}); charger state is unverified.",
             )
             _LOGGER.warning("1FuseLoader command submission failed (%s)", type(err).__name__)
-            if rejected_retry or (positive_submission and response_deadline is not None):
+            if str(err) == "positive_rate_capacity_exhausted":
+                self._protective_zero_pending = True
+                self._positive_retry_after = self.hass.loop.time() + 5
+                self._handle_source_change(None)
+            if rejected_retry or self._dispatch_superseded or positive_submission:
                 # Cancellation cannot establish whether the cloud applied a
                 # request. Re-evaluate rather than waiting for another report.
                 self._handle_source_change(None)
         else:
+            self._delivery.accepted(receipt_record, receipt, self.hass.loop.time())
             self.regulator.acknowledge(decision, self.hass.loop.time())
+            if decision.command == "set_limit" and decision.current_p1 == 0:
+                self._protective_zero_pending = False
             self.last_service_result = "submitted_unverified"
             attempt["result"] = "submitted_unverified"
+        finally:
+            self._dispatch_task = None
+            self._dispatch_input = None
+            self._dispatch_positive = False
+        attempt["delivery"] = receipt_record.public()
         attempt["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         journal_record = {
             **attempt, "mode": decision.mode, "reason": decision.reason,
@@ -1332,15 +1531,16 @@ class OneFuseLoaderController:
         if self._unsub_deadline:
             self._unsub_deadline()
             self._unsub_deadline = None
-        if not self.settings.overload_enabled or self._stopped:
+        if self._stopped:
             return
         delays = []
-        if decision.overload_transition_remaining_seconds is not None:
+        if self.settings.overload_enabled and decision.overload_transition_remaining_seconds is not None:
             delays.append(decision.overload_transition_remaining_seconds)
         if decision.current_p1 > 0 and decision.nominal_response_deadline_ts is not None:
             # Absolute monotonic time includes source age and every await.
             delays.append(decision.nominal_response_deadline_ts - self.hass.loop.time() + elapsed)
-        if decision.mode.removeprefix("dry_run_").startswith("overload") and decision.current_p1 > 0:
+        if (self.settings.overload_enabled and decision.mode.removeprefix("dry_run_").startswith("overload")
+                and decision.current_p1 > 0):
             delays.append(decision.overload_remaining_seconds - OVERLOAD_LEASE_RESERVE_SECONDS)
         if not delays:
             return

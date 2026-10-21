@@ -9,16 +9,25 @@ An HTTP acceptance is submission to the cloud, not physical charger feedback.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import json
 from math import ceil, isfinite
 import re
 import sys
+import time
+import weakref
 from typing import Any
+
+_monotonic = time.monotonic
 
 SUPPORTED_EASEE_VERSION = "0.9.74"
 SUPPORTED_PYEASEE_VERSION = "0.8.17"
+SUPPORTED_PYEASEE_VERSIONS = frozenset({"0.8.17", "0.8.19"})
+NONZERO_ADMISSION_LIMIT = 8
+ADMISSION_PERIOD_SECONDS = 60.01
 REQUEST_TIMEOUT_SECONDS = 10
 MAX_TELEMETRY_AGE_SECONDS = 120
 OBSERVATION_FUTURE_TOLERANCE_SECONDS = 2
@@ -59,6 +68,36 @@ class EaseeAdapterError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class CommandSubmission:
+    """Cloud receipt only: neither delivery nor physical-current proof."""
+
+    http_status: int
+    requested_phases: tuple[int, int, int] | None
+    request_started_monotonic: float
+    request_completed_monotonic: float
+    correlation_ticks: tuple[str, ...] = ()
+    command_type: int | None = None
+    accepted_at: datetime | None = None
+
+    @property
+    def correlation_ids(self) -> tuple[tuple[int, str], ...]:
+        return tuple((self.command_type, tick) for tick in self.correlation_ticks) if self.command_type else ()
+
+
+@dataclass(frozen=True, slots=True)
+class CommandDelivery:
+    """Allowlisted vendor delivery metadata; no identifiers or raw payload."""
+
+    command_type: int
+    ticks: str
+    was_accepted: bool
+    result_code: int | None
+    provider_timestamp: str | None
+    delivered_at: str | None
+    received_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
 class ChargerCurrentSnapshot:
     """Cloud values, local receipt and optional vendor observation metadata.
 
@@ -89,6 +128,17 @@ class EaseeCommandAdapter:
         self._registry_device: Any = None
         self._observation_timestamp_identity: tuple[int, ...] | None = None
         self._observation_timestamp_history: dict[int, tuple[datetime, float]] = {}
+        self.last_submission_receipt: CommandSubmission | None = None
+        self._delivery_callback: Any = None
+        self._hook_connection: Any = None
+        self._hook_generation = 0
+        self._hook_identity: tuple[int, ...] | None = None
+        self._limit_observed_values: list[float | None] = [None, None, None]
+        self._limit_receipts: list[float | None] = [None, None, None]
+        self._closed = False
+        self._request_lock = asyncio.Lock()
+        self._request_starts: deque[float] = deque()
+        self._pending_requests: set[asyncio.Task] = set()
 
     async def async_initialize(self) -> None:
         """Validate already loaded objects without making any network request."""
@@ -100,6 +150,8 @@ class EaseeCommandAdapter:
         return self._resolve_runtime()
 
     def _resolve_runtime(self) -> str | None:
+        if self._closed:
+            return "easee_adapter_closed"
         self._charger = self._circuit = self._product_data = None
         self._controller = self._registry_device = None
         # Do not import/start Easee or pyeasee ourselves. after_dependencies
@@ -108,7 +160,7 @@ class EaseeCommandAdapter:
         pyeasee = sys.modules.get("pyeasee")
         if getattr(easee_const, "VERSION", None) != SUPPORTED_EASEE_VERSION:
             return "unsupported_or_unloaded_easee_version"
-        if getattr(pyeasee, "__version__", None) != SUPPORTED_PYEASEE_VERSION:
+        if getattr(pyeasee, "__version__", None) not in SUPPORTED_PYEASEE_VERSIONS:
             return "unsupported_or_unloaded_pyeasee_version"
         if not self.device_id:
             return "missing_easee_device"
@@ -151,10 +203,205 @@ class EaseeCommandAdapter:
                 return "easee_telemetry_source_not_unique"
             self._charger, self._circuit, self._product_data = charger, circuit, products[0]
             self._controller, self._registry_device = controller, device
+            self._bind_delivery_hook()
         except Exception:
             # Exception text can include a remote URL or private account data.
             return "easee_runtime_incompatible"
         return None
+
+    def set_delivery_callback(self, callback: Any):
+        """Register one synchronous listener; return a local unsubscriber.
+
+        SignalR.on is additive in the audited pysignalr versions. There is no
+        public off method: stale callbacks hold only a weak adapter reference
+        and become inert on connection replacement or close. Never replace
+        pyeasee's existing callbacks or transport/reconnect implementation.
+        """
+        if callback is not None and not callable(callback):
+            raise TypeError("delivery_callback_must_be_callable")
+        self._delivery_callback = callback
+        self._resolve_runtime()
+
+        def unsubscribe():
+            if self._delivery_callback is callback:
+                self._delivery_callback = None
+        return unsubscribe
+
+    set_delivery_listener = set_delivery_callback
+
+    @property
+    def delivery_listener_available(self) -> bool:
+        return self._resolve_runtime() is None and self._hook_connection is not None
+
+    def _bind_delivery_hook(self) -> None:
+        connection = getattr(getattr(self._charger, "easee", None), "sr_connection", None)
+        identity = self._snapshot_source_identity()
+        if connection is self._hook_connection and identity == self._hook_identity:
+            return
+        self._hook_generation += 1
+        self._hook_connection = None
+        self._hook_identity = None
+        self._limit_observed_values = [None, None, None]
+        self._limit_receipts = [None, None, None]
+        if connection is None or not callable(getattr(connection, "on", None)):
+            return
+        generation = self._hook_generation
+        charger_id = self._charger.id
+        adapter_ref = weakref.ref(self)
+
+        async def received(payload):
+            owner = adapter_ref()
+            if owner is None or owner._closed or generation != owner._hook_generation:
+                return
+            if owner._resolve_runtime() is not None:
+                return
+            if generation != owner._hook_generation or identity != owner._snapshot_source_identity():
+                return
+            owner._receive_delivery(payload, charger_id)
+
+        async def observed(payload):
+            owner = adapter_ref()
+            if owner is None or owner._closed or generation != owner._hook_generation:
+                return
+            if owner._resolve_runtime() is not None:
+                return
+            if generation != owner._hook_generation or identity != owner._snapshot_source_identity():
+                return
+            owner._receive_limit_observation(payload, charger_id)
+
+        try:
+            connection.on("CommandResponse", received)
+            connection.on("ProductUpdate", observed)
+        except Exception:
+            # Telemetry commands still work, but delivery remains unverified.
+            return
+        self._hook_connection = connection
+        self._hook_identity = identity
+
+    def _receive_limit_observation(self, payload: Any, charger_id: str) -> None:
+        """Retain only selected native phase events, never GET/cache reads.
+
+        This is a local receipt clock. A ProductUpdate is still vendor data,
+        not synchronized physical acquisition or a command delivery receipt.
+        """
+        records = payload if type(payload) is list else [payload]
+        for record in records[:64]:
+            if not isinstance(record, Mapping) or record.get("mid") != charger_id:
+                continue
+            observation_id = record.get("id")
+            if type(observation_id) is not int or observation_id not in (111, 112, 113):
+                continue
+            if type(record.get("dataType")) is not int or record["dataType"] not in (3, 4):
+                continue
+            try:
+                value = self._snapshot_number(record.get("value"), "invalid_limit_observation")
+            except EaseeAdapterError:
+                continue
+            if not 0 <= value <= 1000:
+                continue
+            self._limit_observed_values[observation_id - 111] = value
+            self._limit_receipts[observation_id - 111] = _monotonic()
+
+    @property
+    def reported_limit_receipts(self) -> tuple[float | None, float | None, float | None]:
+        """Local native-event receipts, fenced against a replaced readback."""
+        limits = self.reported_limits
+        if limits is None:
+            return (None, None, None)
+        return tuple(receipt if observed == current else None for receipt, observed, current
+                     in zip(self._limit_receipts, self._limit_observed_values, limits))
+
+    @staticmethod
+    def _positive_integer(value: Any) -> int | None:
+        if type(value) is int:
+            return value if 0 < value < 2**63 else None
+        if type(value) is str and re.fullmatch(r"[0-9]{1,19}", value):
+            number = int(value)
+            return number if 0 < number < 2**63 else None
+        return None
+
+    @staticmethod
+    def _safe_vendor_timestamp(value: Any) -> str | None:
+        if type(value) is not str or len(value) > 40:
+            return None
+        stamp, error = EaseeCommandAdapter._observation_timestamp(value, datetime.now(timezone.utc))
+        return stamp.isoformat() if error is None else None
+
+    def _receive_delivery(self, payload: Any, charger_id: str) -> None:
+        callback = self._delivery_callback
+        if callback is None:
+            return
+        records = payload if type(payload) is list else [payload]
+        for record in records[:32]:
+            if not isinstance(record, Mapping):
+                continue
+            # Missing or foreign device identity must never confirm our command.
+            serial = record.get("serialNumber", record.get("SerialNumber"))
+            if serial != charger_id:
+                continue
+            command_type = self._positive_integer(record.get("id", record.get("Id")))
+            ticks = self._positive_integer(record.get("ticks", record.get("Ticks")))
+            accepted = record.get("wasAccepted", record.get("WasAccepted"))
+            result = record.get("resultCode", record.get("ResultCode"))
+            if command_type is None or ticks is None or type(accepted) is not bool:
+                continue
+            if result is not None and (type(result) is not int or not -32768 <= result <= 32767):
+                continue
+            event = CommandDelivery(
+                command_type, str(ticks), accepted, result,
+                self._safe_vendor_timestamp(record.get("timestamp", record.get("Timestamp"))),
+                self._safe_vendor_timestamp(record.get("deliveredAt", record.get("DeliveredAt"))),
+                _monotonic(),
+            )
+            try:
+                callback(event)
+            except Exception:
+                # A diagnostic listener must not break native stream dispatch.
+                continue
+
+    async def async_close(self) -> None:
+        self._closed = True
+        self._hook_generation += 1
+        self._hook_connection = None
+        self._delivery_callback = None
+        self._limit_observed_values = [None, None, None]
+        self._limit_receipts = [None, None, None]
+        pending = tuple(self._pending_requests)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    @property
+    def reported_limits(self) -> tuple[float, float, float] | None:
+        """Cached native readback only; no acquisition/delivery assertion."""
+        if self._resolve_runtime() is not None or not isinstance(self._product_data.state, Mapping):
+            return None
+        result = []
+        for phase in (1, 2, 3):
+            value = self._product_data.state.get(f"dynamicCircuitCurrentP{phase}")
+            if type(value) not in (int, float) or not isfinite(value) or not 0 <= value <= 1000:
+                return None
+            result.append(float(value))
+        return tuple(result)
+
+    @property
+    def offline_limits_verified_zero(self) -> bool:
+        if self._resolve_runtime() is not None or not isinstance(self._product_data.state, Mapping):
+            return False
+        return all(type(self._product_data.state.get(f"offlineMaxCircuitCurrentP{phase}")) in (int, float)
+                   and self._product_data.state[f"offlineMaxCircuitCurrentP{phase}"] == 0
+                   for phase in (1, 2, 3))
+
+    @property
+    def control_identity(self) -> tuple[int, ...] | None:
+        """Opaque process-local fence; callers must never persist this tuple."""
+        if self._resolve_runtime() is not None:
+            return None
+        return tuple(id(value) for value in (
+            self._registry_device, self._controller, self._charger,
+            self._circuit, self._product_data, self._hook_connection,
+        ))
 
     def _runtime_identity(self) -> tuple[Any, ...]:
         """Capture selection values and object identities before an await."""
@@ -389,7 +636,7 @@ class EaseeCommandAdapter:
             return "easee_telemetry_invalid"
         return None
 
-    async def async_execute(self, decision: Any) -> None:
+    async def async_execute(self, decision: Any) -> CommandSubmission:
         """Submit a limit or pause/resume, raising unless the API accepted it.
 
         No deduplication: repeating the same circuit limit must renew the TTL.
@@ -426,35 +673,103 @@ class EaseeCommandAdapter:
         # charger and never resume a replacement after capping the old circuit.
         identity = self._runtime_identity()
         charger, circuit = self._charger, self._circuit
+        started = _monotonic()
+        self.last_submission_receipt = None
 
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
-                if command in {"set_limit", "resume"}:
-                    result = await circuit.set_dynamic_current(*currents, ttl_minutes)
-                    self._require_accepted(result)
-                if command in {"pause", "resume"}:
-                    # Reapply a safe finite cap immediately before resume. A
-                    # failed/unknown cap submission must never be followed by
-                    # resume, even if an earlier tick submitted a cap.
-                    if command == "resume":
-                        self._require_same_runtime(identity, healthy=True)
-                    result = await getattr(charger, command)()
-                    self._require_accepted(result)
+                async with self._request_lock:
+                    # Queueing (including our lock and the SDK's opaque shared
+                    # throttler) consumes the same deadline. No detached task
+                    # may continue writing after cancellation or close.
+                    self._require_same_runtime(identity, healthy=command == "resume" or
+                                               (command == "set_limit" and any(currents)))
+                    if command in {"set_limit", "resume"}:
+                        self._admit_limit(any(currents))
+                        result = await self._await_sdk(circuit.set_dynamic_current(*currents, ttl_minutes))
+                        receipt = await self._read_submission(result, currents, started, 22)
+                    if command in {"pause", "resume"}:
+                        if command == "resume":
+                            self._require_same_runtime(identity, healthy=True)
+                        result = await self._await_sdk(getattr(charger, command)())
+                        command_receipt = await self._read_submission(result, None, started, None)
+                        if command == "pause":
+                            receipt = command_receipt
+                    self._require_same_runtime(identity, healthy=False)
+                    self.last_submission_receipt = receipt
+                    return receipt
         except EaseeAdapterError:
             raise
         except Exception as err:
             raise EaseeAdapterError(f"easee_request_failed:{type(err).__name__}") from None
 
-    @staticmethod
-    def _require_accepted(response: Any) -> None:
-        # Public pyeasee methods return None after a swallowed server error.
-        # Require a real successful HTTP response and release its connection.
+    def _admit_limit(self, nonzero: bool) -> None:
+        """Keep four of twelve SDK slots free from our nonzero writes.
+
+        Native/manual users may share the SDK queue; this is admission for our
+        own requests, not a guarantee of available cloud or device capacity.
+        Zero never waits for local admission. The enclosing deadline still
+        cancels an SDK-throttled zero if its queue cannot finish in time.
+        """
+        now = _monotonic()
+        while self._request_starts and now - self._request_starts[0] > ADMISSION_PERIOD_SECONDS:
+            self._request_starts.popleft()
+        if nonzero and len(self._request_starts) >= NONZERO_ADMISSION_LIMIT:
+            raise EaseeAdapterError("positive_rate_capacity_exhausted")
+        self._request_starts.append(now)
+
+    async def _await_sdk(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self._pending_requests.add(task)
+        try:
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self._pending_requests.discard(task)
+
+    async def _read_submission(self, response: Any, phases, started: float, command_type) -> CommandSubmission:
+        """Consume only bounded correlation metadata; release on every path."""
         if response is None:
             raise EaseeAdapterError("easee_api_no_acceptance")
+        accepted_at = datetime.now(timezone.utc)
+        ticks = ()
         try:
             status = getattr(response, "status", None)
             if type(status) is not int or not 200 <= status < 300:
                 raise EaseeAdapterError("easee_api_rejected")
+            if status == 202 and command_type is not None:
+                try:
+                    content = getattr(response, "content", None)
+                    if content is not None and callable(getattr(content, "read", None)):
+                        chunks = bytearray()
+                        while len(chunks) <= 8192:
+                            part = await content.read(8193 - len(chunks))
+                            if not part:
+                                break
+                            chunks.extend(part)
+                        body = json.loads(chunks) if len(chunks) <= 8192 else None
+                    elif callable(getattr(response, "json", None)):
+                        body = await response.json()
+                    else:
+                        body = None
+                    records = body if type(body) is list else [body]
+                    accepted_ticks = []
+                    for item in records[:16]:
+                        if not isinstance(item, Mapping):
+                            continue
+                        kind = self._positive_integer(item.get("commandId", item.get("CommandId")))
+                        tick = self._positive_integer(item.get("ticks", item.get("Ticks")))
+                        if kind == command_type and tick is not None:
+                            accepted_ticks.append(str(tick))
+                    ticks = tuple(dict.fromkeys(accepted_ticks))
+                except Exception:
+                    # An accepted request with no valid correlation remains
+                    # unverified. Never expose a JSON/error/response body.
+                    ticks = ()
+            return CommandSubmission(status, phases, started, _monotonic(), ticks,
+                                     command_type, accepted_at)
         finally:
             release = getattr(response, "release", None)
             if callable(release):
