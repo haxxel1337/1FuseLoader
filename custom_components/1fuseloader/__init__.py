@@ -91,6 +91,7 @@ class OneFuseLoaderController:
         self._delivery = CommandDeliveryTracker()
         self._delivery_unsub = None
         self._control_identity = None
+        self._delivery_binding = None
         self._positive_retry_after = 0.0
         self._dispatch_task: asyncio.Task | None = None
         self._dispatch_input: RegulatorInput | None = None
@@ -921,12 +922,19 @@ class OneFuseLoaderController:
     def _sync_command_identity(self) -> None:
         identity = getattr(self._adapter, "control_identity", None)
         if identity != self._control_identity:
+            binding = self._configured_control_identity()
             latest = self._delivery.latest
-            if self._control_identity is not None and (self._delivery.unresolved_correlated_zero or (
-                    latest is not None and latest.phases == (0, 0, 0))):
+            unresolved_zero = self._delivery.unresolved_correlated_zero or (
+                    latest is not None and latest.phases == (0, 0, 0))
+            same_or_unknown_binding = binding is None or self._delivery_binding is None or binding == self._delivery_binding
+            if self._control_identity is not None and unresolved_zero and same_or_unknown_binding:
                 self._protective_zero_pending = True
-            self._delivery.reset()
+                # A new stream is not proof that the same charger's cloud
+                # queue drained. Keep exact unresolved IDs for later replies.
+            elif not same_or_unknown_binding or not unresolved_zero:
+                self._delivery.reset()
             self._control_identity = identity
+            self._delivery_binding = binding
 
     def _zero_readback_evidence(self, inp: RegulatorInput, *, require_new_current: bool = True) -> dict[str, Any]:
         record = self._delivery.latest

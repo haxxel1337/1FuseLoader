@@ -277,7 +277,18 @@ class DispatchRaceTests(unittest.IsolatedAsyncioTestCase):
         self.adapter.control_identity = (2,)
         self.controller._sync_command_identity()
         self.assertTrue(self.controller._protective_zero_pending)
-        self.assertIsNone(self.controller._delivery.latest)
+        self.assertIsNotNone(self.controller._delivery.latest)
+
+    async def test_same_binding_reconnect_does_not_forget_older_pending_zero_id(self):
+        self.adapter.control_identity = (1,)
+        self.controller._sync_command_identity()
+        record = self.controller._delivery.begin("set_limit", (0, 0, 0), self.hass.loop.time())
+        self.controller._delivery.accepted(record, receipt(), self.hass.loop.time())
+        self.adapter.control_identity = (2,)
+        self.controller._sync_command_identity()
+        self.assertTrue(self.controller._delivery.unresolved_correlated_zero)
+        self.controller._handle_delivery(event())
+        self.assertFalse(self.controller._delivery.unresolved_correlated_zero)
 
     async def test_settled_positive_history_alone_does_not_create_reconnect_stop(self):
         self.adapter.control_identity = (1,)
