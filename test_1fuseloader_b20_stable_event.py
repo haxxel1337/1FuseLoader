@@ -62,6 +62,28 @@ class StableEventAgeTests(unittest.TestCase):
         for t in (5, 15, 25, 26, 30, 40, 60):
             self.assert_no_new_episode(r, self.sample(r, t, 9.4, 7.085, et=0))
 
+    def test_old_event_after_a_gap_does_not_revive_an_expired_lease(self):
+        for t in (60, 100):
+            with self.subTest(t=t):
+                r = self.stable_seven()
+                d = self.sample(r, t, 9.4, 7.085, et=0, accept=False)
+                self.assertEqual((d.mode, d.current_p1), ("low_grid_alignment_stop", 0))
+                self.assertIsNone(d.nominal_response_deadline_ts)
+                self.assertFalse(r.export_overload_state()["normal_control"].get("alignment_pending", False))
+                self.assertTrue(r._restart_required)
+                self.assertEqual(r.last_target[0], 7)  # no fabricated zero ACK
+                self.assertEqual(r.export_overload_state()["failure_reason"], "response_timeout")
+
+    def test_timely_stable_seven_renewal_keeps_its_existing_live_authority(self):
+        r = self.stable_seven()
+        d = self.sample(r, 59, 9.4, 7.085, et=0)
+        self.assert_no_new_episode(r, d)
+        self.assertTrue(d.should_call_service)
+        self.assertEqual(r.last_set_limit_ts, 59)
+        for t in (60, 89, 119, 120, 149, 179):
+            self.assert_no_new_episode(r, self.sample(r, t, 9.4, 7.085, et=0))
+        self.assertEqual(r.export_overload_state()["normal_control"]["stops"], 0)
+
     def test_age_alone_does_not_supply_ev_credit_for_a_new_higher_offer(self):
         r = self.stable_seven(nominal_import_only_fallback=False)
         for t in (30, 60, 90, 120):

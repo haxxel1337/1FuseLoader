@@ -303,16 +303,19 @@ class OneFuseRegulator:
                            self._uncertainty_previous_offer or 0, self._reduction_previous_cap or 0))
         beyond_known_offer = (source_rejection is not None
                               and current > min(s.max_charge_amps, known_offer) + .5)
+        invalid_lease = bool(source_rejection is not None and self.last_target is not None
+            and (self.last_set_limit_ts is None
+                 or not 0 <= now - self.last_set_limit_ts < self.last_target[3]))
         # An unchanged healthy EVENT can legitimately be old or skewed. Age
         # alone is neither a numeric contradiction nor a physical response
         # that needs this additional deadline. Existing freshness and raw-cap
         # guards still govern ordinary control when no episode is pending.
         if not self._low_grid_pending and not (identity is not None and current >= 1
-                and (numeric_conflict or metadata_invalid or beyond_known_offer)):
+                and (numeric_conflict or metadata_invalid or beyond_known_offer or invalid_lease)):
             return None
         if (not self._low_grid_pending and self._low_grid_deadline is not None
                 and self._low_grid_failure is None and not numeric_conflict
-                and not metadata_invalid and not beyond_known_offer):
+                and not metadata_invalid and not beyond_known_offer and not invalid_lease):
             # A completed coherent episode is not reopened solely because an
             # unchanged, healthy event-driven state later becomes old.
             return None
@@ -366,7 +369,7 @@ class OneFuseRegulator:
         if not valid:
             return stop("source_control_or_raw_budget_invalid")
         if not active and not numeric_conflict:
-            # Invalid provenance/value bounds retain their protective zero;
+            # Invalid provenance/value/lease bounds retain their protective zero;
             # they must never purchase a positive alignment window instead.
             return stop("source_control_or_raw_budget_invalid")
         if self._low_grid_deadline is None:
