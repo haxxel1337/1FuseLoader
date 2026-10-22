@@ -80,6 +80,20 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["step_id"], "user")
         self.assertIsNotNone(result["data_schema"])
 
+    async def test_trial_buttons_route_to_transaction_without_a_recalculation(self):
+        module = importlib.import_module("custom_components.1fuseloader.button")
+        controller = SimpleNamespace(async_start_overload_trial=AsyncMock(),
+                                     async_end_overload_trial=AsyncMock(),
+                                     async_tick=AsyncMock(), async_reset_state=AsyncMock())
+        for key in ("start_overload_trial", "end_overload_trial"):
+            description = next(item for item in module.BUTTON_DESCRIPTIONS if item.key == key)
+            entity = module.OneFuseButton(controller, self.entry, description)
+            await entity.async_press()
+        controller.async_start_overload_trial.assert_awaited_once_with()
+        controller.async_end_overload_trial.assert_awaited_once_with()
+        controller.async_tick.assert_not_awaited()
+        controller.async_reset_state.assert_not_awaited()
+
     async def test_options_form_uses_current_config_entry_property(self):
         self.hass.config_entries = SimpleNamespace(async_get_known_entry=lambda _: self.entry)
         flow = self.flow_module.OneFuseLoaderOptionsFlow()

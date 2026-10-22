@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from math import floor, isfinite
 from typing import Optional
 
@@ -152,6 +154,8 @@ class RegulatorDecision:
     recovery_submission_ts: Optional[float] = None
     nominal_sync_deadline_ts: Optional[float] = None
     nominal_sync_remaining_seconds: Optional[float] = None
+    overload_lifetime_used_seconds: float = 0.0
+    overload_historical_failure_reason: Optional[str] = None
 
 
 class OneFuseRegulator:
@@ -166,6 +170,230 @@ class OneFuseRegulator:
         self.reset_overload_budget()
         self.reset()
         self.update_settings(self.settings)
+
+    @staticmethod
+    def _trial_identity(value: object):
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, (tuple, list)) and value and all(
+                isinstance(part, (str, int)) and not isinstance(part, bool) and part != "" for part in value):
+            return tuple(value)
+        return None
+
+    @staticmethod
+    def _trial_started_timestamp(value: object) -> float:
+        if not isinstance(value, str):
+            raise ValueError("Trial approval UTC is missing")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+                raise ValueError("Trial approval must use UTC")
+            stamp = parsed.timestamp()
+        except (TypeError, ValueError, OverflowError) as err:
+            raise ValueError("Trial approval UTC is invalid") from err
+        if not isfinite(stamp) or stamp < 0:
+            raise ValueError("Trial approval UTC is invalid")
+        return stamp
+
+    @staticmethod
+    def _trial_policy(settings: RegulatorSettings) -> dict:
+        snapshot = asdict(settings)
+        defaults = asdict(RegulatorSettings())
+        if any((type(v) is not bool if type(defaults[key]) is bool else
+                not isinstance(v, str) if isinstance(defaults[key], str) else
+                isinstance(v, bool) or not isinstance(v, (int, float)) or not isfinite(v))
+               for key, v in snapshot.items()):
+            raise ValueError("Trial settings must be finite")
+        if (settings.main_fuse_amps != 25 or not 6 <= settings.min_charge_amps <= 7 <= settings.max_charge_amps
+                or not settings.active_control or settings.dry_run or not settings.overload_enabled
+                or not settings.enable_dynamic_limit
+                or not 0 <= settings.buffer_amps < 25 or settings.minimum_reserve_amps < 0
+                or settings.max_sensor_age_seconds <= 0 or settings.measurement_settle_seconds <= 0
+                or settings.normal_ttl_seconds <= 0
+                or not 0.5 <= settings.overload_margin_amps <= 4
+                or not 60 <= settings.overload_budget_seconds <= 1800
+                or not 25 + settings.overload_margin_amps <= settings.overload_transition_limit_amps <= 38
+                or not 1 <= settings.overload_response_seconds <= 10):
+            raise ValueError("Trial requires the approved bounded 25 A / 7 A profile")
+        return dict(main_fuse_amps=25.0, minimum_current=7,
+                    ceiling_amps=25.0 + settings.overload_margin_amps,
+                    budget_seconds=settings.overload_budget_seconds,
+                    transition_limit_amps=settings.overload_transition_limit_amps,
+                    response_seconds=settings.overload_response_seconds, settings=snapshot)
+
+    @property
+    def effective_overload_failure_reason(self) -> Optional[str]:
+        epoch = self._trial_epoch
+        if epoch is None:
+            return self._overload_failure_reason
+        if epoch.get("failure_reason"):
+            return epoch["failure_reason"]
+        if epoch.get("state") == "active" and self._trial_activation_committed:
+            return None
+        return "trial_activation_pending" if epoch.get("state") in {"pending", "active"} else "trial_not_active"
+
+    @property
+    def effective_overload_used_seconds(self) -> float:
+        epoch = self._trial_epoch
+        if epoch is None:
+            return self._overload_used_seconds
+        closed = epoch.get("closed_used_seconds")
+        return float(closed if closed is not None else
+                     max(0.0, self._overload_used_seconds - epoch["baseline_used_seconds"]))
+
+    @property
+    def effective_overload_budget_seconds(self) -> float:
+        return (self._trial_epoch["policy"]["budget_seconds"] if self._trial_epoch is not None
+                else self.settings.overload_budget_seconds)
+
+    @property
+    def overload_minimum_current(self) -> int:
+        return (7 if self._trial_epoch is not None and self._trial_epoch.get("state") == "active"
+                and self._trial_activation_committed else self.settings.min_charge_amps)
+
+    def trial_diagnostics(self) -> dict:
+        epoch = self._trial_epoch
+        return dict(
+            overload_trial_id=epoch["trial_id"] if epoch else None,
+            overload_trial_state=epoch["state"] if epoch else None,
+            overload_trial_started_at_utc=epoch["started_at_utc"] if epoch else None,
+            overload_trial_failure_reason=epoch.get("failure_reason") if epoch else None,
+            overload_trial_baseline_used_seconds=epoch["baseline_used_seconds"] if epoch else None,
+            overload_trial_used_seconds=self.effective_overload_used_seconds if epoch else None,
+            overload_trial_remaining_seconds=max(0.0, self.effective_overload_budget_seconds
+                                                - self.effective_overload_used_seconds) if epoch else None,
+            overload_trial_activation_committed=self._trial_activation_committed,
+            overload_trial_policy=deepcopy(epoch["policy"]) if epoch else None,
+            overload_lifetime_used_seconds=self._overload_used_seconds,
+            overload_historical_failure_reason=self._overload_failure_reason,
+        )
+
+    def _terminate_trial(self, state: str, reason: str) -> None:
+        epoch = self._trial_epoch
+        if epoch is None or epoch["state"] not in {"pending", "active"}:
+            return
+        epoch["closed_used_seconds"] = max(0.0, self._overload_used_seconds - epoch["baseline_used_seconds"])
+        epoch["state"] = state
+        epoch["failure_reason"] = epoch.get("failure_reason") or reason
+        self._trial_activation_committed = False
+
+    def _validate_trial_input(self, inp: RegulatorInput) -> tuple[float, float, object]:
+        policy = self._trial_policy(self.settings)
+        now, wall, grid, current, gt, et = (None if isinstance(value, bool) else _valid_number(value)
+            for value in (inp.now_ts, inp.wall_now_ts, inp.grid_l1, inp.charger_current,
+                          inp.grid_report_ts, inp.charger_report_ts))
+        identity = self._trial_identity(inp.control_source_id)
+        if (now is None or wall is None or grid is None or current is None or gt is None or et is None
+                or not inp.data_valid or inp.data_error or inp.charger_current_trusted is not True
+                or inp.status.strip().lower() != "charging" or current < 1 or grid < 0
+                or identity is None or identity != self._accepted_control_source_id
+                or self.last_target is None or not 0 < self.last_target[0] <= self.settings.max_charge_amps
+                or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                or current > self.last_target[0]+.5 or current > grid+1
+                or grid > min(23.0, self.settings.main_fuse_amps-self.settings.buffer_amps)
+                or not 0 <= wall-gt <= self.settings.max_sensor_age_seconds
+                or not 0 <= wall-et <= self.settings.max_sensor_age_seconds
+                or not abs(gt-et) <= self.settings.measurement_settle_seconds
+                or self._restart_required or self.paused_by_us or self._awaiting_reduction_target is not None
+                or self._positive_cap is not None or self._low_grid_pending
+                or self._normal_shed_deadline is not None or self._normal_shed_failure is not None
+                or self._uncertainty_ceiling is not None or self._uncertainty_stops > 0
+                or self._uncertainty_retry_submission_pending
+                or self._overload_transition_started is not None or self._overload_hold_active
+                or self._overload_failure_reason not in {None, "response_timeout", "cumulative_budget_exhausted"}
+                or self._trial_epoch is not None and self._trial_epoch.get("failure_reason") == "invalid_persisted_trial"
+                or self._overload_last_eval_ts is not None and now < self._overload_last_eval_ts):
+            raise ValueError("Trial start gates are not satisfied")
+        if self._trial_epoch is not None and self._trial_epoch["state"] in {"pending", "active"}:
+            if (self._trial_identity(self._trial_epoch["source_id"]) != identity
+                    or self._trial_epoch["policy"] != policy
+                    or self._trial_last_grid_ts is not None and gt < self._trial_last_grid_ts
+                    or self._trial_last_ev_ts is not None and et < self._trial_last_ev_ts):
+                raise ValueError("Trial source or frozen policy changed")
+        if not self._observe_overload_time(now, grid, True):
+            raise ValueError("Trial accounting clock is invalid")
+        self._trial_last_grid_ts, self._trial_last_ev_ts = gt, et
+        return now, wall, identity
+
+    def prepare_overload_trial(self, inp: RegulatorInput, *, trial_id: str, started_at_utc: str) -> None:
+        if (not isinstance(trial_id, str) or not trial_id.strip() or len(trial_id) > 128
+                or self._trial_epoch is not None and (
+                    self._trial_epoch["state"] in {"pending", "active"} or self._trial_epoch["trial_id"] == trial_id)):
+            raise ValueError("Trial already exists or its ID is invalid")
+        started = self._trial_started_timestamp(started_at_utc)
+        wall = None if isinstance(inp.wall_now_ts, bool) else _valid_number(inp.wall_now_ts)
+        if wall is None or started > wall + 2:
+            raise ValueError("Trial approval UTC is in the future")
+        _, _, identity = self._validate_trial_input(inp)
+        self._trial_epoch = dict(version=1, trial_id=trial_id, started_at_utc=started_at_utc,
+            source_id=list(identity) if isinstance(identity, tuple) else identity,
+            policy=self._trial_policy(self.settings), baseline_used_seconds=self._overload_used_seconds,
+            state="pending", failure_reason=None, closed_used_seconds=None)
+        self._trial_activation_committed = False
+
+    def stage_overload_trial_activation(self, trial_id: str, inp: RegulatorInput) -> None:
+        if self._trial_epoch is None or self._trial_epoch["trial_id"] != trial_id or self._trial_epoch["state"] != "pending":
+            raise ValueError("No matching pending trial")
+        self._validate_trial_input(inp)
+        self._trial_epoch["state"] = "active"
+        self._trial_activation_committed = False
+
+    def commit_overload_trial_activation(self, trial_id: str, inp: RegulatorInput) -> None:
+        if (self._trial_epoch is None or self._trial_epoch["trial_id"] != trial_id
+                or self._trial_epoch["state"] != "active" or self._trial_epoch["failure_reason"] is not None):
+            raise ValueError("No matching staged trial")
+        self._validate_trial_input(inp)
+        self._trial_activation_committed = True
+
+    def reject_overload_trial_activation(self, trial_id: str, reason: str) -> None:
+        if self._trial_epoch is None or self._trial_epoch["trial_id"] != trial_id:
+            raise ValueError("No matching trial to reject")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Trial rejection reason is missing")
+        self._terminate_trial("failed", reason)
+
+    def end_overload_trial(self, inp: RegulatorInput) -> None:
+        if self._trial_epoch is None:
+            return
+        now = None if isinstance(inp.now_ts, bool) else _valid_number(inp.now_ts)
+        grid = None if isinstance(inp.grid_l1, bool) else _valid_number(inp.grid_l1)
+        valid = bool(inp.data_valid and not inp.data_error and grid is not None and grid >= 0)
+        if not self._observe_overload_time(now, grid, valid):
+            self._terminate_trial("interrupted", "invalid_end_clock")
+            return
+        self._terminate_trial("ended", "ended_by_user")
+
+    def _trial_continuity_error(self, inp: RegulatorInput) -> Optional[str]:
+        epoch = self._trial_epoch
+        if epoch is None or epoch["state"] not in {"pending", "active"}:
+            return None
+        if epoch["policy"]["settings"] != asdict(self.settings):
+            self._terminate_trial("interrupted", "settings_changed")
+            return "Explicit trial policy changed; no trial authority remains."
+        now, wall, grid, current, gt, et = (None if isinstance(value, bool) else _valid_number(value)
+            for value in (inp.now_ts, inp.wall_now_ts, inp.grid_l1, inp.charger_current,
+                          inp.grid_report_ts, inp.charger_report_ts))
+        identity = self._trial_identity(inp.control_source_id)
+        if (now is None or wall is None or grid is None or current is None or gt is None or et is None
+                or not inp.data_valid or inp.data_error or inp.charger_current_trusted is not True
+                or inp.status.strip().lower() != "charging" or grid < 0 or current < 0
+                or current > self.settings.max_charge_amps + .5
+                or identity != self._trial_identity(epoch["source_id"])
+                or identity != self._accepted_control_source_id
+                or self._restart_required or self.paused_by_us
+                or self._uncertainty_ceiling is not None or self._uncertainty_stops > 0
+                or self._uncertainty_retry_submission_pending
+                or self.last_target is None or self.last_target[0] <= 0
+                or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                or not 0 <= wall-gt <= self.settings.max_sensor_age_seconds or et > wall
+                or self._trial_last_grid_ts is not None and gt < self._trial_last_grid_ts
+                or self._trial_last_ev_ts is not None and et < self._trial_last_ev_ts):
+            self._terminate_trial("interrupted", "source_control_or_session_invalid")
+            return "Explicit trial source, live control lease or charging session is invalid."
+        # An unchanged trusted EVENT need not change its timestamp while a
+        # stable minimum is held. It grants no new response time or EV proof.
+        self._trial_last_grid_ts, self._trial_last_ev_ts = gt, et
+        return None
 
     def update_settings(self, settings: RegulatorSettings) -> None:
         if settings.controlled_phase != "L1" or settings.unused_phase_current != 0:
@@ -193,6 +421,9 @@ class OneFuseRegulator:
                 settings.main_fuse_amps + settings.overload_margin_amps > settings.overload_transition_limit_amps
                 or settings.min_charge_amps >= settings.main_fuse_amps or not settings.enable_dynamic_limit):
             raise ValueError("Enabled overload requires dynamic limiting and a separate transition ceiling")
+        if (self._trial_epoch is not None and self._trial_epoch["state"] in {"pending", "active"}
+                and self._trial_epoch["policy"]["settings"] != asdict(settings)):
+            self._terminate_trial("interrupted", "settings_changed")
         self.settings = settings
         self.reset_timers()
         if getattr(self, "_low_grid_pending", False):
@@ -215,6 +446,7 @@ class OneFuseRegulator:
 
     def reset(self) -> None:
         # Routine controller resets must not grant another overload budget.
+        self._terminate_trial("interrupted", "controller_reset")
         preserve_normal = None
         if (getattr(self, "_low_grid_pending", False)
                 or getattr(self, "_normal_shed_deadline", None) is not None
@@ -372,7 +604,7 @@ class OneFuseRegulator:
             and not self._restart_required and not self.paused_by_us
             and status in START_ALLOWED_STATUSES and self._last_input_current_trusted
             and self._overload_transition_started is None and not self._overload_hold_active
-            and self._overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
+            and self.effective_overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
             and accepted is not None and s.min_charge_amps <= cap <= accepted <= s.max_charge_amps
             and self.last_set_limit_ts is not None and 0 <= now - self.last_set_limit_ts < self.last_target[3]
             and wall is not None and gt is not None and et is not None
@@ -613,15 +845,19 @@ class OneFuseRegulator:
             if self._normal_shed_sync_deadline is not None:
                 return stop(self._normal_shed_failure)
             return None
+        # An explicit epoch owns its own response/budget failure. The older
+        # nominal trial must not turn its exhaustion into another ten seconds.
+        if not pending and self._trial_epoch is not None:
+            return None
         if not pending and not (s.bounded_nominal_shedding and s.overload_enabled
                 and s.enable_dynamic_limit and status == "charging" and current >= 1
                 and self._last_input_current_trusted and not self._restart_required
                 and not self.paused_by_us and self.last_target is not None
                 and self.last_target[0] > self.startup_current
                 and self._overload_transition_started is None and not self._overload_hold_active
-                and self._overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
-                and (self._overload_failure_reason is not None
-                     or self._overload_used_seconds >= s.overload_budget_seconds)
+                and self.effective_overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
+                and (self.effective_overload_failure_reason is not None
+                     or self.effective_overload_used_seconds >= self.effective_overload_budget_seconds)
                 and grid > s.main_fuse_amps):
             return None
         wall, grid_ts, ev_ts = (self._last_input_wall_now_ts, self._last_input_grid_ts,
@@ -636,7 +872,7 @@ class OneFuseRegulator:
         guards_valid = bool(s.bounded_nominal_shedding and s.overload_enabled and s.enable_dynamic_limit
             and not self._restart_required and not self.paused_by_us and status == "charging"
             and self._overload_transition_started is None and not self._overload_hold_active
-            and self._overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
+            and self.effective_overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
             and accepted is not None and s.min_charge_amps <= accepted <= s.max_charge_amps
             and current >= 1 and current <= min(s.max_charge_amps,
                 self._normal_shed_previous if pending else accepted or 0) + .5)
@@ -1455,6 +1691,13 @@ class OneFuseRegulator:
         This operational counter does not estimate fuse cooling. Its caller
         must not treat an explicit reset as confirmation of a cold fuse.
         """
+        if getattr(self, "_trial_epoch", None) is not None:
+            self._terminate_trial("interrupted", "budget_reset_attempt")
+            return
+        self._trial_epoch: Optional[dict] = None
+        self._trial_activation_committed = False
+        self._trial_last_grid_ts: Optional[float] = None
+        self._trial_last_ev_ts: Optional[float] = None
         self._overload_used_seconds = 0.0
         self._overload_last_eval_ts: Optional[float] = None
         self._overload_exposure_active = False
@@ -1473,7 +1716,10 @@ class OneFuseRegulator:
         self._overload_minimum_attempted_at: Optional[float] = None
 
     def _fail_overload(self, reason: str) -> None:
-        self._overload_failure_reason = self._overload_failure_reason or reason
+        if self._trial_epoch is not None:
+            self._terminate_trial("failed", reason)
+        else:
+            self._overload_failure_reason = self._overload_failure_reason or reason
 
     def export_overload_state(self) -> dict[str, object]:
         """JSON-safe exposure state; the controller adds its UTC save time."""
@@ -1484,6 +1730,7 @@ class OneFuseRegulator:
             "transition_pending": self._overload_transition_started is not None,
             "minimum_held": self._overload_hold_active,
             "failure_reason": self._overload_failure_reason,
+            **({"trial_epoch": deepcopy(self._trial_epoch)} if self._trial_epoch is not None else {}),
             "normal_control": {
                 "version": 1,
                 "response_pending": self._normal_shed_deadline is not None and self._normal_shed_failure is None,
@@ -1501,6 +1748,48 @@ class OneFuseRegulator:
             },
         }
 
+    def _import_trial_epoch(self, value: object) -> bool:
+        # An invalid additive epoch must block only its new authority; retain
+        # the separately validated lifetime exposure and historical failure.
+        fallback_policy = dict(main_fuse_amps=25.0, minimum_current=7, ceiling_amps=29.0,
+            budget_seconds=1800, transition_limit_amps=38.0, response_seconds=10,
+            settings=asdict(self.settings))
+        self._trial_epoch = dict(version=1, trial_id="invalid-persisted-trial",
+            started_at_utc="1970-01-01T00:00:00+00:00", source_id="invalid",
+            policy=fallback_policy, baseline_used_seconds=self._overload_used_seconds,
+            state="failed", failure_reason="invalid_persisted_trial", closed_used_seconds=0.0)
+        try:
+            if not isinstance(value, dict):
+                return False
+            epoch = deepcopy(value)
+            baseline = epoch.get("baseline_used_seconds")
+            closed = epoch.get("closed_used_seconds")
+            state = epoch.get("state")
+            identity = self._trial_identity(epoch.get("source_id"))
+            started = self._trial_started_timestamp(epoch.get("started_at_utc"))
+            policy = epoch.get("policy")
+            validated = OneFuseRegulator(RegulatorSettings(**policy["settings"]))
+            valid = bool(type(epoch.get("version")) is int and epoch["version"] == 1
+                and isinstance(epoch.get("trial_id"), str) and epoch["trial_id"].strip()
+                and len(epoch["trial_id"]) <= 128 and identity is not None
+                and started <= datetime.now(timezone.utc).timestamp() + 5
+                and not isinstance(baseline, bool) and _valid_number(baseline) is not None
+                and 0 <= baseline <= self._overload_used_seconds
+                and policy == self._trial_policy(validated.settings)
+                and state in {"pending", "active", "ended", "failed", "interrupted"}
+                and (state in {"pending", "active"} and epoch.get("failure_reason") is None and closed is None
+                     or state in {"ended", "failed", "interrupted"}
+                     and isinstance(epoch.get("failure_reason"), str) and bool(epoch["failure_reason"])
+                     and not isinstance(closed, bool) and _valid_number(closed) is not None
+                     and 0 <= closed <= self._overload_used_seconds - baseline + 1e-6))
+        except (TypeError, ValueError, KeyError, AttributeError, OverflowError):
+            return False
+        if not valid:
+            return False
+        self._trial_epoch = epoch
+        self._terminate_trial("interrupted", "interrupted_after_restore")
+        return True
+
     def import_overload_state(self, state: object, elapsed_seconds: float = 0.0) -> bool:
         """Restore exposure, charging unknown downtime to a preceding overload.
 
@@ -1508,6 +1797,8 @@ class OneFuseRegulator:
         pending response is therefore latched as interrupted, never renewed.
         Invalid persisted state fails closed instead of refunding exposure.
         """
+        previous_trial = deepcopy(self._trial_epoch)
+        previous_used, previous_failure = self._overload_used_seconds, self._overload_failure_reason
         used = _valid_number(state.get("used_seconds")) if isinstance(state, dict) else None
         gap = _valid_number(elapsed_seconds)
         valid = (isinstance(state, dict) and state.get("version") == 1
@@ -1517,19 +1808,39 @@ class OneFuseRegulator:
                  and type(state.get("minimum_held")) is bool
                  and (state.get("failure_reason") is None or isinstance(state.get("failure_reason"), str))
                  and gap is not None and gap >= 0 and not isinstance(elapsed_seconds, bool))
+        self._trial_epoch = None
+        self._trial_activation_committed = False
+        self._trial_last_grid_ts = self._trial_last_ev_ts = None
         self._clear_overload_transition()
         self._overload_hold_active = False
         self._overload_last_eval_ts = None
         if not valid:
+            if previous_trial is not None:
+                self._overload_used_seconds = max(previous_used, float(self.settings.overload_budget_seconds))
+                self._overload_failure_reason = previous_failure
+                self._trial_epoch = previous_trial
+                self._terminate_trial("interrupted", "invalid_persisted_exposure")
+                return False
             self._overload_used_seconds = float(self.settings.overload_budget_seconds)
             self._overload_exposure_active = True
             self._overload_failure_reason = "invalid_persisted_exposure"
             return False
         assert isinstance(state, dict) and used is not None and gap is not None
         self._overload_used_seconds = used + (gap if state["exposure_active"] else 0.0)
+        if previous_trial is not None:
+            self._overload_used_seconds = max(previous_used, self._overload_used_seconds)
         self._overload_exposure_active = state["exposure_active"]
         self._overload_hold_active = state["minimum_held"]
         self._overload_failure_reason = state.get("failure_reason")
+        trial_valid = self._import_trial_epoch(state["trial_epoch"]) if "trial_epoch" in state else True
+        if previous_trial is not None:
+            self._overload_failure_reason = previous_failure or self._overload_failure_reason
+            if ("trial_epoch" not in state or not trial_valid
+                    or self._trial_epoch["trial_id"] != previous_trial["trial_id"]
+                    or self._trial_epoch["baseline_used_seconds"] != previous_trial["baseline_used_seconds"]):
+                self._trial_epoch = previous_trial
+                self._terminate_trial("interrupted", "interrupted_by_import")
+                trial_valid = False
         if state["transition_pending"]:
             self._fail_overload("interrupted_transition")
         normal = state.get("normal_control")
@@ -1581,7 +1892,7 @@ class OneFuseRegulator:
                     self.settings.restart_stable_seconds * 2 ** min(self._uncertainty_stops - 1, 3)))
             if self._uncertainty_ceiling is not None:
                 self._restart_required = True
-        return True
+        return trial_valid
 
     def _observe_overload_time(self, now: Optional[float], grid: Optional[float], valid: bool) -> bool:
         """Charge left-held observed overload intervals, including transitions.
@@ -1611,9 +1922,15 @@ class OneFuseRegulator:
         s = self.settings
         if not s.overload_enabled:
             return None
+        minimum = self.overload_minimum_current
         ceiling = s.main_fuse_amps + s.overload_margin_amps
         reserve = min(s.buffer_amps, max(0.0, s.minimum_reserve_amps))
-        needed = house + s.min_charge_amps > s.main_fuse_amps - reserve or grid > ceiling
+        needed = house + minimum > s.main_fuse_amps - reserve or grid > ceiling
+        if self._trial_epoch is not None and self._trial_activation_committed:
+            # Keep the explicitly approved 7 A envelope until full NORMAL
+            # buffered headroom returns. The generic 6 A continuity rule must
+            # not take over just because a successful response fell below25.
+            needed = house + minimum > s.main_fuse_amps - s.buffer_amps or grid > s.main_fuse_amps
         pending = self._overload_transition_started is not None
 
         def stop(reason: str) -> tuple[str, str, int, float]:
@@ -1632,12 +1949,12 @@ class OneFuseRegulator:
             return None
         if grid > s.overload_transition_limit_amps:
             return stop("transition_current_exceeded")
-        if self._overload_failure_reason is not None and (needed or grid > s.main_fuse_amps or pending):
+        if self.effective_overload_failure_reason is not None and (needed or grid > s.main_fuse_amps or pending):
             if (pending
                     or not self._blocked_overload_allows_nominal_reduction(now, grid, current, house, status)):
-                return stop(self._overload_failure_reason)
+                return stop(self.effective_overload_failure_reason)
             return None
-        if (needed or pending) and self._overload_used_seconds >= s.overload_budget_seconds:
+        if (needed or pending) and self.effective_overload_used_seconds >= self.effective_overload_budget_seconds:
             return stop("cumulative_budget_exhausted")
         if (needed or pending) and (self._last_input_grid_ts is None or self._last_input_charger_ts is None):
             return stop("missing_report_timestamps")
@@ -1653,7 +1970,7 @@ class OneFuseRegulator:
                            and self._overload_minimum_ev_floor is not None
                            and self._last_input_charger_ts > self._overload_minimum_ev_floor)
             if (self._meaningfully_charging(status, current)
-                    and current <= s.min_charge_amps + 0.5 and ev_advanced):
+                    and current <= minimum + 0.5 and ev_advanced):
                 if self._overload_minimum_response_ts is None:
                     self._overload_minimum_response_ts = self._last_input_charger_ts
             else:
@@ -1670,12 +1987,12 @@ class OneFuseRegulator:
             grid_at_or_after_minimum = (self._overload_minimum_response_ts is not None
                                         and self._last_input_grid_ts is not None
                                         and self._last_input_grid_ts >= self._overload_minimum_response_ts)
-            if (current <= s.min_charge_amps + 0.5 and grid_advanced and ev_advanced
+            if (current <= minimum + 0.5 and grid_advanced and ev_advanced
                     and grid_at_or_after_minimum and grid > ceiling):
                 return stop("minimum_observed_above_ceiling")
-            if (current <= s.min_charge_amps + 0.5 and grid <= ceiling
+            if (current <= minimum + 0.5 and grid <= ceiling
                     and grid_advanced and ev_advanced and grid_after_minimum):
-                if current > grid + 1 or house + s.min_charge_amps > ceiling:
+                if current > grid + 1 or house + minimum > ceiling:
                     return stop("minimum_response_outside_ceiling")
                 self._clear_overload_transition()
                 self._overload_hold_active = grid > s.main_fuse_amps or needed
@@ -1690,36 +2007,42 @@ class OneFuseRegulator:
                 anchor = self._overload_anchor_house if self._overload_anchor_house is not None else house
                 self._increase_since = None
                 return ("overload_shedding", "Requesting minimum current and waiting within the original response deadline.",
-                        s.min_charge_amps, anchor)
+                        minimum, anchor)
 
         if not needed:
             self._overload_hold_active = False
             return None
         if current > grid + 1:
             return stop("inconsistent_current_observations")
-        if house + s.min_charge_amps > ceiling:
+        if house + minimum > ceiling:
             return stop("minimum_projection_exceeds_ceiling")
         # A low observation can predate a higher offer that the API has already
         # accepted. It cannot prove that a NEW reduction to minimum responded.
         # Keep the same bounded shedding path until the accepted minimum has
         # both a later EV receipt and a still later coherent grid receipt.
-        higher_offer = self.last_target is not None and self.last_target[0] > s.min_charge_amps
-        if current <= s.min_charge_amps + 0.5 and not higher_offer:
+        higher_offer = self.last_target is not None and self.last_target[0] > minimum
+        if current <= minimum + 0.5 and not higher_offer:
             if grid > ceiling:
                 return stop("minimum_observed_above_ceiling")
             self._overload_hold_active = True
             self._increase_since = None
             return ("overload_minimum", "Retaining minimum current inside the opt-in post-response envelope and cumulative time budget.",
-                    s.min_charge_amps, house)
+                    minimum, house)
         if self._overload_hold_active:
             return stop("minimum_response_lost")
-        self._overload_transition_started = now
+        origin = now
+        if self._trial_epoch is not None and self._trial_activation_committed:
+            # A delayed grid report cannot buy a fresh ten-second peak window.
+            origin -= max(0.0, self._last_input_wall_now_ts - self._last_input_grid_ts)
+            if now - origin >= s.overload_response_seconds:
+                return stop("response_timeout")
+        self._overload_transition_started = origin
         self._overload_entry_grid_ts = self._last_input_grid_ts
         self._overload_entry_charger_ts = self._last_input_charger_ts
         self._overload_anchor_house = house
         self._increase_since = None
         return ("overload_shedding", "Requesting minimum current; a bounded transition starts now, including API latency.",
-                s.min_charge_amps, house)
+                minimum, house)
 
     def reject_submission(self, decision: RegulatorDecision, now_ts: float) -> bool:
         """Debit a failed/aborted reserved recovery without inventing an ACK.
@@ -1939,7 +2262,7 @@ class OneFuseRegulator:
             if changed and (old_target is None or target > old_target):
                 self._last_increase_ts = now_ts
                 self._nominal_shedding_started = self._nominal_shedding_budget = None
-            if (target == self.settings.min_charge_amps
+            if (target == self.overload_minimum_current
                     and self._overload_transition_started is not None
                     and self._overload_minimum_accepted_at is None):
                 self._overload_minimum_accepted_at = now_ts
@@ -2164,7 +2487,7 @@ class OneFuseRegulator:
         return self.last_action_ts is None or now - self.last_action_ts >= self.settings.min_seconds_between_actions
 
     def _should_send_limit(self, now: float, current: int, ttl: int) -> bool:
-        if (current == self.settings.min_charge_amps
+        if (current == self.overload_minimum_current
                 and self._overload_transition_started is not None
                 and self._overload_minimum_accepted_at is None):
             # A still-valid identical lease may have been accepted BEFORE the
@@ -2286,12 +2609,14 @@ class OneFuseRegulator:
                 available_l1=available, house_load_l1=house, grid_l1=grid,
                 charger_current=current or 0.0, paused_by_us=self.paused_by_us,
                 should_call_service=bool(should_call), dry_run=s.dry_run,
-                overload_used_seconds=self._overload_used_seconds,
-                overload_remaining_seconds=max(0.0, s.overload_budget_seconds - self._overload_used_seconds),
+                overload_used_seconds=self.effective_overload_used_seconds,
+                overload_remaining_seconds=max(0.0, self.effective_overload_budget_seconds - self.effective_overload_used_seconds),
                 overload_transition_remaining_seconds=(
                     max(0.0, s.overload_response_seconds - (now - self._overload_transition_started))
                     if self._overload_transition_started is not None else None),
-                overload_failure_latched=self._overload_failure_reason is not None,
+                overload_failure_latched=self.effective_overload_failure_reason is not None,
+                overload_lifetime_used_seconds=self._overload_used_seconds,
+                overload_historical_failure_reason=self._overload_failure_reason,
                 startup_charge_amps=self.startup_current,
                 waiting_for_vehicle_seconds=(max(0.0, now - self._waiting_for_vehicle_since)
                                              if self._waiting_for_vehicle_since is not None else 0.0),
@@ -2347,6 +2672,9 @@ class OneFuseRegulator:
             error = f"Charger status '{status}' is unavailable, unsupported or a fault."
         if not self._observe_overload_time(observed_now, grid, not bool(error)):
             error = "Controller time is invalid or moved backwards."
+        trial_error = self._trial_continuity_error(inp)
+        if trial_error is not None:
+            error = error or trial_error
         if error:
             if self._low_grid_pending:
                 self._low_grid_failure = "source_invalid"
@@ -2914,7 +3242,7 @@ class OneFuseRegulator:
         mode = "normal"
         reason = f"Calculated charge headroom is {available} A."
         if self._nominal_overload_blocked:
-            reason += f" Nominal limiting only; experimental overload remains blocked: {self._overload_failure_reason}."
+            reason += f" Nominal limiting only; experimental overload remains blocked: {self.effective_overload_failure_reason}."
         if s.enable_soft_guard and soft:
             target = min(target, max(0, s.soft_current_amps))
             if 0 < target < s.min_charge_amps:

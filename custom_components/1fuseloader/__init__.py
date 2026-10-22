@@ -10,6 +10,7 @@ from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from math import isfinite
 from typing import Any
+from uuid import uuid4
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
@@ -179,6 +180,8 @@ class OneFuseLoaderController:
         self._budget_error_type: str | None = None
         self._budget_retry_at = 0.0
         self._overload_restore_receipt_floor: float | None = None
+        self._trial_action_result = "not_requested"
+        self._trial_action_error: str | None = None
         self._unsub_deadline = None
         self._deadline_token: object | None = None
         if command_adapter is not None:
@@ -253,6 +256,98 @@ class OneFuseLoaderController:
             self.regulator.reset()
             if not self._stopped:
                 await self._async_tick_locked()
+
+    def _trial_start_input(self, generation: int) -> RegulatorInput:
+        """Read current start prerequisites without requesting any EV action."""
+        if self._stopped or generation != self._generation:
+            raise ValueError("Trial start interrupted by controller reconfiguration")
+        if not self._budget_loaded or self._budget_error:
+            raise ValueError("Trial start requires a successfully loaded, verified exposure ledger")
+        if (self._dispatch_task is not None or self._protective_zero_pending
+                or self._delivery.unresolved_correlated_zero
+                or self.hass.loop.time() < self._positive_retry_after):
+            raise ValueError("Trial start cannot bypass an unresolved command or retry barrier")
+        if self._adapter is None or self._adapter.control_block_reason:
+            raise ValueError("Trial start requires a verified command adapter")
+        if (self._adapter.telemetry_block_reason
+                or getattr(self._adapter, "overload_block_reason", "unverified")
+                or not getattr(self._adapter, "offline_limits_verified_zero", False)):
+            raise ValueError("Trial start requires healthy telemetry and verified zero offline limits")
+        return self._read_input()
+
+    async def _save_trial_checkpoint(self) -> None:
+        exposure = self.regulator.export_overload_state()
+        await asyncio.wait_for(self._budget_store.async_save(exposure), EXPOSURE_STORE_TIMEOUT_SECONDS)
+        if not self._budget_store.state_is_durable(self.regulator.export_overload_state()):
+            raise RuntimeError("Trial checkpoint is not verified")
+
+    async def async_start_overload_trial(self) -> None:
+        """Explicitly arm one period; this method never sends a charger command.
+
+        Both pending and active states are independently verified before the
+        in-memory permission is committed. A failed/late transaction cannot
+        grant another period after restart: restored periods are interrupted.
+        """
+        generation = self._generation
+        async with self._lock:
+            inp = self._trial_start_input(generation)
+            trial_id = str(uuid4())
+            self.regulator.prepare_overload_trial(
+                inp, trial_id=trial_id, started_at_utc=datetime.now(timezone.utc).isoformat())
+            self._trial_action_result = "pending_checkpoint"
+            self._trial_action_error = None
+            try:
+                await self._save_trial_checkpoint()
+                self.regulator.stage_overload_trial_activation(
+                    trial_id, self._trial_start_input(generation))
+                self._trial_action_result = "active_checkpoint"
+                await self._save_trial_checkpoint()
+                self.regulator.commit_overload_trial_activation(
+                    trial_id, self._trial_start_input(generation))
+                if not self._budget_store.state_is_durable(self.regulator.export_overload_state()):
+                    raise RuntimeError("Latest trial activation state is not verified")
+            except (Exception, asyncio.CancelledError) as err:
+                self.regulator.reject_overload_trial_activation(trial_id, "activation_not_verified")
+                self._trial_action_result = "blocked"
+                self._trial_action_error = type(err).__name__
+                # Keep the terminal period in the next serialized checkpoint,
+                # even if an earlier shielded write completes after timeout.
+                self._budget_error = "overload_budget_save_failed"
+                self._budget_error_type = type(err).__name__
+                self._budget_retry_at = 0.0
+                self._handle_source_change(None)
+                self.notify()
+                if isinstance(err, asyncio.CancelledError):
+                    raise
+                raise ValueError("Trial activation was not verified; no new overload control is permitted") from err
+            self._trial_action_result = "active"
+            self.notify()
+
+    async def async_end_overload_trial(self) -> None:
+        """Withdraw the period and let ordinary protection evaluate next."""
+        self._generation += 1
+        self._cancel_positive_dispatch()
+        async with self._lock:
+            if self._stopped or not self._budget_loaded:
+                raise ValueError("Controller is not ready to end a trial")
+            self.regulator.end_overload_trial(self._read_input())
+            try:
+                await self._save_trial_checkpoint()
+            except (Exception, asyncio.CancelledError) as err:
+                self._trial_action_result = "end_checkpoint_unverified"
+                self._trial_action_error = type(err).__name__
+                self._budget_error = "overload_budget_save_failed"
+                self._budget_error_type = type(err).__name__
+                self._budget_retry_at = 0.0
+                self._handle_source_change(None)
+                self.notify()
+                if isinstance(err, asyncio.CancelledError):
+                    raise
+                raise ValueError("Trial ended locally; its checkpoint is unverified and control is blocked") from err
+            self._trial_action_result = "ended"
+            self._trial_action_error = None
+            self._handle_source_change(None)
+            self.notify()
 
     async def async_start(self) -> None:
         async with self._lock:
@@ -1092,7 +1187,11 @@ class OneFuseLoaderController:
             "physical_current_verified": False,
             "device_ttl_verified": False,
             "budget_storage_error": self._budget_error,
-            "overload_failure_reason": self.regulator.export_overload_state()["failure_reason"],
+            "overload_failure_reason": self.regulator.effective_overload_failure_reason,
+            "overload_historical_failure_reason": self.regulator.export_overload_state()["failure_reason"],
+            **self.regulator.trial_diagnostics(),
+            "overload_trial_action_result": self._trial_action_result,
+            "overload_trial_action_error_type": self._trial_action_error,
             "budget_storage_error_type": self._budget_error_type,
             "budget_checkpoint_verified_at_utc": (
                 datetime.fromtimestamp(self._budget_store.last_verified_at, timezone.utc).isoformat()
@@ -1165,6 +1264,7 @@ class OneFuseLoaderController:
             self._normal_control_checkpoint_pending = True
         if (self._budget_error != "overload_budget_restore_failed"
                 and (self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"]
+                     or exposure.get("trial_epoch") is not None
                      or self._normal_control_checkpoint_pending)
                 and self.hass.loop.time() >= self._budget_retry_at):
             try:
@@ -1369,6 +1469,13 @@ class OneFuseLoaderController:
                                                 if self.last_accepted_limit else None),
                 "overload_used_seconds": exposure["used_seconds"],
                 "overload_failure_reason": exposure["failure_reason"],
+                "overload_effective_used_seconds": self.regulator.effective_overload_used_seconds,
+                "overload_effective_failure_reason": self.regulator.effective_overload_failure_reason,
+                **{key: value for key, value in self.regulator.trial_diagnostics().items()
+                   if key in {"overload_trial_id", "overload_trial_state",
+                              "overload_trial_used_seconds", "overload_trial_remaining_seconds",
+                              "overload_trial_failure_reason", "overload_lifetime_used_seconds",
+                              "overload_historical_failure_reason"}},
                 "command_started_at_utc": attempt["started_at_utc"],
                 "command_completed_at_utc": None,
                 "command_result": "pending", "command_error": None,

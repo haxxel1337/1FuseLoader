@@ -12,6 +12,8 @@ from .const import DOMAIN, NAME
 BUTTON_DESCRIPTIONS = [
     ButtonEntityDescription(key="recalculate_now", name="Recalculate Now", icon="mdi:calculator"),
     ButtonEntityDescription(key="reset_state", name="Reset Internal State", icon="mdi:restart"),
+    ButtonEntityDescription(key="start_overload_trial", name="Start New Overload Trial (7 A)", icon="mdi:timer-play-outline"),
+    ButtonEntityDescription(key="end_overload_trial", name="End Overload Trial", icon="mdi:timer-stop-outline"),
 ]
 
 
@@ -39,5 +41,9 @@ class OneFuseButton(ButtonEntity):
     async def async_press(self) -> None:
         if self.entity_description.key == "reset_state":
             await self.controller.async_reset_state()
+        elif self.entity_description.key == "start_overload_trial":
+            await self.controller.async_start_overload_trial()
+        elif self.entity_description.key == "end_overload_trial":
+            await self.controller.async_end_overload_trial()
         else:
             await self.controller.async_tick()

@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0b23
+
+- Add explicit Start/End Overload Trial buttons and period state/time sensors.
+  Start requires an already charging, healthy normal-load session; it sends no
+  charger command and cannot override normal recovery or delivery barriers.
+- Freeze each explicit period at 7 A minimum, 29 A sustained total, 1800
+  cumulative seconds above 25 A and the existing 38 A/10 s response bounds.
+  Preserve lifetime exposure and historical failures separately; dips do not
+  replenish time and a new period never starts automatically.
+- Verify pending and active checkpoints before granting memory permission.
+  Interrupt every restored pending/active period and end permission on source,
+  policy, reset or storage failures. Duplicate presses and late writes cannot
+  refill or restore a period. Legacy records without a trial retain b22 behavior.
+- Keep normal minimum current, existing source protections and command leases.
+  This software trial does not estimate fuse cooling or guarantee physical
+  response, uninterrupted charging or exactly 30 minutes of available time.
+
 ## 0.4.0b22
 
 - Keep an accepted positive-current response with its original alignment
