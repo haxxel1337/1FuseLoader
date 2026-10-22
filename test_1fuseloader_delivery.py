@@ -324,6 +324,40 @@ class DispatchRaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(timer.call_args.args[1], 0)
         self.assertLessEqual(timer.call_args.args[1], 3)
 
+    async def test_sync_deadline_uses_separate_clock_without_expired_response_loop(self):
+        await self.controller.async_tick()
+        decision = replace(self.controller.last_decision, mode="normal_shedding_sync", current_p1=7,
+                           nominal_response_deadline_ts=None,
+                           nominal_sync_deadline_ts=self.hass.loop.time() + 3)
+        with patch.object(fixtures.runtime, "async_call_later", return_value=Mock()) as timer:
+            self.controller._schedule_overload_deadline(decision)
+        self.assertEqual(timer.call_count, 1)
+        self.assertGreater(timer.call_args.args[1], 2)
+        self.assertLessEqual(timer.call_args.args[1], 3)
+
+    async def test_sync_mode_cannot_write_or_resume_even_with_forged_positive_plan(self):
+        await self.controller.async_tick()
+        template = self.controller.last_decision
+        count = len(self.adapter.calls)
+        for command in ("set_limit", "resume"):
+            decision = replace(template, mode="normal_shedding_sync", command=command, current_p1=7,
+                               should_call_service=True, nominal_response_deadline_ts=None,
+                               nominal_sync_deadline_ts=self.hass.loop.time() + 3)
+            with patch.object(self.controller.regulator, "evaluate", return_value=decision):
+                await self.controller.async_tick()
+            self.assertEqual(len(self.adapter.calls), count)
+            self.assertIsNone(self.controller.last_decision.command)
+            self.assertFalse(self.controller.last_decision.should_call_service)
+
+    async def test_protective_zero_is_not_suppressed_by_sync_guard(self):
+        await self.controller.async_tick()
+        decision = replace(self.controller.last_decision, mode="normal_shedding_sync", command="set_limit",
+                           current_p1=0, should_call_service=True, nominal_response_deadline_ts=None,
+                           nominal_sync_deadline_ts=None)
+        with patch.object(self.controller.regulator, "evaluate", return_value=decision):
+            await self.controller.async_tick()
+        self.assertEqual(self.adapter.calls[-1].current_p1, 0)
+
     async def test_ev_age_crossing_checkpoint_invalidates_positive_dispatch(self):
         original = self.controller._read_input()
         before = replace(original, wall_now_ts=119.5, grid_report_ts=119.5, charger_report_ts=0)

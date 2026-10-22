@@ -131,6 +131,28 @@ still be verified under supervision after activation.
 
 ### Bounded lower-current trial (b18)
 
+From b21, a lower-current report received before the original response deadline
+can enter a separate, nonrenewable synchronization phase while waiting for the
+next meter report. This requires a live accepted lower offer, a trusted
+post-acceptance EV event at that offer and a post-command grid report below the
+full normal buffered ceiling. The phase lasts at most five seconds from the
+first qualifying response, also bounded by the existing alignment window.
+It sends no command or lease renewal and permits no increase or resume.
+Raw grid above the normal buffered ceiling, excessive EV current, invalid source
+or control metadata and an expired lease terminate the phase. Unchanged events
+and small measurement jitter do not move the response floor. A meaningful EV
+value change requires a grid event after that change without granting more time.
+Only a verified configured source binding can enter this phase.
+
+This is explicitly bounded sampling tolerance, not a proof of simultaneous
+physical measurements. A grid report of 18.6 A followed by a 7 A EV report does
+not meet the stronger whole-offer raw-grid bound (18.6 + 7 = 25.6 A). The short
+synchronization policy depends on the reported reduction continuing and prompt
+fresh meter feedback; it cannot guarantee that no intervening household load
+change occurred. The original high-load response deadline, experimental budget
+and persisted failures are not renewed. Reloading an interrupted phase retains
+the existing failed-response recovery behavior.
+
 The separate **Bounded lower-current trial after overload lockout** option is
 off by default. It requires the experimental profile to be enabled. When an
 old response timeout or spent experimental budget would block continued
