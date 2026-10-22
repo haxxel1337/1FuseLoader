@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import time
 import unittest
 from unittest.mock import patch
@@ -99,6 +100,26 @@ class NormalSheddingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.async_tick()
         self.assertEqual([call.current_p1 for call in self.adapter.calls], [0])
         self.assertIsNotNone(self.regulator._normal_shed_failure)
+
+    async def test_expired_dispatch_recheck_can_retain_valid_no_write_sync_hold(self):
+        await self.controller.async_tick()
+        accepted = self.controller.last_decision
+        count = len(self.adapter.calls)
+        self.states["sensor.grid"].state = "18.6"
+        self.states["sensor.car"].state = "7.079"
+        self.states["sensor.grid"].last_reported = self.wall()
+        self.states["sensor.car"].last_reported = self.wall()
+        old_plan = replace(accepted, command="set_limit", should_call_service=True,
+                           nominal_response_deadline_ts=self.now-1)
+        sync = replace(accepted, mode="normal_shedding_sync", command=None,
+                       should_call_service=False, nominal_response_deadline_ts=None,
+                       nominal_sync_deadline_ts=self.now+3)
+        with patch.object(self.regulator, "evaluate", side_effect=[old_plan, sync]):
+            await self.controller.async_tick()
+        self.assertEqual(len(self.adapter.calls), count)
+        self.assertEqual(self.controller.last_decision.mode, "normal_shedding_sync")
+        self.assertEqual(self.controller.last_decision.current_p1, 7)
+        self.assertFalse(self.controller.last_decision.should_call_service)
 
     async def test_late_acceptance_queues_expiry_even_without_new_reports(self):
         original = self.adapter.async_execute

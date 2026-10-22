@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0b21
+
+- Separate the lower-current response deadline from subsequent meter/EV
+  synchronization. A trusted post-acceptance low-current event received within
+  the original window and a buffered-normal post-command grid report can enter
+  one fixed synchronization phase, at most five seconds from that response.
+- Retain only the existing lower offer during synchronization: no writes,
+  renewals, increases or resumes. A raw grid above the normal buffered ceiling,
+  rising EV current, source/control fault or expired lease terminates it.
+- Anchor later-grid ordering to the first qualifying response rather than a
+  continually moving latest EV event. Preserve interrupted-response recovery,
+  cumulative exposure and existing overload latches.
+
 ## 0.4.0b20
 
 - Fix an old, unchanged EV current event starting a new ten-second low-grid

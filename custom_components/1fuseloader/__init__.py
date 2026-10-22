@@ -1209,6 +1209,11 @@ class OneFuseLoaderController:
                 command="set_limit", current_p1=0, current_p2=0, current_p3=0,
                 should_call_service=self.settings.active_control,
             )
+        if (decision.mode.removeprefix("dry_run_") == "normal_shedding_sync"
+                and decision.current_p1 > 0):
+            # Synchronization retains only an existing live offer. It cannot
+            # write, renew a lease, or resume, even if a stale plan says so.
+            decision = replace(decision, command=None, service=None, should_call_service=False)
         self._schedule_overload_deadline(decision, max(0.0, self.hass.loop.time() - inp.now_ts))
         self.last_decision = decision
         if not decision.should_call_service:
@@ -1246,7 +1251,11 @@ class OneFuseLoaderController:
             inp = latest
             plan_source_diagnostics = dict(self.source_diagnostics)
             exposure = self.regulator.export_overload_state()
-            if decision.current_p1 > 0 or decision.command == "resume":
+            sync_hold = bool(decision.mode.removeprefix("dry_run_") == "normal_shedding_sync"
+                and decision.command is None and not decision.should_call_service
+                and decision.nominal_sync_deadline_ts is not None
+                and self.hass.loop.time() < decision.nominal_sync_deadline_ts)
+            if (decision.current_p1 > 0 or decision.command == "resume") and not sync_hold:
                 decision = replace(
                     decision, mode="normal_shedding_stop",
                     reason="The fixed nominal response deadline expired before dispatch; requesting 0 A.",
@@ -1539,6 +1548,11 @@ class OneFuseLoaderController:
         if decision.current_p1 > 0 and decision.nominal_response_deadline_ts is not None:
             # Absolute monotonic time includes source age and every await.
             delays.append(decision.nominal_response_deadline_ts - self.hass.loop.time() + elapsed)
+        sync_deadline = getattr(decision, "nominal_sync_deadline_ts", None)
+        if decision.current_p1 > 0 and sync_deadline is not None:
+            # Separate, nonrenewable measurement synchronization; the original
+            # high-load response allowance is never extended by this timer.
+            delays.append(sync_deadline - self.hass.loop.time() + elapsed)
         if (self.settings.overload_enabled and decision.mode.removeprefix("dry_run_").startswith("overload")
                 and decision.current_p1 > 0):
             delays.append(decision.overload_remaining_seconds - OVERLOAD_LEASE_RESERVE_SECONDS)

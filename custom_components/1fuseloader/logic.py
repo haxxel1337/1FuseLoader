@@ -150,6 +150,8 @@ class RegulatorDecision:
     nominal_response_remaining_seconds: Optional[float] = None
     nominal_response_deadline_ts: Optional[float] = None
     recovery_submission_ts: Optional[float] = None
+    nominal_sync_deadline_ts: Optional[float] = None
+    nominal_sync_remaining_seconds: Optional[float] = None
 
 
 class OneFuseRegulator:
@@ -195,6 +197,9 @@ class OneFuseRegulator:
         self.reset_timers()
         if getattr(self, "_low_grid_pending", False):
             self._low_grid_failure = "settings_changed_during_alignment"
+            self._restart_required = True
+        if getattr(self, "_normal_shed_sync_deadline", None) is not None:
+            self._normal_shed_failure = "settings_changed_during_sync"
             self._restart_required = True
         # An options change cannot extend an alignment deadline using old bounds.
         self._clear_positive_alignment()
@@ -439,6 +444,79 @@ class OneFuseRegulator:
         self._normal_shed_response_ts: Optional[float] = None
         self._normal_shed_attempt_at: Optional[float] = None
         self._normal_shed_failure: Optional[str] = None
+        self._normal_shed_source_id = None
+        self._normal_shed_response_monotonic: Optional[float] = None
+        self._normal_shed_sync_deadline: Optional[float] = None
+        self._normal_shed_sync_value: Optional[float] = None
+        self._normal_shed_sync_floor: Optional[float] = None
+        self._normal_shed_sync_last_ev_ts: Optional[float] = None
+        self._normal_shed_sync_last_grid_ts: Optional[float] = None
+
+    def _nominal_sync_plan(self, now: float, grid: float, current: float,
+                           response_valid: bool, stop, complete):
+        """Wait briefly for publication ordering, never for another EV rise.
+
+        This is explicit sampling tolerance, not simultaneous measurements or
+        a fuse thermal model. The first response owns the only sync deadline;
+        a substantively changed current needs a later grid, without more time.
+        """
+        s = self.settings
+        cap = self._normal_shed_cap
+        active = self._normal_shed_sync_deadline is not None
+        identity = self._last_input_control_source_id
+        wall, gt, et = self._last_input_wall_now_ts, self._last_input_grid_ts, self._last_input_charger_ts
+        if not active:
+            if (self._normal_shed_source_id is None or not response_valid
+                    or self._normal_shed_response_monotonic is None
+                    or self._normal_shed_accepted_at is None
+                    or self._normal_shed_ev_floor is None
+                    or self._normal_shed_grid_floor is None
+                    or gt is None or gt <= max(self._normal_shed_grid_floor, self._normal_shed_ev_floor)
+                    or grid > s.main_fuse_amps - s.buffer_amps):
+                return None
+        if (identity is None or identity != self._normal_shed_source_id
+                or identity != self._accepted_control_source_id
+                or wall is None or gt is None or et is None
+                or not self._last_input_current_trusted
+                or not 0 <= wall - et <= s.max_sensor_age_seconds
+                or not 0 <= wall - gt <= s.max_sensor_age_seconds
+                or cap is None or not 1 <= current <= cap + .5
+                or grid > s.main_fuse_amps - s.buffer_amps
+                or self.last_target is None or self.last_target[0] != cap):
+            return stop("sync_source_or_nominal_bounds_invalid")
+        if active:
+            if (et < self._normal_shed_sync_last_ev_ts or gt < self._normal_shed_sync_last_grid_ts):
+                return stop("sync_source_clock_regressed")
+        else:
+            window = _valid_number(s.measurement_settle_seconds)
+            if window is None or window <= 0:
+                return stop("sync_alignment_window_invalid")
+            first = self._normal_shed_response_monotonic
+            if not self._normal_shed_accepted_at < first < self._normal_shed_deadline:
+                return None
+            deadline = min(first + min(5.0, window), self._normal_shed_origin + window)
+            if now >= deadline:
+                # A grace never used cannot retroactively shorten the still
+                # live original response window. It also cannot be restarted
+                # from this later observation or a new identical EV receipt.
+                return None
+            self._normal_shed_sync_deadline = deadline
+            self._normal_shed_sync_value = current
+            self._normal_shed_sync_floor = et
+        if now >= self._normal_shed_sync_deadline:
+            return stop("sync_timeout")
+        if abs(current - self._normal_shed_sync_value) > .1:
+            if self._normal_shed_sync_last_ev_ts is not None and et <= self._normal_shed_sync_last_ev_ts:
+                return stop("sync_value_changed_without_new_source_event")
+            self._normal_shed_sync_value = current
+            self._normal_shed_sync_floor = et
+        self._normal_shed_sync_last_ev_ts = et
+        self._normal_shed_sync_last_grid_ts = gt
+        if (gt > self._normal_shed_sync_floor and current <= grid + 1
+                and grid - current + cap <= s.main_fuse_amps - s.buffer_amps):
+            return complete(max(0.0, grid - current))
+        return ("normal_shedding_sync", "The lower accepted offer has a timely reported response; awaiting one later grid observation inside the fixed sampling-tolerance window. No command, increase, resume or lease renewal is permitted.",
+                None, cap, grid, s.normal_ttl_seconds)
 
     def _bounded_normal_shedding_plan(self, now: float, grid: float, current: float,
                                       house: float, status: str):
@@ -456,13 +534,26 @@ class OneFuseRegulator:
                 self._uncertainty_ceiling = min(self.last_target[0], self.startup_current)
                 self._uncertainty_previous_offer = self.last_target[0]
             self._normal_shed_failure = code
+            self._normal_shed_sync_deadline = None
             self.reset_timers()
             self._clear_positive_alignment()
             self._restart_required = True
             return ("normal_shedding_stop", f"Bounded nominal reduction failed: {code}; requesting 0 A. Experimental budget and failure remain unchanged.",
                     "set_limit", 0, grid, s.normal_ttl_seconds)
 
+        def complete(basis: float):
+            self._awaiting_reduction_target = None
+            self._house_before_reduction = None
+            self._settle_started = None
+            self._clear_partial_reduction_alignment()
+            self._clear_positive_alignment()
+            self._clear_bounded_nominal_shedding()
+            return ("normal_shedding_complete", "Lower accepted offer has fresh nominal response evidence; experimental allowance remains blocked.",
+                    "set_limit", cap, basis, s.normal_ttl_seconds)
+
         if self._normal_shed_failure is not None:
+            if self._normal_shed_sync_deadline is not None:
+                return stop(self._normal_shed_failure)
             return None
         if not pending and not (s.bounded_nominal_shedding and s.overload_enabled
                 and s.enable_dynamic_limit and status == "charging" and current >= 1
@@ -508,6 +599,7 @@ class OneFuseRegulator:
             self._normal_shed_previous = accepted
             self._normal_shed_grid_floor = grid_ts
             self._normal_shed_ev_floor = ev_ts
+            self._normal_shed_source_id = self._last_input_control_source_id
             self._uncertainty_ceiling = min(self._uncertainty_ceiling or accepted, self.startup_current)
             self._uncertainty_previous_offer = max(self._uncertainty_previous_offer or accepted, accepted)
             pending = True
@@ -523,7 +615,7 @@ class OneFuseRegulator:
             return stop("source_or_control_invalid")
         if grid > min(38, s.overload_transition_limit_amps):
             return stop("raw_peak_exceeded")
-        if now >= self._normal_shed_deadline:
+        if self._normal_shed_sync_deadline is None and now >= self._normal_shed_deadline:
             return stop("response_timeout")
         soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
         pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
@@ -543,6 +635,8 @@ class OneFuseRegulator:
             if response_valid:
                 if self._normal_shed_response_ts is None:
                     self._normal_shed_response_ts = ev_ts
+                if self._normal_shed_response_monotonic is None:
+                    self._normal_shed_response_monotonic = min(now, now - (wall - ev_ts))
             elif current > cap + .5:
                 self._normal_shed_response_ts = None
             response = self._normal_shed_response_ts
@@ -551,16 +645,14 @@ class OneFuseRegulator:
                             and grid - current + cap <= s.main_fuse_amps - s.buffer_amps)
             raw_proof = bool(s.nominal_import_only_fallback and grid_ts > self._normal_shed_grid_floor
                              and grid + cap <= s.main_fuse_amps - s.buffer_amps)
-            if ev_proof or raw_proof:
+            if self._normal_shed_sync_deadline is None and (ev_proof or raw_proof):
                 basis = max(0.0, grid - current) if ev_proof else grid
-                self._awaiting_reduction_target = None
-                self._house_before_reduction = None
-                self._settle_started = None
-                self._clear_partial_reduction_alignment()
-                self._clear_positive_alignment()
-                self._clear_bounded_nominal_shedding()
-                return ("normal_shedding_complete", "Lower accepted offer has fresh nominal response evidence; experimental allowance remains blocked.",
-                        "set_limit", cap, basis, s.normal_ttl_seconds)
+                return complete(basis)
+            sync = self._nominal_sync_plan(now, grid, current, response_valid, stop, complete)
+            if sync is not None:
+                return sync
+        if now >= self._normal_shed_deadline:
+            return stop("response_timeout")
         return ("normal_shedding", "Requesting only a lower accepted offer inside the original sample-aged response deadline; no EV credit, increase, resume or new overload budget.",
                 "set_limit", cap, grid, s.normal_ttl_seconds)
 
@@ -2060,11 +2152,17 @@ class OneFuseRegulator:
                 nominal_response_remaining_seconds=(max(0.0, self._low_grid_deadline - now)
                     if self._low_grid_pending and self._low_grid_failure is None else
                     max(0.0, self._normal_shed_deadline - now)
-                    if self._normal_shed_deadline is not None and self._normal_shed_failure is None else None),
+                    if self._normal_shed_deadline is not None and self._normal_shed_failure is None
+                    and self._normal_shed_sync_deadline is None else None),
                 nominal_response_deadline_ts=(self._low_grid_deadline
                     if self._low_grid_pending and self._low_grid_failure is None else
-                    self._normal_shed_deadline if self._normal_shed_failure is None else None),
+                    self._normal_shed_deadline if self._normal_shed_failure is None
+                    and self._normal_shed_sync_deadline is None else None),
                 recovery_submission_ts=recovery_submission_ts,
+                nominal_sync_deadline_ts=(self._normal_shed_sync_deadline
+                    if self._normal_shed_failure is None else None),
+                nominal_sync_remaining_seconds=(max(0.0, self._normal_shed_sync_deadline - now)
+                    if self._normal_shed_sync_deadline is not None and self._normal_shed_failure is None else None),
             )
 
         error = inp.data_error
@@ -2142,7 +2240,7 @@ class OneFuseRegulator:
             mode, reason, command, cap, house, ttl = bounded_plan
             house_basis = ("nominal_response_verified" if mode == "normal_shedding_complete"
                            else "raw_grid_bounded_normal_response")
-            refresh_required = mode == "normal_shedding"
+            refresh_required = mode in {"normal_shedding", "normal_shedding_sync"}
             result = decision(mode, reason, command, cap, ttl, emergency=True)
             if mode == "normal_shedding" and result.should_call_service:
                 if (self._normal_shed_attempt_at is not None
