@@ -50,6 +50,36 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Response ownership and conservative retention (b22)
+
+The same accepted current change has one response owner. A qualified EV-first
+rise stays with the existing positive-response context through both earlier
+uncertainty gates. The accepted lease, selected source binding, original
+alignment budget and conservative household anchor must remain valid. A
+source fault, higher raw load or configured protective guard still takes
+priority. Accepting or renewing an API request is not physical-response proof.
+
+When a lower offer has already been accepted, a subsequent coherent grid/EV
+pair can hand it to the remaining reduction guard. That handoff preserves
+the previous possible offer, post-acceptance EV floor and earliest deadline.
+It cannot count an EV event preceding acceptance as response to the reduction.
+
+An expired alignment clock alone does not imply excessive load. With the
+verified import-only option, a fresh raw grid plus the **entire unresolved
+previous offer** may establish a conservative normal-envelope bound. In that
+case `low_grid_raw_hold` retains only the accepted lower offer. It grants no
+new alignment time, increase, resume, EV subtraction or experimental allowance.
+Ordinary same-cap renewal requires that whole-authority bound and a live lease
+at every evaluation. Losing the bound or source/lease validity requests zero.
+The unresolved hold is checkpointed; restoring it cannot create another
+positive response attempt. A genuinely post-acceptance lower-current event
+and later coherent grid observation can complete the held response.
+
+These nominal-control repairs do not change the experimental overload contract
+below. An enabled experimental switch with exhausted time or a saved failure
+does not grant another 30-minute period. This version adds no automatic reset
+or new trial activation.
+
 ### Command delivery and low-grid alignment (b19)
 
 From b20, event age or skew alone cannot open a new low-grid alignment
@@ -57,6 +87,8 @@ episode. An old, unchanged EV event follows the existing freshness policy:
 it provides no new credit for an increase, but does not manufacture a new
 ten-second response obligation. A genuine numeric conflict still uses the
 bounded alignment path and its original deadline, including after reentry.
+The b22 ownership and whole-authority retention rules above apply before
+opening a competing response or treating an expired clock as overload.
 
 Each command records HTTP acceptance separately from an exactly correlated
 Easee CommandResponse and native circuit-limit observations. A missing or

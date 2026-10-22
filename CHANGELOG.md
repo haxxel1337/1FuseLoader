@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0b22
+
+- Keep an accepted positive-current response with its original alignment
+  owner across EV-first reports. Neither of the earlier uncertainty fallbacks
+  may start a competing decrease for that same qualified response.
+- Hand a coherent lower-offer observation to the remaining reduction guard
+  without treating a pre-acceptance EV event as physical response or granting
+  another deadline.
+- Retain only an existing lower offer when fresh raw grid plus the entire
+  unresolved previous offer fits the normal buffered envelope. This raw hold
+  supplies no EV subtraction, increase, resume or new alignment time. Source,
+  lease, clock and whole-offer bounds continue to apply; interrupted holds
+  remain fail-closed after restart.
+- Preserve historical experimental exposure and failures. This update does
+  not activate a new overload trial, replenish time or estimate fuse cooling.
+
 ## 0.4.0b21
 
 - Separate the lower-current response deadline from subsequent meter/EV

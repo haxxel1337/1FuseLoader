@@ -103,17 +103,25 @@ class StableEventAgeTests(unittest.TestCase):
         for t in (12, 16, 19.9):
             d = self.sample(r, t, 2.4, 16.2, et=0)
             self.assertEqual((d.current_p1, d.nominal_response_deadline_ts), (7, 20))
-        self.assertEqual(self.sample(r, 20, 2.4, 16.2, et=0).current_p1, 0)
+        held = self.sample(r, 20, 2.4, 16.2, et=0)
+        self.assertEqual((held.mode, held.current_p1), ("low_grid_raw_hold", 7))
+        self.assertEqual(r._low_grid_deadline, 20)
+        self.assertIsNone(held.nominal_response_deadline_ts)
+        self.assertLessEqual(held.grid_l1 + r._low_grid_previous, 23)
         self.assertEqual(r.export_overload_state()["failure_reason"], "response_timeout")
 
-    def test_numeric_seven_conflict_still_times_out_without_a_new_source_event(self):
+    def test_numeric_seven_conflict_can_hold_whole_offer_without_a_new_source_event(self):
         r = self.stable_seven()
         d = self.sample(r, 10, 2.4, 7.085, et=0)
         self.assertEqual(d.nominal_response_deadline_ts, 20)
         # Coherent numbers do not erase an already-open, unconfirmed episode.
         d = self.sample(r, 12, 9.4, 7.085, et=0)
         self.assertEqual((d.mode, d.nominal_response_deadline_ts), ("low_grid_alignment", 20))
-        self.assertEqual(self.sample(r, 20, 9.4, 7.085, et=0).current_p1, 0)
+        held = self.sample(r, 20, 9.4, 7.085, et=0)
+        self.assertEqual((held.mode, held.current_p1), ("low_grid_raw_hold", 7))
+        self.assertEqual(r._low_grid_deadline, 20)
+        self.assertIsNone(held.nominal_response_deadline_ts)
+        self.assertLessEqual(held.grid_l1 + r._low_grid_previous, 23)
 
     def test_completed_episode_reentry_spends_only_original_remaining_time(self):
         r = self.pending()
@@ -122,14 +130,19 @@ class StableEventAgeTests(unittest.TestCase):
         reopened = self.sample(r, 16, 2.4, 4.5, et=12)
         self.assertEqual((reopened.current_p1, reopened.nominal_response_deadline_ts), (7, 20))
         self.assertEqual(reopened.nominal_response_remaining_seconds, 4)
-        self.assertEqual(self.sample(r, 20, 2.4, 4.5, et=12).current_p1, 0)
+        held = self.sample(r, 20, 2.4, 4.5, et=12)
+        self.assertEqual((held.mode, held.current_p1), ("low_grid_raw_hold", 7))
+        self.assertEqual(r._low_grid_deadline, 20)
+        self.assertIsNone(held.nominal_response_deadline_ts)
 
     def test_genuine_conflict_after_completed_deadline_does_not_open_new_time(self):
         r = self.pending()
         self.sample(r, 15, 6.5, 4.5, et=12)
         d = self.sample(r, 25, 2.4, 4.5, et=12, accept=False)
-        self.assertEqual((d.mode, d.current_p1), ("low_grid_alignment_stop", 0))
-        self.assertEqual(self.sample(r, 26, 2.4, 4.5, et=12, accept=False).current_p1, 0)
+        self.assertEqual((d.mode, d.current_p1), ("low_grid_raw_hold", 7))
+        self.assertEqual(r._low_grid_deadline, 20)
+        self.assertIsNone(d.nominal_response_deadline_ts)
+        self.assertEqual(self.sample(r, 26, 2.4, 4.5, et=12, accept=False).current_p1, 7)
 
     def test_new_event_then_later_grid_can_still_finish_before_original_deadline(self):
         r = self.stable_seven()
