@@ -83,14 +83,20 @@ class LowGridAlignmentTests(unittest.TestCase):
         r = self.pending()
         self.sample(r, 15, 6.5, 4.5, et=12)
         d = self.sample(r, 25, 2.4, 4.5, et=12)
-        self.assertEqual((d.mode, d.current_p1), ("low_grid_alignment_stop", 0))
+        self.assertEqual((d.mode, d.current_p1), ("low_grid_raw_hold", 7))
+        self.assertEqual(r._low_grid_deadline, 20)
+        self.assertIsNone(d.nominal_response_deadline_ts)
+        self.assertLessEqual(d.grid_l1 + r._low_grid_previous, 23)
 
     def test_source_event_not_get_receipt_is_completion_evidence(self):
         r = self.pending()
         d = self.sample(r, 19, 2.4, .02, et=0, status="awaiting_start", charger_snapshot_verified=True)
-        self.assertEqual(d.mode, "low_grid_alignment")
+        self.assertNotEqual(d.mode, "low_grid_alignment_complete")
+        self.assertEqual(r._low_grid_previous, 16)
         d = self.sample(r, 20, 2.4, .02, et=0, status="awaiting_start", charger_snapshot_verified=True)
-        self.assertEqual((d.current_p1, d.mode), (0, "low_grid_alignment_stop"))
+        self.assertEqual((d.current_p1, d.mode), (7, "low_grid_raw_hold"))
+        self.assertEqual(r._low_grid_previous, 16)
+        self.assertTrue(r.export_overload_state()["normal_control"]["alignment_pending"])
 
     def test_new_ev_requires_a_strictly_later_grid(self):
         r = self.pending()
@@ -114,7 +120,11 @@ class LowGridAlignmentTests(unittest.TestCase):
         d = self.sample(r, 16, 2.4, 16.2, et=0)
         self.assertEqual(d.nominal_response_deadline_ts, 17)
         r.acknowledge(replace(d, should_call_service=True), 16)
-        self.assertEqual(self.sample(r, 17, 2.4, 16.2, et=0).current_p1, 0)
+        held = self.sample(r, 17, 2.4, 16.2, et=0)
+        self.assertEqual((held.mode, held.current_p1), ("low_grid_raw_hold", 7))
+        self.assertEqual(r._low_grid_deadline, 17)
+        self.assertIsNone(held.nominal_response_deadline_ts)
+        self.assertLessEqual(held.grid_l1 + r._low_grid_previous, 23)
 
     def test_late_ack_cannot_reopen_terminal_zero(self):
         r = self.running()
@@ -149,7 +159,11 @@ class LowGridAlignmentTests(unittest.TestCase):
         r._positive_alignment_used_seconds = 14
         d = self.sample(r, 10, 2.4, 16.2, et=0)
         self.assertEqual(d.nominal_response_deadline_ts, 11)
-        self.assertEqual(self.sample(r, 11, 2.4, 16.2, et=0).current_p1, 0)
+        held = self.sample(r, 11, 2.4, 16.2, et=0)
+        self.assertEqual((held.mode, held.current_p1), ("low_grid_raw_hold", 7))
+        self.assertEqual(r._low_grid_deadline, 11)
+        self.assertIsNone(held.nominal_response_deadline_ts)
+        self.assertLessEqual(held.grid_l1 + r._low_grid_previous, 23)
 
     def test_existing_bounded_normal_response_is_not_restarted(self):
         r = self.running()

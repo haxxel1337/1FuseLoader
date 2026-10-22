@@ -1255,7 +1255,15 @@ class OneFuseLoaderController:
                 and decision.command is None and not decision.should_call_service
                 and decision.nominal_sync_deadline_ts is not None
                 and self.hass.loop.time() < decision.nominal_sync_deadline_ts)
-            if (decision.current_p1 > 0 or decision.command == "resume") and not sync_hold:
+            raw_hold = bool(decision.mode.removeprefix("dry_run_") == "low_grid_raw_hold"
+                and not decision.should_call_service and decision.command in {None, "set_limit"}
+                and decision.nominal_response_deadline_ts is None
+                and self.regulator.last_target is not None
+                and decision.current_p1 == self.regulator.last_target[0] > 0)
+            # The re-evaluation can retire the old response deadline using a
+            # fresh, whole-authority raw bound. Retain that existing offer
+            # without dispatching the old request or manufacturing a zero.
+            if (decision.current_p1 > 0 or decision.command == "resume") and not (sync_hold or raw_hold):
                 decision = replace(
                     decision, mode="normal_shedding_stop",
                     reason="The fixed nominal response deadline expired before dispatch; requesting 0 A.",
