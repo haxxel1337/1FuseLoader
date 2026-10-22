@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0b20
+
+- Fix an old, unchanged EV current event starting a new ten-second low-grid
+  response window despite numerically coherent currents and a safe raw-grid
+  budget. Event age/skew alone now stays with the existing freshness and
+  conservative-cap policy; it cannot manufacture a new response obligation.
+- Keep genuine numeric-conflict windows, fixed deadlines, source faults,
+  raw-current limits and persisted recovery/overload latches unchanged.
+- Add regressions for first activation with a stable event, aging/skew,
+  genuine conflict reentry, timeout, restore and an unchanged full-buffer edge.
+
 ## 0.4.0b19
 
 - Correlate bounded HTTP receipts with exact Easee CommandResponse IDs, and
