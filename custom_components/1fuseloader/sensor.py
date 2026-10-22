@@ -16,6 +16,17 @@ from .const import CONF_BMW_DEVICE_ID, DOMAIN, NAME
 
 SENSOR_DESCRIPTIONS = [
     SensorEntityDescription(
+        key="overload_trial_state", name="Overload Trial State", icon="mdi:timer-outline",
+    ),
+    SensorEntityDescription(
+        key="overload_trial_used_seconds", name="Overload Trial Used Seconds",
+        native_unit_of_measurement="s", icon="mdi:timer-sand",
+    ),
+    SensorEntityDescription(
+        key="overload_trial_remaining_seconds", name="Overload Trial Remaining Seconds",
+        native_unit_of_measurement="s", icon="mdi:timer-sand-complete",
+    ),
+    SensorEntityDescription(
         key="mode",
         name="Mode",
         icon="mdi:ev-station",
@@ -141,6 +152,9 @@ class OneFuseSensor(SensorEntity):
     @property
     def native_value(self) -> Any:
         key = self.entity_description.key
+        if key.startswith("overload_trial_"):
+            value = self.controller.regulator.trial_diagnostics().get(key)
+            return "not_started" if key == "overload_trial_state" and value is None else value
         if key.startswith("bmw_"):
             field = self.controller.bmw_context.get(key.removeprefix("bmw_"), {})
             return field.get("value") if field.get("available") else None
@@ -175,6 +189,11 @@ class OneFuseSensor(SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
+        if self.entity_description.key.startswith("overload_trial_"):
+            return {
+                **self.controller.regulator.trial_diagnostics(),
+                "scope": "explicit_software_period_not_fuse_thermal_model",
+            }
         if self.entity_description.key.startswith("bmw_"):
             field = self.controller.bmw_context.get(self.entity_description.key.removeprefix("bmw_"), {})
             # The source timestamp establishes age without recording a changing

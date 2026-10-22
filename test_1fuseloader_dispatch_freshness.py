@@ -310,6 +310,10 @@ class DispatchFreshnessTests(unittest.IsolatedAsyncioTestCase):
             "grid_report_utc", "charger_report_utc", "source_error",
             "product_update_received_at_utc", "previous_submitted_limit_p1",
             "overload_used_seconds", "overload_failure_reason",
+            "overload_effective_used_seconds", "overload_effective_failure_reason",
+            "overload_trial_id", "overload_trial_state", "overload_trial_used_seconds",
+            "overload_trial_remaining_seconds", "overload_trial_failure_reason",
+            "overload_lifetime_used_seconds", "overload_historical_failure_reason",
             "command_started_at_utc", "command_completed_at_utc", "command_result",
             "command_error", "clock_scope",
         }

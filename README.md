@@ -50,6 +50,44 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Explicit experimental trial periods (b23)
+
+**Start New Overload Trial (7 A)** starts a separately recorded software
+allowance. It sends no charger command and cannot start an idle vehicle. It
+requires an already charging vehicle, a live accepted positive offer, verified
+zero offline fallback, fresh coherent current reports and raw L1 within the
+normal buffered ceiling (23 A with the default 25 A fuse and 2 A buffer).
+Storage, command, source and normal-recovery barriers must be clear.
+
+Each period freezes this policy: reduce to 7 A at high load, require at most
+29 A total after the observed response, and count at most 1800 cumulative
+seconds above 25 A, including the bounded response phase. The existing peak
+ceiling of 38 A and fixed response window of at most 10 seconds still apply.
+An infeasible 7 A offer, missing or invalid measurements, failed response or
+other protective condition may request zero earlier. This is not a fuse
+temperature model or a guarantee of an uninterrupted 30-minute session.
+
+Activation requires two independently verified checkpoints before permission
+is granted in memory. Concurrent presses cannot create additional time. The
+period has its own ID, frozen policy and baseline in the monotonic lifetime
+exposure journal. A new explicit period does not erase the historical exposure
+or failure; short load dips never replenish its time.
+
+**End Overload Trial** withdraws that allowance and saves the terminal state.
+It does not send a charger command itself; the next ordinary evaluation applies
+the remaining normal protections. Restart, reset, source or policy changes and
+source faults interrupt the period. Every restored pending or active period is
+interrupted, so a late write or restart cannot resume it automatically. A later
+period requires a new eligible, explicit start. No automatic cooling or rearm
+is inferred.
+
+The three **Overload Trial** sensors show state, used seconds and remaining
+seconds. Their attributes distinguish period failure from historical failure
+and lifetime exposure. An installation without a recorded trial retains the
+legacy experimental behavior described below. Upgrading does not clear a spent
+legacy budget, start a period or start charging. Normal minimum current remains
+separately configurable; the explicit period minimum is 7 A.
+
 ### Response ownership and conservative retention (b22)
 
 The same accepted current change has one response owner. A qualified EV-first
@@ -75,10 +113,10 @@ The unresolved hold is checkpointed; restoring it cannot create another
 positive response attempt. A genuinely post-acceptance lower-current event
 and later coherent grid observation can complete the held response.
 
-These nominal-control repairs do not change the experimental overload contract
+These nominal-control repairs did not change the experimental overload contract
 below. An enabled experimental switch with exhausted time or a saved failure
-does not grant another 30-minute period. This version adds no automatic reset
-or new trial activation.
+does not grant another 30-minute period. B23 adds the separate explicit start
+described above; it adds no automatic reset.
 
 ### Command delivery and low-grid alignment (b19)
 
@@ -432,8 +470,9 @@ draw. Updating or restarting does not clear an existing safety latch.
 Exposure is cumulative rather than a thermal cooling estimate. The controller
 persists its budget and unresolved exposure across unload/restart and setting
 changes; a short dip below the fuse rating, toggling the switch or restarting HA
-does not grant another 30 minutes. There is no user budget-reset button in this
-release. Unknown elapsed exposure is handled conservatively. Diagnostic sensors
+does not grant another 30 minutes. B23's explicit-period start records a new
+baseline without resetting the lifetime counter; it is not a budget-reset
+button. Unknown elapsed exposure is handled conservatively. Diagnostic sensors
 show used/remaining time, the response window and any latched failure.
 
 A blocked timed-overload profile does not by itself forbid a proven normal
