@@ -126,12 +126,15 @@ class LowGridAlignmentTests(unittest.TestCase):
         self.assertTrue(r._restart_required)
 
     def test_whole_offer_full_buffer_boundary_and_rising_raw(self):
-        r = self.running()
-        d = self.sample(r, 10, 16, 16.2, et=-30)
+        # Keep this a genuine numeric conflict at the full 16 + 7 A raw
+        # boundary. A merely aged coherent event no longer starts a window.
+        r = self.regulator(max_charge_amps=32)
+        self.assertEqual(self.sample(r, 0, 20, 18).current_p1, 21)
+        d = self.sample(r, 10, 16, 18, et=0)
         self.assertEqual(d.current_p1, 7)
-        d = self.sample(r, 11, 16.0001, 16.2, et=-30, accept=False)
+        d = self.sample(r, 11, 16.0001, 18, et=0, accept=False)
         self.assertEqual(d.current_p1, 0)
-        self.assertEqual(self.sample(r, 12, 2.4, 16.2, et=-30, accept=False).current_p1, 0)
+        self.assertEqual(self.sample(r, 12, 2.4, 18, et=0, accept=False).current_p1, 0)
 
     def test_rising_raw_cannot_open_another_normal_or_experimental_window(self):
         r = self.pending()

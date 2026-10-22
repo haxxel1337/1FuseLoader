@@ -52,6 +52,12 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ### Command delivery and low-grid alignment (b19)
 
+From b20, event age or skew alone cannot open a new low-grid alignment
+episode. An old, unchanged EV event follows the existing freshness policy:
+it provides no new credit for an increase, but does not manufacture a new
+ten-second response obligation. A genuine numeric conflict still uses the
+bounded alignment path and its original deadline, including after reentry.
+
 Each command records HTTP acceptance separately from an exactly correlated
 Easee CommandResponse and native circuit-limit observations. A missing or
 ambiguous correlation remains unverified. Vendor clocks are not used to

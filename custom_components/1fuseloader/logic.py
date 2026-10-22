@@ -295,11 +295,24 @@ class OneFuseRegulator:
         identity = self._last_input_control_source_id
         numeric_conflict = (current > grid + 1
                            or (self._positive_cap is not None and current > self._positive_cap + .5))
-        conflict = numeric_conflict or not self._fast_sources_fresh()
-        if not self._low_grid_pending and not (identity is not None and conflict and current >= 1):
+        source_rejection = self._numeric_source_rejection()
+        metadata_invalid = source_rejection not in {
+            None, "charger_receipt_stale", "report_skew_exceeds_alignment_window"}
+        known_offer = (self._low_grid_previous if self._low_grid_deadline is not None else
+                       max(self.last_target[0] if self.last_target else 0,
+                           self._uncertainty_previous_offer or 0, self._reduction_previous_cap or 0))
+        beyond_known_offer = (source_rejection is not None
+                              and current > min(s.max_charge_amps, known_offer) + .5)
+        # An unchanged healthy EVENT can legitimately be old or skewed. Age
+        # alone is neither a numeric contradiction nor a physical response
+        # that needs this additional deadline. Existing freshness and raw-cap
+        # guards still govern ordinary control when no episode is pending.
+        if not self._low_grid_pending and not (identity is not None and current >= 1
+                and (numeric_conflict or metadata_invalid or beyond_known_offer)):
             return None
         if (not self._low_grid_pending and self._low_grid_deadline is not None
-                and self._low_grid_failure is None and not numeric_conflict):
+                and self._low_grid_failure is None and not numeric_conflict
+                and not metadata_invalid and not beyond_known_offer):
             # A completed coherent episode is not reopened solely because an
             # unchanged, healthy event-driven state later becomes old.
             return None
@@ -351,6 +364,10 @@ class OneFuseRegulator:
             and current <= min(s.max_charge_amps, previous) + .5
             and grid + cap <= s.main_fuse_amps - s.buffer_amps)
         if not valid:
+            return stop("source_control_or_raw_budget_invalid")
+        if not active and not numeric_conflict:
+            # Invalid provenance/value bounds retain their protective zero;
+            # they must never purchase a positive alignment window instead.
             return stop("source_control_or_raw_budget_invalid")
         if self._low_grid_deadline is None:
             configured = _valid_number(s.measurement_settle_seconds)
