@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0b24
+
+- Preserve a qualified unresolved previous current bound when an accepted
+  intermediate reduction needs a further decrease to 7 A. A lower API offer
+  is not proof that measured draw has already responded. Keep the original
+  chain's remaining alignment/response deadline, source identity, lease and
+  post-acceptance observation floors through the handoff.
+- Bound detached entity diagnostics to 11 KiB of serialized JSON, including
+  escaping and sensor decision fields, so Recorder can retain them. Expose
+  compact recent summaries, full-ring counts and explicit truncation metadata;
+  keep the full private incident journal. Each stop now retains its four
+  preceding positive limit receipts and matching delivery summaries.
+- Preserve exposure, historical failures and explicit trial state. This update
+  neither starts a new overload trial nor replenishes time. It does not add a
+  waiting-status grace or establish the cause of charger-first output drops.
+
 ## 0.4.0b23
 
 - Add explicit Start/End Overload Trial buttons and period state/time sensors.

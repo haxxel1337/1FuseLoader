@@ -190,10 +190,10 @@ class OneFuseSensor(SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         if self.entity_description.key.startswith("overload_trial_"):
-            return {
+            return self.controller.compact_state_attributes({
                 **self.controller.regulator.trial_diagnostics(),
                 "scope": "explicit_software_period_not_fuse_thermal_model",
-            }
+            })
         if self.entity_description.key.startswith("bmw_"):
             field = self.controller.bmw_context.get(self.entity_description.key.removeprefix("bmw_"), {})
             # The source timestamp establishes age without recording a changing
@@ -204,7 +204,7 @@ class OneFuseSensor(SensorEntity):
                     key: {name: value for name, value in self.controller.bmw_context.get(key, {}).items() if name != "age_seconds"}
                     for key in ("plug_state", "ac_voltage", "end_reason", "last_result")
                 }
-            return attributes
+            return self.controller.compact_state_attributes(attributes)
         d = self.controller.last_decision
         if d is None:
             return None
@@ -226,11 +226,11 @@ class OneFuseSensor(SensorEntity):
                 diagnostics = {name: snapshot[name] for name in (
                     "last_command_attempt", "last_accepted_command", "last_accepted_limit",
                 )}
-        return {
+        return self.controller.compact_state_attributes({
             **asdict(d),
             **diagnostics,
             "proposed_command": d.command,
             "command_result": self.controller.last_service_result,
             "command_error": self.controller.last_service_error,
             "control_block_reason": self.controller.control_block_reason,
-        }
+        })
