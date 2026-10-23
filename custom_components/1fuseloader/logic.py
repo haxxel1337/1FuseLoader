@@ -728,6 +728,9 @@ class OneFuseRegulator:
         self._normal_shed_deadline: Optional[float] = None
         self._normal_shed_cap: Optional[int] = None
         self._normal_shed_previous: Optional[int] = None
+        self._normal_shed_entry_cap: Optional[int] = None
+        self._normal_shed_last_grid_ts: Optional[float] = None
+        self._normal_shed_last_ev_ts: Optional[float] = None
         self._normal_shed_grid_floor: Optional[float] = None
         self._normal_shed_ev_floor: Optional[float] = None
         self._normal_shed_accepted_at: Optional[float] = None
@@ -867,15 +870,20 @@ class OneFuseRegulator:
             and _valid_number(s.max_sensor_age_seconds) is not None
             and 0 <= wall - grid_ts <= s.max_sensor_age_seconds and ev_ts <= wall + 2)
         accepted = self.last_target[0] if self.last_target is not None else None
+        inherited = (self._unresolved_reduction_owner(now, accepted, current)
+                     if not pending else None)
+        previous = (self._normal_shed_previous if pending else
+                    inherited[0] if inherited is not None else accepted or 0)
         live_lease = bool(self.last_target is not None and self.last_set_limit_ts is not None
                           and 0 <= now - self.last_set_limit_ts < self.last_target[3])
         guards_valid = bool(s.bounded_nominal_shedding and s.overload_enabled and s.enable_dynamic_limit
             and not self._restart_required and not self.paused_by_us and status == "charging"
             and self._overload_transition_started is None and not self._overload_hold_active
             and self.effective_overload_failure_reason in {None, "response_timeout", "cumulative_budget_exhausted"}
+            and (not pending or self._normal_shed_source_id is None
+                 or self._last_input_control_source_id == self._normal_shed_source_id == self._accepted_control_source_id)
             and accepted is not None and s.min_charge_amps <= accepted <= s.max_charge_amps
-            and current >= 1 and current <= min(s.max_charge_amps,
-                self._normal_shed_previous if pending else accepted or 0) + .5)
+            and current >= 1 and current <= min(s.max_charge_amps, previous) + .5)
         if not pending:
             # An invalid entry must not create new positive authority. The
             # existing protective path still determines its zero diagnosis.
@@ -885,12 +893,18 @@ class OneFuseRegulator:
                 return stop("source_or_prior_control_invalid")
             age = wall - grid_ts
             deadline = now - age + min(10, s.overload_response_seconds)
+            if inherited is not None:
+                # A later high-grid report changes the required lower offer,
+                # not the owner of the already unobserved decrease. Preserve
+                # its finite remaining clock, including spent alignment time.
+                deadline = min(deadline, inherited[1])
             if deadline <= now:
-                return None
+                return stop("inherited_response_window_expired") if inherited is not None else None
             self._normal_shed_deadline = deadline
             self._normal_shed_origin = now - age
             self._normal_shed_cap = self.startup_current
-            self._normal_shed_previous = accepted
+            self._normal_shed_previous = previous
+            self._normal_shed_entry_cap = accepted
             self._normal_shed_grid_floor = grid_ts
             self._normal_shed_ev_floor = ev_ts
             self._normal_shed_source_id = self._last_input_control_source_id
@@ -904,9 +918,13 @@ class OneFuseRegulator:
         cap = self._normal_shed_cap
         if (not valid_source or not guards_valid or not live_lease
                 or not s.min_charge_amps <= cap <= s.max_charge_amps
-                or accepted not in {cap, self._normal_shed_previous}
+                or accepted not in {cap, self._normal_shed_entry_cap}
                 or grid_ts < self._normal_shed_grid_floor):
             return stop("source_or_control_invalid")
+        if ((self._normal_shed_last_grid_ts is not None and grid_ts < self._normal_shed_last_grid_ts)
+                or (self._normal_shed_last_ev_ts is not None and ev_ts < self._normal_shed_last_ev_ts)):
+            return stop("source_clock_regressed")
+        self._normal_shed_last_grid_ts, self._normal_shed_last_ev_ts = grid_ts, ev_ts
         if grid > min(38, s.overload_transition_limit_amps):
             return stop("raw_peak_exceeded")
         if self._normal_shed_sync_deadline is None and now >= self._normal_shed_deadline:
@@ -949,6 +967,43 @@ class OneFuseRegulator:
             return stop("response_timeout")
         return ("normal_shedding", "Requesting only a lower accepted offer inside the original sample-aged response deadline; no EV credit, increase, resume or new overload budget.",
                 "set_limit", cap, grid, s.normal_ttl_seconds)
+
+    def _unresolved_reduction_owner(self, now: float, accepted: Optional[int], current: float):
+        """Carry only an actual accepted, source-bound pending decrease.
+
+        A lower API offer is not proof that the old higher draw responded.
+        This bound can qualify another decrease; it grants no EV subtraction,
+        rise, fresh deadline, experimental time or completed-response claim.
+        """
+        previous, origin = self._reduction_previous_cap, self._reduction_chain_origin
+        identity = self._last_input_control_source_id
+        gt, et = self._last_input_grid_ts, self._last_input_charger_ts
+        if (accepted is None or self.last_target is None or self.last_target[0] != accepted
+                or self._awaiting_reduction_target != accepted or self._accepted_reduction_cap != accepted
+                or previous is None or not self.settings.min_charge_amps <= accepted < previous <= self.settings.max_charge_amps
+                or origin is None or not isfinite(origin) or not 0 <= now-origin
+                or identity is None or identity != self._accepted_control_source_id
+                or self._reduction_grid_ts is None or self._reduction_charger_ts is None
+                or gt is None or et is None or gt < self._reduction_grid_ts or et < self._reduction_charger_ts
+                or self._partial_reduction_budget is None or self._partial_reduction_budget <= 0
+                or self._partial_reduction_used_seconds < 0):
+            return None
+        # A distinct, trusted post-ACK response and later coherent grid retire
+        # the earlier higher offer. The following lower request is then based
+        # on that verified current bound, not borrowed old authority. A TTL
+        # renewal does not change this genuinely changed-cap ACK floor.
+        wall = self._last_input_wall_now_ts
+        if (wall is not None and self._last_limit_change_ts is not None
+                and 0 <= now-self._last_limit_change_ts
+                and et > wall-(now-self._last_limit_change_ts)
+                and gt > et and self._fast_sources_fresh()
+                and 1 <= current <= accepted + .5):
+            return None
+        deadline = min(origin + self._partial_reduction_budget,
+                       now + self._reduction_alignment_remaining(now))
+        if self._reduction_guard_deadline is not None:
+            deadline = min(deadline, self._reduction_guard_deadline)
+        return previous, deadline
 
     def _clear_measurement_uncertainty(self) -> None:
         """Only session/reset or sustained source recovery retires this mode."""
@@ -1221,6 +1276,7 @@ class OneFuseRegulator:
         self._reduction_before_current: Optional[float] = None
         self._accepted_reduction_cap: Optional[int] = None
         self._reduction_previous_cap: Optional[int] = None
+        self._reduction_chain_origin: Optional[float] = None
         self._reduction_under_cap_baseline = False
         self._reduction_high_current: Optional[float] = None
         self._reduction_high_ev_ts: Optional[float] = None
@@ -2208,6 +2264,7 @@ class OneFuseRegulator:
                              and now_ts < self._reduction_guard_deadline))
                 )
                 previous_cap = self._reduction_previous_cap if same_pending_chain else old_target
+                chain_origin = self._reduction_chain_origin if same_pending_chain else now_ts
                 budget = (self._partial_reduction_budget if same_pending_chain else
                           min(self.settings.measurement_settle_seconds, self.settings.max_sensor_age_seconds))
                 spent = self._partial_reduction_used_seconds if same_pending_chain else 0.0
@@ -2234,6 +2291,7 @@ class OneFuseRegulator:
                 self._accepted_reduction_cap = target if target > 0 else None
                 self._reduction_before_current = decision.charger_current
                 self._reduction_previous_cap = previous_cap
+                self._reduction_chain_origin = chain_origin
                 self._reduction_under_cap_baseline = (
                     target > 0 and old_target is not None and old_target > target
                     and decision.charger_current <= target + 0.5)

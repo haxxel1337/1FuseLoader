@@ -315,7 +315,7 @@ class DispatchFreshnessTests(unittest.IsolatedAsyncioTestCase):
             "overload_trial_remaining_seconds", "overload_trial_failure_reason",
             "overload_lifetime_used_seconds", "overload_historical_failure_reason",
             "command_started_at_utc", "command_completed_at_utc", "command_result",
-            "command_error", "clock_scope",
+            "command_error", "clock_scope", "preceding_positive_limit_receipts",
         }
         self.assertEqual(set(context), expected)
         self.assertEqual(context["product_update_received_at_utc"], pulse.isoformat())

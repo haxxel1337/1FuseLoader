@@ -50,6 +50,24 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Accepted reductions and diagnostic history (b24)
+
+An accepted lower circuit limit and the measured vehicle current can describe
+different moments. During a qualified pending reduction, a further decrease
+retains the previous unresolved physical bound while tracking the latest
+accepted offer separately. The entire decrease chain shares its original
+remaining deadline and source/lease guards. Intermediate offers and identical
+renewals cannot restart that clock, prove physical response or grant a new
+overload period.
+
+Entity attributes contain detached, compact diagnostic summaries capped at
+11 KiB of serialized JSON. Truncation is explicit; counts describe the full
+bounded rings. The private incident journal keeps full records, and a stop
+also retains four preceding positive limit receipts for later TTL/delivery
+analysis. HTTP acceptance, reported limits, offered current and measured draw
+remain separate evidence. A charger-first output drop is not established as
+a controller fault merely because a later protective zero is recorded.
+
 ### Explicit experimental trial periods (b23)
 
 **Start New Overload Trial (7 A)** starts a separately recorded software

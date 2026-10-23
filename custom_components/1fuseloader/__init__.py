@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 from collections import deque
@@ -57,6 +58,133 @@ SNAPSHOT_FAILURE_TYPES = frozenset({
 _PENDING_BUDGET_WRITES_KEY = f"{DOMAIN}_pending_budget_writes"
 # One minute lease plus storage, request and scheduling allowances.
 OVERLOAD_LEASE_RESERVE_SECONDS = 90
+# Leave room for HA's own entity attributes below Recorder's 16 KiB limit.
+DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES = 11 * 1024
+
+
+def _limit_receipt_summary(record: dict[str, Any]) -> dict[str, Any]:
+    """Detached local receipt evidence, never remote delivery or physical proof."""
+    summary = {key: record[key] for key in (
+        "started_at_utc", "completed_at_utc", "command", "target_p1", "target_p2",
+        "target_p3", "ttl_seconds", "result", "error",
+    ) if key in record}
+    delivery = record.get("delivery")
+    if isinstance(delivery, dict):
+        summary["delivery"] = {key: delivery[key] for key in (
+            "sequence", "state", "http_status", "correlation_available", "vendor_accepted",
+            "delivery_received", "readback_matches", "readback_after_submission", "superseded",
+            "physical_response_verified", "device_ttl_verified",
+        ) if key in delivery}
+    return summary
+
+
+def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
+    """Bound only HA state views; never mutate regulator or private journal data."""
+    truncated = bool(attributes.get("diagnostics_truncated"))
+
+    def compact(value: Any, *, text_bytes: int = 1024, depth: int = 0) -> Any:
+        nonlocal truncated
+        if isinstance(value, str):
+            encoded = value.encode("utf-8")
+            if len(encoded) > text_bytes:
+                truncated = True
+                return encoded[:text_bytes].decode("utf-8", errors="ignore") + " [truncated]"
+            return value
+        if isinstance(value, dict):
+            if depth >= 6:
+                truncated = True
+                return "[truncated nested diagnostic]"
+            return {key: compact(item, text_bytes=text_bytes, depth=depth + 1)
+                    for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            if len(value) > 4:
+                truncated = True
+            return [compact(item, text_bytes=text_bytes, depth=depth + 1) for item in value[:4]]
+        return value
+
+    view = compact(attributes)
+    policy = view.get("overload_trial_policy")
+    if isinstance(policy, dict) and "settings" in policy:
+        # The immutable complete settings snapshot belongs to the ledger, not
+        # three trial sensors and Source Health on every watchdog evaluation.
+        policy.pop("settings")
+        truncated = True
+    view["diagnostics_scope"] = "compact_state_view_full_incident_journal_in_storage"
+    view["diagnostics_truncated"] = truncated
+
+    def size() -> int:
+        # Escaped ASCII is a conservative upper bound for UTF-8 JSON as well.
+        return len(json.dumps(view, ensure_ascii=True, default=str).encode("utf-8"))
+
+    if size() > DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES:
+        truncated = True
+        view = compact(view, text_bytes=384)
+        view["diagnostics_truncated"] = True
+        # Histories are optional state summaries. The full rings remain in the
+        # private incident journal and must never be shortened for Recorder.
+        for key in ("recent_command_journal", "recent_stop_contexts", "recent_command_deliveries"):
+            if key in view:
+                view[key] = []
+    if size() > DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES:
+        essential = {
+            "mode", "reason", "current_p1", "current_p2", "current_p3", "target_p1",
+            "source_health", "source_health_reason", "source_errors", "last_stop_context",
+            "last_stop_nominal_diagnostics", "command_result", "command_error", "control_block_reason",
+            "overload_failure_reason", "overload_historical_failure_reason",
+            "overload_lifetime_used_seconds", "overload_trial_state", "overload_trial_used_seconds",
+            "overload_trial_remaining_seconds", "overload_trial_failure_reason",
+            "recent_command_journal_count", "recent_stop_contexts_count", "recent_command_deliveries_count",
+            "last_command_attempt", "last_accepted_command", "last_accepted_limit",
+            "diagnostics_scope", "diagnostics_truncated",
+        }
+        omitted = 0
+        # A future unexpectedly verbose source field must not silently discard
+        # the latest cause or accounting counters by crossing Recorder's limit.
+        for key in sorted((key for key in view if key not in essential),
+                          key=lambda key: len(json.dumps(view[key], default=str)), reverse=True):
+            if size() <= DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES:
+                break
+            del view[key]
+            omitted += 1
+        view["diagnostics_omitted_fields_count"] = omitted
+    if size() > DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES:
+        # Fixed final projection keeps the limit hard even if a future nested
+        # source payload is accidentally attached to an essential field.
+        def scalar(value: Any) -> Any:
+            value = (value if value is None or isinstance(value, (str, int, float, bool))
+                     else "[omitted diagnostic detail]")
+            if len(json.dumps(value, ensure_ascii=True).encode("utf-8")) <= 96:
+                return value
+            text = str(value)
+            low, high = 0, min(len(text), 96)
+            # Control characters can require six JSON bytes each. Raw UTF-8
+            # length alone cannot enforce Recorder's serialized byte limit.
+            while low < high:
+                middle = (low + high + 1) // 2
+                candidate = text[:middle] + " [truncated]"
+                if len(json.dumps(candidate, ensure_ascii=True).encode("utf-8")) <= 96:
+                    low = middle
+                else:
+                    high = middle - 1
+            return text[:low] + " [truncated]"
+        last_stop = view.get("last_stop_context")
+        view = {key: scalar(view[key]) for key in essential if key in view}
+        if isinstance(last_stop, dict):
+            view["last_stop_context"] = {key: scalar(last_stop[key]) for key in (
+                "plan_utc", "reason", "mode", "grid_l1", "charger_current", "status",
+                "command_result", "command_error", "overload_failure_reason",
+            ) if key in last_stop}
+        view["diagnostics_truncated"] = True
+        view["diagnostics_scope"] = "compact_state_view_full_incident_journal_in_storage"
+        if size() > DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES:
+            view = {key: view[key] for key in (
+                "mode", "reason", "current_p1", "current_p2", "current_p3", "source_health",
+                "source_health_reason", "last_stop_context", "overload_lifetime_used_seconds",
+                "overload_historical_failure_reason", "overload_trial_state", "overload_trial_used_seconds",
+                "overload_trial_remaining_seconds", "recent_command_journal_count", "recent_stop_contexts_count",
+                "diagnostics_truncated", "diagnostics_scope",
+            ) if key in view}
+    return view
 
 
 def _get_state_value(hass: HomeAssistant, entity_id: str | None) -> Any:
@@ -1156,6 +1284,10 @@ class OneFuseLoaderController:
         diagnostics["easee_product_update_clock_scope"] = "native_local_ProductUpdate_receipt_not_transport_ping_or_physical_acquisition"
         self.source_diagnostics = diagnostics
 
+    @staticmethod
+    def compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
+        return _compact_state_attributes(attributes)
+
     def diagnostic_attributes(self) -> dict[str, Any]:
         accepted = self.last_accepted_limit
         reported = tuple(self.source_diagnostics.get(f"reported_circuit_p{phase}") for phase in (1, 2, 3))
@@ -1167,16 +1299,37 @@ class OneFuseLoaderController:
             accepted_time = self._utc_time(accepted.get("completed_at_utc"))
             if report_time is not None and accepted_time is not None:
                 post_acceptance = report_time >= accepted_time
-        return {
+        delivery = self._delivery.diagnostics()
+        delivery["recent_command_deliveries"] = delivery.get("recent_command_deliveries", [])[-2:]
+        stop_summaries = [{key: item[key] for key in (
+            "plan_utc", "mode", "reason", "grid_l1", "charger_current", "status", "command_result",
+        ) if key in item} for item in list(self._recent_stop_contexts)[-2:]]
+        for item in stop_summaries:
+            reason = item.get("reason")
+            if isinstance(reason, str) and len(reason.encode("utf-8")) > 160:
+                item["reason"] = reason.encode("utf-8")[:160].decode("utf-8", errors="ignore") + " [truncated]"
+        stop = dict(self.last_stop_context) if self.last_stop_context else None
+        if stop is not None and isinstance(stop.get("preceding_positive_limit_receipts"), list):
+            stop["preceding_positive_limit_receipts"] = [
+                _limit_receipt_summary(item) for item in stop["preceding_positive_limit_receipts"][-4:]]
+        return self.compact_state_attributes({
             **self.source_diagnostics,
-            **self._delivery.diagnostics(),
+            **delivery,
+            **({"mode": self.last_decision.mode, "reason": self.last_decision.reason,
+                "current_p1": self.last_decision.current_p1, "current_p2": self.last_decision.current_p2,
+                "current_p3": self.last_decision.current_p3} if self.last_decision is not None else {}),
             "zero_confirmation_scope": "native_ProductUpdate_receipt_and_correlated_delivery_not_physical_response",
             "last_command_attempt": dict(self.last_command_attempt) if self.last_command_attempt else None,
             "last_accepted_command": dict(self.last_accepted_command) if self.last_accepted_command else None,
             "last_accepted_limit": dict(accepted) if accepted else None,
-            "last_stop_context": dict(self.last_stop_context) if self.last_stop_context else None,
-            "recent_command_journal": [dict(item) for item in list(self._recent_commands)[-8:]],
-            "recent_stop_contexts": [dict(item) for item in self._recent_stop_contexts],
+            "last_stop_context": stop,
+            "recent_command_journal": [_limit_receipt_summary(item) for item in list(self._recent_commands)[-2:]],
+            "recent_stop_contexts": stop_summaries,
+            "recent_command_journal_count": len(self._recent_commands),
+            "recent_stop_contexts_count": len(self._recent_stop_contexts),
+            "recent_command_deliveries_count": len(self._delivery.records),
+            "diagnostics_truncated": bool(self._recent_commands or self._recent_stop_contexts
+                                           or len(self._delivery.records) > 2),
             "incident_journal_error_type": self._incident_journal_error,
             "incident_journal_scope": "bounded_local_receipts_and_vendor_observations_not_physical_proof",
             "last_stop_nominal_diagnostics": (dict(self.last_stop_nominal_diagnostics)
@@ -1198,7 +1351,7 @@ class OneFuseLoaderController:
                 if self._budget_store.last_verified_at is not None else None),
             "budget_latest_state_durable": self._budget_store.state_is_durable(
                 self.regulator.export_overload_state()),
-        }
+        })
 
     async def async_tick(self) -> None:
         # Drop redundant timer ticks while an action or reconfiguration is in
@@ -1456,6 +1609,14 @@ class OneFuseLoaderController:
             # Keep the first request's cause through subsequent inconsistent
             # feedback/retries. A newly accepted positive offer arms a new
             # incident. These are diagnostic receipts, never physical proof.
+            preceding_receipts = [_limit_receipt_summary(item) for item in
+                [item for item in self._recent_commands if item.get("command") in {"set_limit", "resume"}
+                 and type(item.get("target_p1")) in (int, float) and item["target_p1"] > 0][-4:]]
+            delivery_by_sequence = {record.sequence: record.public() for record in self._delivery.records}
+            for item in preceding_receipts:
+                sequence = item.get("delivery", {}).get("sequence")
+                if sequence in delivery_by_sequence:
+                    item["delivery"] = _limit_receipt_summary({"delivery": delivery_by_sequence[sequence]})["delivery"]
             self.last_stop_context = {
                 "plan_utc": report_utc(inp.wall_now_ts),
                 "reason": decision.reason, "mode": decision.mode,
@@ -1467,6 +1628,7 @@ class OneFuseLoaderController:
                 "product_update_received_at_utc": plan_source_diagnostics.get("easee_stream_pulse_utc"),
                 "previous_submitted_limit_p1": (self.last_accepted_limit.get("target_p1")
                                                 if self.last_accepted_limit else None),
+                "preceding_positive_limit_receipts": preceding_receipts,
                 "overload_used_seconds": exposure["used_seconds"],
                 "overload_failure_reason": exposure["failure_reason"],
                 "overload_effective_used_seconds": self.regulator.effective_overload_used_seconds,
