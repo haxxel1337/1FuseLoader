@@ -110,6 +110,16 @@ class RegulatorInput:
     # Stable configured source/device binding, never a measured value or clock.
     # The optional identity opts a caller into the source-bound alignment path.
     control_source_id: Optional[str | tuple] = None
+    # UTC values from distinct reporting clocks cannot establish replay or
+    # response merely by their relative magnitude. Defaults preserve callers
+    # that do not yet provide explicit observation-clock provenance.
+    charger_report_family: str = "legacy"
+    charger_report_provenance: Optional[tuple[str | int, ...]] = None
+    charger_increase_ready: bool = True
+    charger_event_source_ts: Optional[float] = None
+    charger_event_source_known: bool = False
+    charger_observation_report_times: Optional[tuple[tuple[int, float], ...]] = None
+    charger_observation_sequences: Optional[tuple[tuple[int, int], ...]] = None
 
 
 @dataclass(slots=True)
@@ -167,9 +177,289 @@ class OneFuseRegulator:
 
     def __init__(self, settings: RegulatorSettings | None = None) -> None:
         self.settings = settings or RegulatorSettings()
+        self._ev_clock_watermarks: dict[tuple, float] = {}
+        self._ev_clock_key = None
+        self._ev_clock_baseline: Optional[float] = None
+        self._ev_clock_credit = True
+        self._ev_clock_error: Optional[str] = None
+        self._ev_clock_explicit = False
+        self._ev_owner_clocks: dict[str, dict] = {}
+        self._ev_event_source_ts: Optional[float] = None
+        self._ev_event_source_known = False
+        self._ev_observation_watermarks: dict[tuple, float] = {}
+        self._ev_current_observations: dict[tuple, float] = {}
+        self._ev_current_winners: tuple[tuple, ...] = ()
+        self._ev_observation_sequences: dict[tuple, int] = {}
+        self._ev_current_sequences: dict[tuple, int] = {}
+        self._ev_frame_wall_ts: Optional[float] = None
+        self._ev_frame_grid_ts: Optional[float] = None
+        self._ev_established_value: Optional[float] = None
+        self._ev_established_binding = None
         self.reset_overload_budget()
         self.reset()
         self.update_settings(self.settings)
+
+    def _observe_ev_clock(self, inp: RegulatorInput) -> None:
+        """Validate each observation clock without changing its UTC value.
+
+        An explicit domain switch establishes a baseline only. It cannot
+        create EV response credit, headroom for a rise or another deadline.
+        Keep every domain's high-water mark across switches and routine resets.
+        """
+        family, provenance = inp.charger_report_family, inp.charger_report_provenance
+        self._ev_clock_error = None
+        self._ev_frame_wall_ts = None if isinstance(inp.wall_now_ts, bool) else _valid_number(inp.wall_now_ts)
+        self._ev_frame_grid_ts = None if isinstance(inp.grid_report_ts, bool) else _valid_number(inp.grid_report_ts)
+        self._ev_current_observations = {}
+        self._ev_current_winners = ()
+        self._ev_current_sequences = {}
+        self._ev_event_source_known = inp.charger_event_source_known is True
+        self._ev_event_source_ts = (None if isinstance(inp.charger_event_source_ts, bool)
+                                   else _valid_number(inp.charger_event_source_ts))
+        self._ev_clock_explicit = family != "legacy" or provenance is not None
+        if not self._ev_clock_explicit:
+            if self._ev_clock_key is not None:
+                self._ev_clock_error = "charger_clock_provenance_missing"
+                self._ev_clock_credit = False
+                return
+            self._ev_clock_credit = True
+            self._remember_ev_value(inp)
+            return
+        if (not isinstance(family, str) or family not in {"native_ha_receipt", "native_terminal_receipt", "vendor_event"}
+                or not isinstance(provenance, tuple) or not provenance
+                or any(not isinstance(part, (str, int)) or isinstance(part, bool)
+                       or part == "" for part in provenance)):
+            self._ev_clock_error = "charger_clock_provenance_invalid"
+            self._ev_clock_credit = False
+            return
+        wall = None if isinstance(inp.wall_now_ts, bool) else _valid_number(inp.wall_now_ts)
+        if wall is None:
+            self._ev_clock_error = "charger_clock_timestamp_invalid"
+            self._ev_clock_credit = False
+            return
+        if not inp.data_valid or inp.charger_current_trusted is not True:
+            self._ev_clock_credit = False
+            return
+        vector_advance = self._observe_ev_vector(inp, family, provenance, wall)
+        if self._ev_clock_error:
+            self._ev_clock_credit = False
+            return
+        stamp = None if isinstance(inp.charger_report_ts, bool) else _valid_number(inp.charger_report_ts)
+        if stamp is None:
+            self._ev_clock_credit = False
+            return
+        if stamp > wall+5:
+            self._ev_clock_error = "charger_clock_timestamp_invalid"
+            self._ev_clock_credit = False
+            return
+        key = (family, provenance)
+        high = self._ev_clock_watermarks.get(key)
+        if high is not None and stamp < high:
+            self._ev_clock_error = "charger_clock_regressed"
+            self._ev_clock_credit = False
+            return
+        if high is None and len(self._ev_clock_watermarks) >= 64:
+            self._ev_clock_error = "charger_clock_domain_capacity_exhausted"
+            self._ev_clock_credit = False
+            return
+        if self._ev_clock_key is None:
+            self._ev_clock_baseline = stamp
+            self._ev_clock_credit = False
+        elif key != self._ev_clock_key:
+            self._ev_clock_baseline = stamp if high is None else high
+            self._ev_clock_credit = high is not None and stamp > high
+        elif self._ev_clock_baseline is not None and stamp > self._ev_clock_baseline:
+            self._ev_clock_credit = True
+        if vector_advance or any(self._ev_vector_after_owner(record) for record in self._ev_owner_clocks.values()):
+            # The receiver clock already has per-conductor history. A fresh
+            # winning conductor may be new to the aggregate MAX provenance,
+            # while still advancing its own established clock after the ACK.
+            self._ev_clock_credit = True
+        self._ev_clock_key = key
+        self._ev_clock_watermarks[key] = stamp if high is None else max(high, stamp)
+        for record in self._ev_owner_clocks.values():
+            record["baselines"].setdefault(key, stamp)
+        self._remember_ev_value(inp)
+
+    def _remember_ev_value(self, inp: RegulatorInput) -> None:
+        value = None if isinstance(inp.charger_current, bool) else _valid_number(inp.charger_current)
+        if (self._ev_clock_credit and self._ev_clock_error is None and inp.data_valid
+                and inp.charger_current_trusted is True and value is not None and value >= 0
+                and self._event_source_usable()):
+            self._ev_established_value = value
+            self._ev_established_binding = inp.control_source_id
+
+    def _observe_ev_vector(self, inp: RegulatorInput, family: str, provenance: tuple,
+                           wall: float) -> bool:
+        vector, sequences = inp.charger_observation_report_times, inp.charger_observation_sequences
+        if vector is None and sequences is None:
+            return False
+        try:
+            marker = provenance.index("max_terminals")
+            prefix, winners = provenance[:marker], provenance[marker+1:]
+            if (vector is not None and not isinstance(vector, tuple) or any(type(item) is not int or item not in {182, 183, 184, 185}
+                    for item in winners)):
+                raise ValueError("Invalid observation vector")
+            values = {}
+            for item in vector or ():
+                if not isinstance(item, tuple) or len(item) != 2:
+                    raise ValueError("Invalid observation clock")
+                observation, value = item
+                stamp = None if isinstance(value, bool) else _valid_number(value)
+                if type(observation) is not int or observation not in {182, 183, 184, 185} or stamp is None or stamp < 0 or stamp > wall+5:
+                    raise ValueError("Invalid observation clock")
+                key = (family, prefix, observation)
+                if key in values:
+                    raise ValueError("Duplicate observation clock")
+                old = self._ev_observation_watermarks.get(key)
+                if old is not None and stamp < old:
+                    self._ev_clock_error = "charger_clock_regressed"
+                    return False
+                values[key] = stamp
+            counters = {}
+            if sequences is not None:
+                if not isinstance(sequences, tuple):
+                    raise ValueError("Invalid observation sequences")
+                for item in sequences:
+                    if (not isinstance(item, tuple) or len(item) != 2 or type(item[0]) is not int
+                            or item[0] not in {182, 183, 184, 185} or type(item[1]) is not int or item[1] < 0):
+                        raise ValueError("Invalid observation sequence")
+                    key = (family, prefix, item[0])
+                    if key in counters:
+                        raise ValueError("Duplicate observation sequence")
+                    if key in self._ev_observation_sequences and item[1] < self._ev_observation_sequences[key]:
+                        self._ev_clock_error = "charger_clock_regressed"
+                        return False
+                    counters[key] = item[1]
+            winner_keys = tuple((family, prefix, observation) for observation in winners)
+            advanced = bool(winner_keys and all(key in values and key in self._ev_observation_watermarks
+                and values[key] > self._ev_observation_watermarks[key] for key in winner_keys))
+            if counters:
+                advanced = bool(winner_keys and all(key in values and key in counters
+                    and key in self._ev_observation_sequences and counters[key] > self._ev_observation_sequences[key]
+                    for key in winner_keys))
+            if len(set(self._ev_observation_watermarks) | set(values) | set(counters)) > 256:
+                raise ValueError("Too many observation clocks")
+            self._ev_current_observations = values
+            self._ev_current_winners = winner_keys
+            self._ev_current_sequences = counters
+            self._ev_observation_watermarks.update(values)
+            self._ev_observation_sequences.update(counters)
+            for record in self._ev_owner_clocks.values():
+                for key, stamp in values.items():
+                    record["vectors"].setdefault(key, stamp)
+                for key, sequence in counters.items():
+                    record["sequences"].setdefault(key, sequence)
+            return advanced
+        except (ValueError, TypeError, AttributeError):
+            self._ev_clock_error = "charger_clock_vector_invalid"
+            return False
+
+    def _ev_regressed_since(self, previous: Optional[float], current: Optional[float] = None) -> bool:
+        if self._ev_clock_explicit:
+            return self._ev_clock_error == "charger_clock_regressed"
+        stamp = self._last_input_charger_ts if current is None else current
+        return bool(previous is not None and stamp is not None and stamp < previous)
+
+    def _pin_ev_owner(self, name: str, *, wall_floor: Optional[float] = None,
+                      copy_from: Optional[str] = None) -> None:
+        if copy_from is not None and copy_from in self._ev_owner_clocks:
+            self._ev_owner_clocks[name] = deepcopy(self._ev_owner_clocks[copy_from])
+            return
+        baselines = ({self._ev_clock_key: self._last_input_charger_ts}
+                     if self._ev_clock_key is not None and self._last_input_charger_ts is not None else {})
+        self._ev_owner_clocks[name] = {"baselines": baselines, "wall_floor": wall_floor,
+                                       "vectors": dict(self._ev_observation_watermarks),
+                                       "sequences": dict(self._ev_observation_sequences)}
+
+    def _set_ev_owner_wall(self, name: str, wall_floor: Optional[float]) -> None:
+        if name not in self._ev_owner_clocks:
+            self._pin_ev_owner(name, wall_floor=wall_floor)
+        else:
+            self._ev_owner_clocks[name]["wall_floor"] = wall_floor
+
+    def _ack_wall(self, now: float) -> Optional[float]:
+        if (self._last_input_wall_now_ts is not None and self._last_input_now_ts is not None
+                and _valid_number(now) is not None and now >= self._last_input_now_ts):
+            return self._last_input_wall_now_ts+now-self._last_input_now_ts
+        return None
+
+    def _event_source_usable(self, wall_floor: Optional[float] = None) -> bool:
+        if not self._ev_event_source_known:
+            return True
+        event, wall, grid = self._ev_event_source_ts, self._ev_frame_wall_ts, self._ev_frame_grid_ts
+        return bool(event is not None and wall is not None and grid is not None
+                    and -5 <= wall-event <= self.settings.max_sensor_age_seconds
+                    and abs(grid-event) <= self.settings.measurement_settle_seconds
+                    and (wall_floor is None or event > wall_floor))
+
+    def _ev_advanced_since(self, previous: Optional[float], owner: Optional[str] = None) -> bool:
+        stamp = self._last_input_charger_ts
+        if not self._ev_clock_explicit:
+            return bool(previous is not None and stamp is not None and stamp > previous)
+        record = self._ev_owner_clocks.get(owner)
+        if not self._ev_clock_credit or self._ev_clock_error or stamp is None or record is None:
+            return False
+        baseline = record["baselines"].get(self._ev_clock_key)
+        wall_floor = record["wall_floor"]
+        if self._ev_current_winners:
+            return self._ev_vector_after_owner(record)
+        return bool(baseline is not None and stamp > baseline and wall_floor is not None
+                    and stamp > wall_floor and self._event_source_usable(wall_floor))
+
+    def _ev_vector_after_owner(self, record: dict) -> bool:
+        wall_floor = record["wall_floor"]
+        if wall_floor is None or not self._ev_current_winners or not self._event_source_usable(wall_floor):
+            return False
+        for key in self._ev_current_winners:
+            stamp = self._ev_current_observations.get(key)
+            if stamp is None or stamp <= wall_floor:
+                return False
+            if self._ev_current_sequences:
+                if (key not in record["sequences"] or key not in self._ev_current_sequences
+                        or self._ev_current_sequences[key] <= record["sequences"][key]):
+                    return False
+            elif key not in record["vectors"] or stamp <= record["vectors"][key]:
+                return False
+        return True
+
+    def _clock_baseline_raw_hold(self, now: float, grid: float, current: float, status: str):
+        """No-write retention under a whole-offer raw bound, without EV credit.
+
+        This does not seed a response, renew authority or modify a pending
+        owner's clocks. A terminal failure or expired owner remains terminal.
+        """
+        s = self.settings
+        if (not self._ev_clock_explicit or self._ev_clock_credit or self._ev_clock_error
+                or not s.nominal_import_only_fallback or not s.enable_dynamic_limit
+                or self._restart_required or self.paused_by_us
+                or status not in {"charging", "start_charging", "awaiting_start", "ready_to_charge"}
+                or not self._last_input_current_trusted or self.last_target is None
+                or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                or self._last_input_control_source_id is None
+                or self._last_input_control_source_id != self._accepted_control_source_id
+                or self._last_input_wall_now_ts is None or self._last_input_grid_ts is None
+                or not 0 <= self._last_input_wall_now_ts-self._last_input_grid_ts <= s.max_sensor_age_seconds
+                or self._low_grid_failure is not None or self._normal_shed_failure is not None
+                or self._uncertainty_stops > 0 or self._uncertainty_retry_submission_pending
+                or self._overload_transition_started is not None or self._overload_hold_active):
+            return None
+        cap = self.last_target[0]
+        whole = max(cap, self._reduction_previous_cap or 0 if self._awaiting_reduction_target is not None else cap,
+                    self._low_grid_previous or 0 if self._low_grid_pending else cap,
+                    self._uncertainty_previous_offer or 0 if self._uncertainty_ceiling is not None else cap)
+        if (not s.min_charge_amps <= cap <= whole <= s.max_charge_amps
+                or current > whole+.5 or grid+whole > s.main_fuse_amps-s.buffer_amps
+                or self._normal_shed_deadline is not None and now >= self._normal_shed_deadline
+                or self._low_grid_pending and self._low_grid_phase != "raw_hold"
+                   and self._low_grid_deadline is not None and now >= self._low_grid_deadline
+                or self._positive_skew_since is not None
+                   and self._positive_alignment_used_seconds+now-self._positive_skew_since
+                   >= min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+                or self._awaiting_reduction_target is not None
+                   and self._reduction_alignment_remaining(now) <= 0):
+            return None
+        return cap, grid
 
     @staticmethod
     def _trial_identity(value: object):
@@ -278,6 +568,7 @@ class OneFuseRegulator:
         self._trial_activation_committed = False
 
     def _validate_trial_input(self, inp: RegulatorInput) -> tuple[float, float, object]:
+        self._observe_ev_clock(inp)
         policy = self._trial_policy(self.settings)
         now, wall, grid, current, gt, et = (None if isinstance(value, bool) else _valid_number(value)
             for value in (inp.now_ts, inp.wall_now_ts, inp.grid_l1, inp.charger_current,
@@ -285,6 +576,7 @@ class OneFuseRegulator:
         identity = self._trial_identity(inp.control_source_id)
         if (now is None or wall is None or grid is None or current is None or gt is None or et is None
                 or not inp.data_valid or inp.data_error or inp.charger_current_trusted is not True
+                or self._ev_clock_error is not None or not self._ev_clock_credit or not self._event_source_usable()
                 or inp.status.strip().lower() != "charging" or current < 1 or grid < 0
                 or identity is None or identity != self._accepted_control_source_id
                 or self.last_target is None or not 0 < self.last_target[0] <= self.settings.max_charge_amps
@@ -308,7 +600,7 @@ class OneFuseRegulator:
             if (self._trial_identity(self._trial_epoch["source_id"]) != identity
                     or self._trial_epoch["policy"] != policy
                     or self._trial_last_grid_ts is not None and gt < self._trial_last_grid_ts
-                    or self._trial_last_ev_ts is not None and et < self._trial_last_ev_ts):
+                    or self._ev_regressed_since(self._trial_last_ev_ts, et)):
                 raise ValueError("Trial source or frozen policy changed")
         if not self._observe_overload_time(now, grid, True):
             raise ValueError("Trial accounting clock is invalid")
@@ -376,6 +668,7 @@ class OneFuseRegulator:
         identity = self._trial_identity(inp.control_source_id)
         if (now is None or wall is None or grid is None or current is None or gt is None or et is None
                 or not inp.data_valid or inp.data_error or inp.charger_current_trusted is not True
+                or self._ev_clock_error is not None
                 or inp.status.strip().lower() != "charging" or grid < 0 or current < 0
                 or current > self.settings.max_charge_amps + .5
                 or identity != self._trial_identity(epoch["source_id"])
@@ -387,7 +680,7 @@ class OneFuseRegulator:
                 or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
                 or not 0 <= wall-gt <= self.settings.max_sensor_age_seconds or et > wall
                 or self._trial_last_grid_ts is not None and gt < self._trial_last_grid_ts
-                or self._trial_last_ev_ts is not None and et < self._trial_last_ev_ts):
+                or self._ev_regressed_since(self._trial_last_ev_ts)):
             self._terminate_trial("interrupted", "source_control_or_session_invalid")
             return "Explicit trial source, live control lease or charging session is invalid."
         # An unchanged trusted EVENT need not change its timestamp while a
@@ -646,13 +939,14 @@ class OneFuseRegulator:
             # with the later grid; do not demand an additional value-change
             # event merely because the paired GET copied the same state.
             self._low_grid_ev_floor = self._accepted_control_ev_ts
+            self._pin_ev_owner("_low_grid_ev_floor", copy_from="_accepted_control_ev_ts")
             self._low_grid_grid_floor = gt
             self._uncertainty_ceiling = min(self._uncertainty_ceiling or cap, cap)
             self._uncertainty_previous_offer = max(self._uncertainty_previous_offer or 0, previous)
         self._low_grid_pending = True
         if (gt < self._low_grid_grid_floor
                 or self._low_grid_last_grid_ts is not None and gt < self._low_grid_last_grid_ts
-                or self._low_grid_last_ev_ts is not None and et < self._low_grid_last_ev_ts):
+                or self._ev_regressed_since(self._low_grid_last_ev_ts)):
             return stop("source_clock_regressed")
         self._low_grid_last_grid_ts, self._low_grid_last_ev_ts = gt, et
         if accepted == cap and self._low_grid_accepted_at is None:
@@ -660,6 +954,7 @@ class OneFuseRegulator:
             # its UTC ACK floor once; identical renewals must never move it.
             self._low_grid_accepted_at = self.last_set_limit_ts
             self._low_grid_ack_ev_floor = wall - (now - self.last_set_limit_ts)
+            self._set_ev_owner_wall("_low_grid_ev_floor", self._low_grid_ack_ev_floor)
         soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
         pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
         self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
@@ -670,10 +965,10 @@ class OneFuseRegulator:
         self._increase_since = None
         anchor = max(self._house_before_reduction or 0.0, self._low_grid_entry_house,
                      max(0.0, grid - current))
-        complete = bool(accepted == cap and self._low_grid_ev_floor is not None
+        complete = bool(accepted == cap and (self._low_grid_ev_floor is not None or self._ev_clock_explicit)
             and self._low_grid_ack_ev_floor is not None
             and et > self._low_grid_ack_ev_floor
-            and et > self._low_grid_ev_floor
+            and self._ev_advanced_since(self._low_grid_ev_floor, "_low_grid_ev_floor")
             and self._fast_sources_fresh() and gt > et
             and gt > self._low_grid_grid_floor and current <= cap + .5 and current <= grid + 1
             and anchor + cap <= s.main_fuse_amps - s.buffer_amps)
@@ -778,7 +1073,7 @@ class OneFuseRegulator:
                 or self.last_target is None or self.last_target[0] != cap):
             return stop("sync_source_or_nominal_bounds_invalid")
         if active:
-            if (et < self._normal_shed_sync_last_ev_ts or gt < self._normal_shed_sync_last_grid_ts):
+            if (self._ev_regressed_since(self._normal_shed_sync_last_ev_ts) or gt < self._normal_shed_sync_last_grid_ts):
                 return stop("sync_source_clock_regressed")
         else:
             window = _valid_number(s.measurement_settle_seconds)
@@ -799,11 +1094,19 @@ class OneFuseRegulator:
         if now >= self._normal_shed_sync_deadline:
             return stop("sync_timeout")
         if abs(current - self._normal_shed_sync_value) > .1:
-            if self._normal_shed_sync_last_ev_ts is not None and et <= self._normal_shed_sync_last_ev_ts:
+            if not self._ev_advanced_since(self._normal_shed_sync_last_ev_ts, "_normal_shed_sync_last_ev_ts"):
+                if self._ev_clock_explicit:
+                    # A different reporting clock supplies no new response
+                    # just by describing a different cached value. Preserve
+                    # only this already fixed no-write synchronization window.
+                    return ("normal_shedding_sync", "The changed observation has no post-ACK event credit yet; retaining the existing offer only inside its original synchronization deadline.",
+                            None, cap, grid, s.normal_ttl_seconds)
                 return stop("sync_value_changed_without_new_source_event")
             self._normal_shed_sync_value = current
             self._normal_shed_sync_floor = et
         self._normal_shed_sync_last_ev_ts = et
+        self._pin_ev_owner("_normal_shed_sync_last_ev_ts", wall_floor=(
+            self._ev_owner_clocks.get("_normal_shed_ev_floor", {}).get("wall_floor")))
         self._normal_shed_sync_last_grid_ts = gt
         if (gt > self._normal_shed_sync_floor and current <= grid + 1
                 and grid - current + cap <= s.main_fuse_amps - s.buffer_amps):
@@ -907,6 +1210,7 @@ class OneFuseRegulator:
             self._normal_shed_entry_cap = accepted
             self._normal_shed_grid_floor = grid_ts
             self._normal_shed_ev_floor = ev_ts
+            self._pin_ev_owner("_normal_shed_ev_floor")
             self._normal_shed_source_id = self._last_input_control_source_id
             self._uncertainty_ceiling = min(self._uncertainty_ceiling or accepted, self.startup_current)
             self._uncertainty_previous_offer = max(self._uncertainty_previous_offer or accepted, accepted)
@@ -922,7 +1226,7 @@ class OneFuseRegulator:
                 or grid_ts < self._normal_shed_grid_floor):
             return stop("source_or_control_invalid")
         if ((self._normal_shed_last_grid_ts is not None and grid_ts < self._normal_shed_last_grid_ts)
-                or (self._normal_shed_last_ev_ts is not None and ev_ts < self._normal_shed_last_ev_ts)):
+                or self._ev_regressed_since(self._normal_shed_last_ev_ts)):
             return stop("source_clock_regressed")
         self._normal_shed_last_grid_ts, self._normal_shed_last_ev_ts = grid_ts, ev_ts
         if grid > min(38, s.overload_transition_limit_amps):
@@ -941,12 +1245,14 @@ class OneFuseRegulator:
             return stop("soft_guard")
         self._increase_since = None
         if self._normal_shed_accepted_at is not None and accepted == cap:
-            response_valid = bool(self._normal_shed_ev_floor is not None
-                and ev_ts > self._normal_shed_ev_floor and -2 <= wall - ev_ts <= s.max_sensor_age_seconds
+            response_valid = bool((self._normal_shed_ev_floor is not None or self._ev_clock_explicit)
+                and self._ev_advanced_since(self._normal_shed_ev_floor, "_normal_shed_ev_floor")
+                and -2 <= wall - ev_ts <= s.max_sensor_age_seconds
                 and 1 <= current <= cap + .5)
             if response_valid:
                 if self._normal_shed_response_ts is None:
                     self._normal_shed_response_ts = ev_ts
+                    self._pin_ev_owner("_normal_shed_response_ts", copy_from="_normal_shed_ev_floor")
                 if self._normal_shed_response_monotonic is None:
                     self._normal_shed_response_monotonic = min(now, now - (wall - ev_ts))
             elif current > cap + .5:
@@ -984,7 +1290,7 @@ class OneFuseRegulator:
                 or origin is None or not isfinite(origin) or not 0 <= now-origin
                 or identity is None or identity != self._accepted_control_source_id
                 or self._reduction_grid_ts is None or self._reduction_charger_ts is None
-                or gt is None or et is None or gt < self._reduction_grid_ts or et < self._reduction_charger_ts
+                or gt is None or et is None or gt < self._reduction_grid_ts or self._ev_regressed_since(self._reduction_charger_ts)
                 or self._partial_reduction_budget is None or self._partial_reduction_budget <= 0
                 or self._partial_reduction_used_seconds < 0):
             return None
@@ -996,6 +1302,7 @@ class OneFuseRegulator:
         if (wall is not None and self._last_limit_change_ts is not None
                 and 0 <= now-self._last_limit_change_ts
                 and et > wall-(now-self._last_limit_change_ts)
+                and self._ev_advanced_since(self._reduction_charger_ts, "_reduction_charger_ts")
                 and gt > et and self._fast_sources_fresh()
                 and 1 <= current <= accepted + .5):
             return None
@@ -1145,6 +1452,8 @@ class OneFuseRegulator:
         self._positive_ev_ts: Optional[float] = None
         self._positive_before_current: Optional[float] = None
         self._positive_response_ts: Optional[float] = None
+        self._positive_anchor_response_ts: Optional[float] = None
+        self._positive_anchor_hold_used = False
         self._positive_response_current: Optional[float] = None
         self._positive_skew_since: Optional[float] = None
         self._positive_alignment_used_seconds = 0.0
@@ -1157,7 +1466,7 @@ class OneFuseRegulator:
         return (self._last_input_grid_ts is not None and self._positive_grid_ts is not None
                 and self._last_input_grid_ts > self._positive_grid_ts
                 and self._last_input_charger_ts is not None and self._positive_ev_ts is not None
-                and self._last_input_charger_ts > self._positive_ev_ts)
+                and self._ev_advanced_since(self._positive_ev_ts, "_positive_ev_ts"))
 
     def _normal_grid_first_hold(self, now: float, grid: float, current: float,
                                 house: float, status: str) -> bool:
@@ -1174,6 +1483,10 @@ class OneFuseRegulator:
 
         if self._positive_grid_first_closed:
             return False
+        if (self._positive_anchor_hold_used and self._positive_anchor_response_ts is not None
+                and self._last_input_grid_ts is not None
+                and self._last_input_grid_ts > self._positive_anchor_response_ts):
+            return reject()
         cap, anchor = self._positive_cap, self._positive_house
         if (self._restart_required or not self.settings.enable_dynamic_limit
                 or cap is None or anchor is None or self.last_target is None
@@ -1187,8 +1500,8 @@ class OneFuseRegulator:
                 or self._last_input_grid_ts is None or self._positive_grid_ts is None
                 or self._last_input_charger_ts is None or self._positive_ev_ts is None
                 or self._last_input_grid_ts <= self._positive_grid_ts
-                or self._last_input_charger_ts <= self._positive_ev_ts
-                or self._last_input_charger_ts < self._positive_response_ts
+                or not self._ev_advanced_since(self._positive_ev_ts, "_positive_ev_ts")
+                or self._ev_regressed_since(self._positive_response_ts)
                 or current > cap + 0.5 or current > grid + 1):
             return reject()
         budget = min(self.settings.measurement_settle_seconds, self.settings.max_sensor_age_seconds)
@@ -1254,7 +1567,7 @@ class OneFuseRegulator:
             and self._house_before_reduction + accepted <= s.main_fuse_amps - s.buffer_amps
             and self._reduction_before_current is not None and current < self._reduction_before_current - 0.5
             and self._reduction_charger_ts is not None
-            and self._last_input_charger_ts > self._reduction_charger_ts
+            and self._ev_advanced_since(self._reduction_charger_ts, "_reduction_charger_ts")
             and self._last_input_grid_ts <= self._last_input_charger_ts
             and self._reduction_grid_ceiling is not None and grid <= self._reduction_grid_ceiling
             and self._last_limit_change_ts is not None
@@ -1341,7 +1654,7 @@ class OneFuseRegulator:
         """
         if (self._awaiting_reduction_target is None or self._reduction_high_current is None
                 or self._last_input_charger_ts is None or self._reduction_charger_ts is None
-                or self._last_input_charger_ts <= self._reduction_charger_ts
+                or not self._ev_advanced_since(self._reduction_charger_ts, "_reduction_charger_ts")
                 or not self._fast_sources_fresh()):
             return
         if current > self._awaiting_reduction_target + 0.5:
@@ -1359,11 +1672,15 @@ class OneFuseRegulator:
         full and partial response consumers must reject a pre-ACK EV event;
         unrelated established reduction paths keep their existing contract.
         """
+        if not self._ev_clock_credit:
+            return False
         if (self._low_grid_pending and self._low_grid_phase == "reduction"
                 and cap == self._low_grid_cap):
             return bool(stamp is not None and self._low_grid_ack_ev_floor is not None
-                        and stamp > self._low_grid_ack_ev_floor)
-        return True
+                        and stamp > self._low_grid_ack_ev_floor
+                        and self._ev_advanced_since(self._reduction_charger_ts, "_reduction_charger_ts"))
+        return (not self._ev_clock_explicit or self._ev_advanced_since(
+            self._reduction_charger_ts, "_reduction_charger_ts"))
 
     def _reduction_low_is_response(self, cap: int, current: float, status: str) -> bool:
         if not self._reduction_response_after_ack(cap, self._last_input_charger_ts):
@@ -1416,7 +1733,7 @@ class OneFuseRegulator:
             and self._last_input_grid_ts is not None and self._reduction_grid_ts is not None
             and self._last_input_grid_ts > self._reduction_grid_ts
             and self._last_input_charger_ts is not None and self._reduction_charger_ts is not None
-            and self._last_input_charger_ts > self._reduction_charger_ts
+            and self._ev_advanced_since(self._reduction_charger_ts, "_reduction_charger_ts")
             and self._fast_sources_fresh()
             and grid + cap <= self.settings.main_fuse_amps - self.settings.buffer_amps
         )
@@ -1439,7 +1756,7 @@ class OneFuseRegulator:
                 or self._house_before_reduction is None or self._partial_reduction_budget is None
                 or self._reduction_grid_ts is None or self._reduction_charger_ts is None
                 or grid_ts is None or ev_ts is None
-                or grid_ts < self._reduction_grid_ts or ev_ts < self._reduction_charger_ts
+                or grid_ts < self._reduction_grid_ts or self._ev_regressed_since(self._reduction_charger_ts)
                 or status != "charging"):
             return None
         if not self._reduction_response_after_ack(cap, ev_ts):
@@ -1457,7 +1774,7 @@ class OneFuseRegulator:
         low = self._partial_reduction_current if partial_seen else max(before, self._reduction_high_current or 0.0)
         completed_partial = (partial_seen and low > cap + 0.5
                              and current <= cap + 0.5 and current < low)
-        if ev_ts > self._reduction_charger_ts and (current < low - 0.5 or completed_partial):
+        if self._ev_advanced_since(self._reduction_charger_ts, "_reduction_charger_ts") and (current < low - 0.5 or completed_partial):
             self._partial_reduction_current = current
             self._partial_reduction_response_ts = ev_ts
         response = self._partial_reduction_response_ts
@@ -1482,7 +1799,8 @@ class OneFuseRegulator:
 
     def _fast_sources_fresh(self) -> bool:
         """Require actual UTC receipt ages; a stream heartbeat is insufficient."""
-        return self._numeric_source_rejection() is None
+        return (self._numeric_source_rejection() is None and self._ev_clock_credit
+                and self._event_source_usable())
 
     def _numeric_source_rejection(self) -> Optional[str]:
         """Describe existing numeric freshness checks without weakening them."""
@@ -1523,6 +1841,8 @@ class OneFuseRegulator:
         positive current. An aged EV fallback can preserve only an observation
         that already began with fresh idle evidence; it cannot begin one.
         """
+        if self._raw_clock_zero_observation(grid_current, status, current):
+            return True
         wall, grid, ev = (self._last_input_wall_now_ts, self._last_input_grid_ts,
                           self._last_input_charger_ts)
         common = bool(
@@ -1543,7 +1863,29 @@ class OneFuseRegulator:
             return bool(self._restart_ready_since is not None and self._raw_zero_restart_cap is not None
                         and self.settings.min_charge_amps <= self._raw_zero_restart_cap <= self.settings.max_charge_amps)
         return bool(current > 0.5 and not self._meaningfully_charging(status, current)
-                    and (self._reduction_charger_ts is None or ev >= self._reduction_charger_ts))
+                    and (self._reduction_charger_ts is None or not self._ev_regressed_since(self._reduction_charger_ts)))
+
+    def _raw_clock_zero_observation(self, grid: float, status: str, current: float) -> bool:
+        """Observe raw restart capacity without inventing a zero EV report.
+
+        The receiver is active but may have no winning-conductor event yet.
+        Only our already submitted zero and the existing continuous raw-grid
+        restart gate qualify; the controller still orders native zero readback.
+        """
+        s = self.settings
+        return bool(s.nominal_import_only_fallback and s.enable_dynamic_limit
+            and self._ev_clock_explicit and self._ev_clock_error is None
+            and self._ev_current_sequences and self._last_input_current_trusted
+            and self._restart_required and not self.paused_by_us
+            and status in {"charging", "start_charging", "awaiting_start", "ready_to_charge"}
+            and 0 <= current <= .5 and self.last_target is not None and self.last_target[0] == 0
+            and self._awaiting_reduction_target == 0
+            and self._last_input_control_source_id is not None
+            and self._last_input_control_source_id == self._accepted_control_source_id
+            and not self._uncertainty_retry_submission_pending and self._uncertainty_stops < 3
+            and self._last_input_wall_now_ts is not None and self._last_input_grid_ts is not None
+            and 0 <= self._last_input_wall_now_ts-self._last_input_grid_ts <= s.max_sensor_age_seconds
+            and grid+self.startup_current <= s.main_fuse_amps-s.buffer_amps)
 
     def _rebase_positive_house(self, now: float, grid: float, house: float, current: float, status: str,
                                snapshot_verified: bool) -> bool:
@@ -1569,12 +1911,14 @@ class OneFuseRegulator:
             # and a later coherent grid receipt. Spend all elapsed uncertainty;
             # this neither refunds time nor grants another alignment window.
             if (self._positive_response_ts is None
-                    or self._last_input_charger_ts <= self._positive_response_ts
+                    or not self._ev_advanced_since(self._positive_response_ts, "_positive_response_ts")
                     or self._positive_alignment_used_seconds + elapsed < settle):
                 return False
             self._positive_alignment_used_seconds += elapsed
             self._positive_skew_since = None
             self._positive_response_ts = None
+            self._positive_anchor_response_ts = None
+            self._positive_anchor_hold_used = False
         self._positive_house = house
         reference = (self._positive_response_current if self._positive_response_current is not None
                      else self._positive_verified_low_current if self._positive_verified_low_current is not None
@@ -1582,6 +1926,8 @@ class OneFuseRegulator:
         if reference is not None and current < reference - 0.5:
             self._positive_verified_low_current = current
             self._positive_verified_low_ts = self._last_input_charger_ts
+            self._pin_ev_owner("_positive_verified_low_ts", wall_floor=(
+                self._ev_owner_clocks.get("_positive_ev_ts", {}).get("wall_floor")))
         return True
 
     def _positive_response_owns_uncertainty(
@@ -1603,6 +1949,7 @@ class OneFuseRegulator:
                         self._last_input_charger_ts)
         identity = self._last_input_control_source_id
         if (not s.enable_dynamic_limit or self._restart_required or self.paused_by_us
+                or not self._ev_clock_credit
                 or status != "charging" or cap is None or anchor is None
                 or self.last_target is None or self.last_target[0] != cap
                 or not s.min_charge_amps <= cap <= s.max_charge_amps
@@ -1628,10 +1975,10 @@ class OneFuseRegulator:
         if (not 0 <= wall - gt <= s.max_sensor_age_seconds
                 or wall < et or (not whole_accepted_fits and wall - et > s.max_sensor_age_seconds)
                 or self._positive_grid_ts is None or gt < self._positive_grid_ts
-                or self._positive_ev_ts is None or et <= self._positive_ev_ts
+                or not self._ev_advanced_since(self._positive_ev_ts, "_positive_ev_ts")
                 or (previous_grid_ts is not None and gt < previous_grid_ts)
-                or (previous_charger_ts is not None and et < previous_charger_ts)
-                or (self._positive_response_ts is not None and et < self._positive_response_ts)
+                or self._ev_regressed_since(previous_charger_ts)
+                or self._ev_regressed_since(self._positive_response_ts)
                 or reference is None or current <= reference + 0.5
                 or current <= grid + 1 or current > cap + 0.5
                 or _valid_number(normal) is None or _valid_number(anchor) is None
@@ -1677,17 +2024,21 @@ class OneFuseRegulator:
         if anchor is None or anchor + cap > s.main_fuse_amps - s.buffer_amps:
             self._clear_positive_alignment()
             return None
-        ev_advanced = (self._last_input_charger_ts is not None and self._positive_ev_ts is not None
-                       and self._last_input_charger_ts > self._positive_ev_ts)
+        ev_advanced = self._ev_advanced_since(self._positive_ev_ts, "_positive_ev_ts")
         reference = (self._positive_verified_low_current if self._positive_verified_low_current is not None
                      else self._positive_before_current or 0.0)
         increased = current > reference + 0.5
         fresh_low_response = (self._positive_verified_low_ts is not None
                               and self._last_input_charger_ts is not None
-                              and self._last_input_charger_ts > self._positive_verified_low_ts)
+                              and self._ev_advanced_since(self._positive_verified_low_ts, "_positive_verified_low_ts"))
         if (ev_advanced and increased and (self._positive_response_current is None
                 or current > self._positive_response_current + 0.5 or fresh_low_response)):
+            if self._positive_response_ts is None:
+                self._positive_anchor_response_ts = self._last_input_charger_ts
+                self._positive_anchor_hold_used = False
             self._positive_response_ts = self._last_input_charger_ts
+            self._pin_ev_owner("_positive_response_ts", wall_floor=(
+                self._ev_owner_clocks.get("_positive_ev_ts", {}).get("wall_floor")))
             self._positive_response_current = current
             self._positive_verified_low_ts = None
         if self._positive_response_ts is None:
@@ -1706,9 +2057,9 @@ class OneFuseRegulator:
             # This grants no new alignment time, increase, resume or overload.
             valid_receipts = (self._last_input_grid_ts is not None and self._positive_grid_ts is not None
                               and self._last_input_grid_ts >= self._positive_grid_ts
-                              and self._last_input_charger_ts is not None and self._positive_ev_ts is not None
-                              and self._last_input_charger_ts >= self._positive_ev_ts
-                              and self._last_input_charger_ts >= self._positive_response_ts)
+                              and self._last_input_charger_ts is not None
+                              and not self._ev_regressed_since(self._positive_ev_ts)
+                              and not self._ev_regressed_since(self._positive_response_ts))
             if valid_receipts and grid + cap <= s.main_fuse_amps - s.buffer_amps:
                 grid_after_response = self._last_input_grid_ts > self._positive_response_ts
                 if (grid_after_response and current <= grid + 1 and current >= cap - 0.5
@@ -1733,6 +2084,8 @@ class OneFuseRegulator:
                 self._positive_alignment_used_seconds += active_elapsed
                 self._positive_skew_since = None
                 self._positive_response_ts = None
+                self._positive_anchor_response_ts = None
+                self._positive_anchor_hold_used = False
             # A coherent partial/tapered current is not a failed start and
             # must not cause timed zero/start retries. Retain eligibility for
             # the rest of this same accepted rise, without renewing any grace.
@@ -1740,6 +2093,50 @@ class OneFuseRegulator:
         if self._positive_skew_since is None:
             self._positive_skew_since = now
         return "hold"
+
+    def _positive_ev_first_anchor_hold(self, now: float, grid: float, current: float,
+                                       status: str, previous_grid_ts: Optional[float],
+                                       previous_charger_ts: Optional[float]) -> bool:
+        """Retain an existing rise's coherent house bound for one mixed pair.
+
+        A partial EV response can be published just after the grid observation.
+        Subtracting it from that earlier grid must not manufacture new house
+        load. Keep only the accepted cap inside its ORIGINAL response budget;
+        a later grid must return to normal load estimation and limiting.
+        """
+        s = self.settings
+        cap, anchor = self._positive_cap, self._positive_house
+        gt, et, wall = self._last_input_grid_ts, self._last_input_charger_ts, self._last_input_wall_now_ts
+        identity = self._last_input_control_source_id
+        if (not s.nominal_import_only_fallback or not s.enable_dynamic_limit
+                or self._restart_required or self.paused_by_us
+                or not self._meaningfully_charging(status, current)
+                or cap is None or anchor is None or self.last_target is None
+                or self.last_target[0] != cap or not s.min_charge_amps <= cap <= s.max_charge_amps
+                or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                or identity is None or identity != self._accepted_control_source_id
+                or self._awaiting_reduction_target is not None or self._low_grid_pending
+                or self._uncertainty_ceiling is not None
+                or self._overload_transition_started is not None or self._overload_hold_active
+                or self._normal_shed_deadline is not None
+                or self._numeric_source_rejection() is not None or not self._ev_clock_credit
+                or wall is None or gt is None or et is None or et > wall or gt > wall
+                or gt is None or et is None or self._positive_grid_ts is None
+                or gt < self._positive_grid_ts or not self._ev_advanced_since(self._positive_ev_ts, "_positive_ev_ts")
+                or previous_grid_ts is not None and gt < previous_grid_ts
+                or self._ev_regressed_since(previous_charger_ts)
+                or self._positive_response_ts is None or not gt <= self._positive_response_ts <= et
+                or self._positive_anchor_response_ts is None or gt > self._positive_anchor_response_ts
+                or self._positive_response_current is None or current < self._positive_response_current-.5
+                or self._positive_before_current is None or current <= self._positive_before_current+.5
+                or current > cap+.5 or self._positive_skew_since is None
+                or not 0 <= now-self._positive_skew_since
+                or self._positive_alignment_used_seconds + now-self._positive_skew_since
+                    >= min(s.measurement_settle_seconds, s.max_sensor_age_seconds)):
+            return False
+        normal = s.main_fuse_amps-s.buffer_amps
+        return bool(0 <= anchor and anchor+cap <= normal and grid <= normal
+                    and grid <= anchor+cap+.5)
 
     def reset_overload_budget(self) -> None:
         """Explicit new exposure state; never call for settings or HA reloads.
@@ -2021,10 +2418,10 @@ class OneFuseRegulator:
                 return stop("response_timeout")
             grid_advanced = (self._last_input_grid_ts is not None and self._overload_entry_grid_ts is not None
                              and self._last_input_grid_ts > self._overload_entry_grid_ts)
-            ev_advanced = (self._overload_minimum_accepted_at is not None
+            ev_advanced = (self._ev_clock_credit and self._overload_minimum_accepted_at is not None
                            and self._last_input_charger_ts is not None
-                           and self._overload_minimum_ev_floor is not None
-                           and self._last_input_charger_ts > self._overload_minimum_ev_floor)
+                           and (self._overload_minimum_ev_floor is not None or self._ev_clock_explicit)
+                           and self._ev_advanced_since(self._overload_minimum_ev_floor, "_overload_minimum_ev_floor"))
             if (self._meaningfully_charging(status, current)
                     and current <= minimum + 0.5 and ev_advanced):
                 if self._overload_minimum_response_ts is None:
@@ -2188,6 +2585,7 @@ class OneFuseRegulator:
             self._accepted_control_source_id = self._last_input_control_source_id
             if changed or accepted_restart:
                 self._accepted_control_ev_ts = self._last_input_charger_ts
+                self._pin_ev_owner("_accepted_control_ev_ts", wall_floor=self._ack_wall(now_ts))
             if (self._low_grid_pending and target == self._low_grid_cap
                     and self._low_grid_accepted_at is None):
                 self._low_grid_accepted_at = now_ts
@@ -2197,6 +2595,7 @@ class OneFuseRegulator:
                         and now_ts >= self._last_input_now_ts):
                     self._low_grid_ack_ev_floor = (self._last_input_wall_now_ts
                         + now_ts - self._last_input_now_ts)
+                    self._set_ev_owner_wall("_low_grid_ev_floor", self._low_grid_ack_ev_floor)
             if (accepted_restart or (changed and target > 0 and self._low_grid_cap is not None
                                      and target != self._low_grid_cap)):
                 self._clear_low_grid_alignment()
@@ -2229,12 +2628,13 @@ class OneFuseRegulator:
                 if (target > 0 and (old_target is None or target > old_target)
                         and target > decision.charger_current + 0.5
                         and self._last_input_grid_ts is not None
-                        and self._last_input_charger_ts is not None
+                        and (self._last_input_charger_ts is not None or self._ev_clock_explicit and self._ev_current_sequences)
                         and decision.house_load_l1 + target <= self.settings.main_fuse_amps - self.settings.buffer_amps):
                     self._positive_cap = target
                     self._positive_house = decision.house_load_l1
                     self._positive_grid_ts = self._last_input_grid_ts
                     self._positive_ev_ts = self._last_input_charger_ts
+                    self._pin_ev_owner("_positive_ev_ts", wall_floor=self._ack_wall(now_ts))
                     self._positive_before_current = decision.charger_current
             if same_cap_restart:
                 # The zero may have physically stopped the car without an HTTP
@@ -2243,12 +2643,13 @@ class OneFuseRegulator:
                 self._clear_positive_alignment()
                 if (target > decision.charger_current + 0.5
                         and self._last_input_grid_ts is not None
-                        and self._last_input_charger_ts is not None
+                        and (self._last_input_charger_ts is not None or self._ev_clock_explicit and self._ev_current_sequences)
                         and decision.house_load_l1 + target <= self.settings.main_fuse_amps - self.settings.buffer_amps):
                     self._positive_cap = target
                     self._positive_house = decision.house_load_l1
                     self._positive_grid_ts = self._last_input_grid_ts
                     self._positive_ev_ts = self._last_input_charger_ts
+                    self._pin_ev_owner("_positive_ev_ts", wall_floor=self._ack_wall(now_ts))
                     self._positive_before_current = decision.charger_current
             if changed and (target < decision.charger_current or
                             (old_target is not None and target < old_target)):
@@ -2285,6 +2686,7 @@ class OneFuseRegulator:
                 # even when its uncertainty belongs to an older active chain.
                 self._reduction_grid_ts = self._last_input_grid_ts
                 self._reduction_charger_ts = self._last_input_charger_ts
+                self._pin_ev_owner("_reduction_charger_ts", wall_floor=self._ack_wall(now_ts))
                 self._settle_started = None
                 self._clear_partial_reduction_alignment()
                 self._awaiting_reduction_target = target
@@ -2297,6 +2699,7 @@ class OneFuseRegulator:
                     and decision.charger_current <= target + 0.5)
                 self._reduction_high_current = decision.charger_current
                 self._reduction_high_ev_ts = self._last_input_charger_ts
+                self._pin_ev_owner("_reduction_high_ev_ts", wall_floor=self._ack_wall(now_ts))
                 self._reduction_grid_ceiling = grid_ceiling
                 self._partial_reduction_budget = budget
                 self._partial_reduction_used_seconds = spent
@@ -2335,6 +2738,7 @@ class OneFuseRegulator:
                         self._last_input_wall_now_ts + accepted_now - self._last_input_now_ts)
                     if accepted_wall is not None and self._last_input_charger_ts is not None:
                         self._overload_minimum_ev_floor = max(self._last_input_charger_ts, accepted_wall)
+                        self._pin_ev_owner("_overload_minimum_ev_floor", wall_floor=accepted_wall)
                 if self._awaiting_reduction_target == target:
                     deadline = self._overload_transition_started + self.settings.overload_response_seconds
                     self._partial_reduction_budget = min(
@@ -2380,6 +2784,7 @@ class OneFuseRegulator:
                             and accepted_now >= self._last_input_now_ts):
                         self._normal_shed_ev_floor = max(self._normal_shed_ev_floor or 0.0,
                             self._last_input_wall_now_ts + accepted_now - self._last_input_now_ts)
+                        self._set_ev_owner_wall("_normal_shed_ev_floor", self._ack_wall(accepted_now))
                     else:
                         self._normal_shed_ev_floor = None
             self.last_set_limit_ts = now_ts
@@ -2568,6 +2973,7 @@ class OneFuseRegulator:
     def evaluate(self, inp: RegulatorInput) -> RegulatorDecision:
         s = self.settings
         previous_grid_ts, previous_charger_ts = self._last_input_grid_ts, self._last_input_charger_ts
+        self._observe_ev_clock(inp)
         observed_now = _valid_number(inp.now_ts)
         now = observed_now if observed_now is not None else 0.0
         self._last_input_now_ts = None if isinstance(inp.now_ts, bool) else observed_now
@@ -2607,6 +3013,13 @@ class OneFuseRegulator:
             # Initial takeover cannot be seeded from an old retained EV value.
             available, house = self.calculate_available_l1(grid, 0.0)
             house_basis = "raw_grid_unverified_ev"
+        if (self._ev_clock_explicit and (self._ev_established_value != current
+                or self._ev_established_binding != self._last_input_control_source_id)):
+            # An unknown first frame or metadata-only clock baseline supplies
+            # no new numeric EV subtraction. A previously reported unchanged
+            # value may remain an established cache state under its binding.
+            available, house = self.calculate_available_l1(grid, 0.0)
+            house_basis = "raw_grid_without_established_ev_value"
 
         def decision(mode: str, reason: str, command: str | None = None,
                      target: int = 0, ttl: int | None = None, emergency: bool = False) -> RegulatorDecision:
@@ -2641,6 +3054,17 @@ class OneFuseRegulator:
                 should_call = should_call and (emergency or reduction or change_allowed)
             else:
                 should_call = should_call and ((emergency and command == "pause") or self._action_allowed(now))
+            live_same_cap = bool(self.last_target is not None and self.last_target[0] == target > 0
+                and self.last_set_limit_ts is not None
+                and 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                and not self._restart_required)
+            if (inp.charger_increase_ready is not True and should_call
+                    and (command == "resume" or command == "set_limit" and target > 0
+                         and (not live_same_cap and (self.last_target is None
+                              or target >= self.last_target[0] or self._restart_required)))):
+                should_call = False
+                mode = "waiting_for_stable_current_frame"
+                reason = "Current-conductor reports are still changing; deferring only new positive authority until the bounded quiet period ends."
             recovery_submission_ts = None
             if (self._uncertainty_restart and command == "set_limit" and target > 0 and should_call):
                 if self._uncertainty_retry_submission_pending:
@@ -2719,7 +3143,7 @@ class OneFuseRegulator:
                     if self._normal_shed_sync_deadline is not None and self._normal_shed_failure is None else None),
             )
 
-        error = inp.data_error
+        error = inp.data_error or self._ev_clock_error
         if not inp.data_valid:
             error = error or "Required telemetry is missing or stale."
         elif grid is None or grid < 0:
@@ -2787,6 +3211,14 @@ class OneFuseRegulator:
             self._restart_required = True
             return decision("unavailable", "Accepted positive response source binding changed; requesting 0 A.",
                             "set_limit", emergency=True)
+        baseline_hold = self._clock_baseline_raw_hold(now, grid, current, status)
+        if baseline_hold is not None:
+            cap, house = baseline_hold
+            available, _ = self.calculate_available_l1(grid, 0.0)
+            house_basis = "whole_authority_raw_bound_without_clock_credit"
+            refresh_required = True
+            return decision("low_grid_raw_hold", "Retaining only the existing live offer without a command: fresh raw L1 plus its entire unresolved authority fits the normal buffered budget; the observation clock is still a baseline.",
+                            None, cap, self.last_target[3])
         positive_response_owner = self._positive_response_owns_uncertainty(
             now, grid, current, status, previous_grid_ts, previous_charger_ts,
         )
@@ -2895,9 +3327,11 @@ class OneFuseRegulator:
                 self._settle_started = None
                 self._clear_partial_reduction_alignment()
         raw_zero_restart = self._raw_zero_restart_allowed(grid, status, current)
-        raw_zero_fresh = bool(raw_zero_restart and self._last_input_wall_now_ts is not None
+        raw_zero_fresh = bool(raw_zero_restart and (self._raw_clock_zero_observation(grid, status, current) or (
+                              self._last_input_wall_now_ts is not None
                               and self._last_input_charger_ts is not None
-                              and self._last_input_wall_now_ts - self._last_input_charger_ts <= s.max_sensor_age_seconds)
+                              and self._last_input_wall_now_ts - self._last_input_charger_ts <= s.max_sensor_age_seconds
+                              and self._ev_clock_credit and self._event_source_usable())))
         if not raw_zero_restart and self._raw_zero_restart_cap is not None:
             self._raw_zero_restart_cap = None
             self._restart_ready_since = None
@@ -2998,8 +3432,17 @@ class OneFuseRegulator:
             )
         if alignment == "hold":
             assert self._positive_cap is not None and self.last_target is not None
-            house = max(house, self._positive_house or 0.0)
-            house_basis = "positive_response_anchor"
+            if self._positive_ev_first_anchor_hold(
+                    now, grid, current, status, previous_grid_ts, previous_charger_ts):
+                # This EV-first observation belongs to the accepted rise.
+                # Credit no mixed-pair subtraction and grant no higher cap,
+                # resume, fresh response timer or experimental allowance.
+                house = self._positive_house
+                house_basis = "prior_coherent_house_ev_first_hold"
+                self._positive_anchor_hold_used = True
+            else:
+                house = max(house, self._positive_house or 0.0)
+                house_basis = "positive_response_anchor"
             raw_available = s.main_fuse_amps - house - s.buffer_amps
             available = (int(floor(min(raw_available, s.max_charge_amps)))
                          if raw_available >= s.min_charge_amps else 0)
@@ -3035,7 +3478,7 @@ class OneFuseRegulator:
                     self._last_input_grid_ts is not None and self._positive_grid_ts is not None
                     and self._last_input_grid_ts >= self._positive_grid_ts
                     and self._last_input_charger_ts is not None and self._positive_ev_ts is not None
-                    and self._last_input_charger_ts >= self._positive_ev_ts
+                    and not self._ev_regressed_since(self._positive_ev_ts)
                     and self._fast_sources_fresh())
                 remaining = min(s.measurement_settle_seconds, s.max_sensor_age_seconds) - (
                     self._positive_alignment_used_seconds + max(0.0, now - self._positive_skew_since))
@@ -3195,7 +3638,7 @@ class OneFuseRegulator:
                                     and self._last_input_grid_ts <= self._reduction_grid_ts)
                 ev_updated = (self._last_input_charger_ts is not None
                               and self._reduction_charger_ts is not None
-                              and self._last_input_charger_ts > self._reduction_charger_ts)
+                              and self._ev_advanced_since(self._reduction_charger_ts, "_reduction_charger_ts"))
                 grid_before_under_cap_response = (
                     self._reduction_under_cap_baseline and self._last_input_grid_ts is not None
                     and self._reduction_low_response_ts is not None

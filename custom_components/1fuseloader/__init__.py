@@ -43,6 +43,8 @@ CURRENT_SNAPSHOT_MAX_AGE_SECONDS = 30
 CURRENT_SNAPSHOT_MIN_INTERVAL_SECONDS = 5
 CURRENT_SNAPSHOT_REQUEST_TIMEOUT_SECONDS = 10
 CURRENT_SNAPSHOT_MAX_BACKOFF_SECONDS = 300
+CURRENT_TUPLE_QUIET_SECONDS = 0.25
+_NO_NATIVE_CURRENT_CLOCK = object()
 SNAPSHOT_ERROR_CODES = frozenset({
     "easee_snapshot_api_unavailable", "easee_snapshot_missing_or_invalid",
     "easee_snapshot_invalid_current", "easee_snapshot_invalid_operation_mode",
@@ -219,6 +221,9 @@ class OneFuseLoaderController:
         self._recent_commands: deque[dict[str, Any]] = deque(maxlen=32)
         self._delivery = CommandDeliveryTracker()
         self._delivery_unsub = None
+        self._current_observation_unsub = None
+        self._current_quiet_unsub = None
+        self._current_quiet_token: object | None = None
         self._control_identity = None
         self._delivery_binding = None
         self._positive_retry_after = 0.0
@@ -529,6 +534,11 @@ class OneFuseLoaderController:
                 if self._delivery_unsub is not None:
                     self._delivery_unsub()
                 self._delivery_unsub = subscribe(self._handle_delivery)
+            subscribe_current = getattr(self._adapter, "set_current_observation_callback", None)
+            if callable(subscribe_current):
+                if self._current_observation_unsub is not None:
+                    self._current_observation_unsub()
+                self._current_observation_unsub = subscribe_current(lambda: self._handle_source_change(None))
             await self._async_tick_locked()
             # async_stop marks stopped before waiting for this lock. It may
             # already have removed listeners while any startup await yielded;
@@ -670,6 +680,13 @@ class OneFuseLoaderController:
         if self._delivery_unsub is not None:
             self._delivery_unsub()
             self._delivery_unsub = None
+        if self._current_observation_unsub is not None:
+            self._current_observation_unsub()
+            self._current_observation_unsub = None
+        self._current_quiet_token = None
+        if self._current_quiet_unsub is not None:
+            self._current_quiet_unsub()
+            self._current_quiet_unsub = None
         self._pending_refresh = False
         snapshot_task = self._charger_snapshot_task
         self._cancel_snapshot_refresh(cancel_request=True)
@@ -711,14 +728,58 @@ class OneFuseLoaderController:
                 pass
 
     def _charger_source_revision(self) -> tuple:
-        """Identify relevant HA events, including unchanged-value new reports."""
+        """Identify actual selected value/observation changes, not HA fanout."""
         data = self.entry.data
         result: list[Any] = [data.get(CONF_DEVICE_ID)]
+        native = self._native_current_clock()
+        if native is not _NO_NATIVE_CURRENT_CLOCK:
+            status_id = data.get(CONF_STATUS_ENTITY)
+            status = self.hass.states.get(status_id)
+            changed = self._utc_time(getattr(status, "last_changed", None))
+            current_id = data.get(CONF_CHARGER_CURRENT_ENTITY)
+            current = self.hass.states.get(current_id)
+            receipt = self._utc_time(getattr(native, "received_at", None))
+            return (data.get(CONF_DEVICE_ID), status_id, getattr(status, "state", None),
+                    changed.timestamp() if changed else None, current_id, getattr(current, "state", None),
+                    receipt.timestamp() if receipt else None,
+                    ("native_terminal_receipt", getattr(native, "source_identity", None),
+                     getattr(native, "observation_ids", ()), getattr(native, "error", None)))
         for key in (CONF_STATUS_ENTITY, CONF_CHARGER_CURRENT_ENTITY):
             entity_id = data.get(key)
             state = self.hass.states.get(entity_id)
             result.extend((entity_id, getattr(state, "state", None), self._report_timestamp(state)))
         return tuple(result)
+
+    def _native_current_clock(self) -> Any:
+        try:
+            return getattr(self._adapter, "native_current_observation", _NO_NATIVE_CURRENT_CLOCK)
+        except Exception:
+            # Real adapters with unavailable evidence must never silently fall
+            # back to the aggregate HA receipt clock.
+            return None
+
+    def _schedule_current_quiet_tick(self, changed_at: float | None) -> bool:
+        """Defer only new positive authority; do not alter source/deadline time."""
+        now = self.hass.loop.time()
+        pending = (type(changed_at) in (int, float) and isfinite(changed_at)
+                   and now - changed_at < CURRENT_TUPLE_QUIET_SECONDS)
+        if not pending:
+            return True
+        self._current_quiet_token = token = object()
+        if self._current_quiet_unsub is not None:
+            self._current_quiet_unsub()
+        generation = self._generation
+
+        async def ready(_now: datetime) -> None:
+            if self._stopped or generation != self._generation or token is not self._current_quiet_token:
+                return
+            self._current_quiet_unsub = None
+            self._current_quiet_token = None
+            self._handle_source_change(None)
+
+        self._current_quiet_unsub = async_call_later(
+            self.hass, max(0.001, CURRENT_TUPLE_QUIET_SECONDS - (now - changed_at)), ready)
+        return False
 
     def _cancel_snapshot_refresh(self, *, cancel_request: bool = False) -> None:
         if self._charger_snapshot_refresh_unsub is not None:
@@ -866,7 +927,8 @@ class OneFuseLoaderController:
                         or (received - observed).total_seconds() >= self._snapshot_freshness_window() / 2
                         or observed > received + timedelta(seconds=2))
                     report_times = [revision[3], revision[6]]
-                    if any(stamp is None or stamp >= received.timestamp() for stamp in report_times):
+                    if any((stamp is None and len(revision) == 7) or
+                           (stamp is not None and stamp >= received.timestamp()) for stamp in report_times):
                         self._charger_snapshot_error = "snapshot_not_newer_than_entity_reports"
                         self._charger_snapshot_error_reason = "snapshot_not_newer_than_entity_reports"
                         self._charger_snapshot_failure_type = None
@@ -981,12 +1043,45 @@ class OneFuseLoaderController:
         snapshot_age = ((datetime.now(timezone.utc) - received).total_seconds()
                         if received is not None else float("inf"))
         snapshot_is_current = getattr(self._adapter, "snapshot_is_current", None)
-        entity_report_times = (self._report_timestamp(current_state), self._report_timestamp(status_state))
+        revision = self._charger_source_revision()
+        native_clock = self._native_current_clock()
+        explicit_native_clock = native_clock is not _NO_NATIVE_CURRENT_CLOCK
+        entity_report_times = ((revision[6], revision[3]) if explicit_native_clock else
+                              (self._report_timestamp(current_state), self._report_timestamp(status_state)))
         source_stamp = self._utc_time(getattr(snapshot, "current_source_timestamp", None))
         status_source_stamp = self._utc_time(getattr(snapshot, "status_source_timestamp", None))
         source_error = getattr(snapshot, "source_timestamp_error", None)
         current_trusted = True
         current_clock_scope = "native_HA_receipt_not_guaranteed_acquisition"
+        # Keep age/observation metadata intact, but identify clocks explicitly.
+        # A later HTTP read can reveal an earlier vendor event for the SAME
+        # native value. That is a provenance change, not a replay of either
+        # clock, and it must never be treated as new response evidence.
+        try:
+            clock_owner = getattr(self._adapter, "observation_clock_identity", None)
+        except Exception:
+            clock_owner = None
+        if (not isinstance(clock_owner, tuple) or not clock_owner
+                or any(type(part) is not int for part in clock_owner)):
+            clock_owner = (id(self._adapter),)
+        current_report_family = "native_ha_receipt"
+        current_report_provenance = ("entity", data.get(CONF_CHARGER_CURRENT_ENTITY) or "", *clock_owner)
+        current_observation_ids: tuple[int, ...] = ()
+
+        def maximum_ids(maxima: Any) -> tuple[int, ...]:
+            if (not isinstance(maxima, tuple) or not maxima
+                    or any(type(key) is not int or key not in (182, 183, 184, 185) for key in maxima)
+                    or tuple(sorted(set(maxima))) != maxima):
+                return ()
+            return maxima
+
+        def vendor_clock_provenance(item: Any) -> tuple[str | int, ...]:
+            owner = getattr(item, "source_identity", None)
+            if (not isinstance(owner, tuple) or not owner
+                    or any(type(part) is not int for part in owner)):
+                owner = clock_owner
+            maxima = maximum_ids(getattr(item, "current_source_observation_ids", ()))
+            return (*owner, "max_terminals", *maxima) if maxima else (*owner, "unknown_maximum")
         def current_number(value: Any) -> float | None:
             try:
                 number = float(value)
@@ -994,6 +1089,47 @@ class OneFuseLoaderController:
             except (TypeError, ValueError, OverflowError):
                 return None
         native_number = current_number(current_value)
+        increase_ready = True
+        native_receipt = None
+        native_clock_error = None
+        native_maxima = ()
+        native_source_times: tuple = ()
+        event_source_known = False
+        event_source_ts = None
+        observation_report_times = None
+        observation_sequences = None
+        if explicit_native_clock:
+            native_maxima = maximum_ids(getattr(native_clock, "observation_ids", ()))
+            native_clock_error = getattr(native_clock, "error", None)
+            native_receipt = self._utc_time(getattr(native_clock, "received_at", None))
+            # Numeric state and this terminal receipt must describe the same
+            # winning value. A missing receipt is explicit unknown provenance,
+            # never an excuse to adopt a fresh HA attribute-fanout timestamp.
+            if native_number is None or current_number(getattr(native_clock, "current", None)) != native_number:
+                native_receipt = None
+            current_report_ts = native_receipt.timestamp() if native_receipt else None
+            current_report_family = "native_terminal_receipt"
+            current_report_provenance = (*clock_owner, "max_terminals", *native_maxima)
+            current_observation_ids = native_maxima
+            current_clock_scope = "native_winning_terminal_local_receipt_not_physical_acquisition"
+            native_source_times = getattr(native_clock, "source_timestamps", ())
+            source_times = dict(native_source_times) if isinstance(native_source_times, tuple) else {}
+            known_sources = [self._utc_time(source_times.get(key)) for key in native_maxima]
+            event_source_known = any(stamp is not None for stamp in known_sources)
+            if native_maxima and all(stamp is not None for stamp in known_sources):
+                # Same raw frame/terminal observations bind these provider
+                # times to our native events. Keep this bound separate from
+                # actual local receipt ordering; neither clock is fabricated.
+                event_source_ts = min(known_sources).timestamp()
+            if native_clock_error and native_clock_error != "native_terminal_values_unavailable":
+                current_trusted = False
+            increase_ready = self._schedule_current_quiet_tick(
+                getattr(native_clock, "last_tuple_change_monotonic", None))
+            observation_report_times = tuple((key, stamp.timestamp())
+                for key, raw_stamp in getattr(native_clock, "observation_report_times", ())
+                if type(key) is int and key in (182, 183, 184, 185)
+                and (stamp := self._utc_time(raw_stamp)) is not None)
+            observation_sequences = getattr(native_clock, "observation_sequences", ())
         evidence = self._charger_vendor_evidence
         if evidence is not None and (
                 self._stopped or errors or health_error or evidence["generation"] != self._generation
@@ -1019,6 +1155,7 @@ class OneFuseLoaderController:
                     "timestamp": None if malformed else source_stamp, "invalid": bool(malformed),
                 }
         snapshot_source_rejection = None
+        canonical_native = bool(explicit_native_clock and native_receipt is not None and native_maxima)
         if snapshot is not None:
             if source_error:
                 snapshot_source_rejection = "observation_timestamp_invalid"
@@ -1043,31 +1180,70 @@ class OneFuseLoaderController:
                 elif (snapshot.status != status_value and entity_report_times[1] is not None
                       and status_source_stamp.timestamp() <= entity_report_times[1]):
                     snapshot_source_rejection = "status_observation_precedes_native_report"
+            if canonical_native and native_number == current_number(getattr(snapshot, "current", None)):
+                # Equality of float/winner/device does not establish event
+                # identity: an older A value can predate an intervening B.
+                # Keep the actual native event canonical and the GET metadata
+                # unassociated, instead of relabelling A(new) as A(old).
+                snapshot_source_rejection = "matching_get_not_native_event_identity"
         # A new HA status/current event supersedes the whole REST pair. Never
         # combine a new current with an old authorization/schedule status.
         snapshot_used = bool(snapshot is not None and not errors and not health_error
             and snapshot_source_rejection is None
             and self._charger_snapshot_selection == self._charger_source_revision()
             and 0 <= snapshot_age <= CURRENT_SNAPSHOT_MAX_AGE_SECONDS
-            and all(stamp is not None and stamp < received.timestamp() for stamp in entity_report_times)
+            and all((stamp is None and explicit_native_clock) or
+                    (stamp is not None and stamp < received.timestamp()) for stamp in entity_report_times)
             and callable(snapshot_is_current) and snapshot_is_current(snapshot))
         if snapshot_used:
             current_value = snapshot.current
             status_value = snapshot.status
+            current_trusted = True
             # Vendor observation time is still not guaranteed acquisition
             # time. It is nevertheless distinct from a new HTTP receipt.
             current_report_ts = source_stamp.timestamp()
             current_clock_scope = "vendor_observation_timestamp_not_guaranteed_acquisition"
+            current_report_family = "vendor_event"
+            current_report_provenance = vendor_clock_provenance(snapshot)
+            current_observation_ids = maximum_ids(getattr(snapshot, "current_source_observation_ids", ()))
+            event_source_known = True
+            event_source_ts = source_stamp.timestamp()
+            raw_times = getattr(snapshot, "current_source_timestamps", None)
+            observation_report_times = (tuple((key, stamp.timestamp()) for key, raw_stamp in raw_times
+                if type(key) is int and key in (182, 183, 184, 185)
+                and (stamp := self._utc_time(raw_stamp)) is not None) if raw_times is not None else None)
+            observation_sequences = None  # GET receipts are never native push events.
         elif snapshot is not None:
             self._charger_snapshot = None
             self._charger_snapshot_selection = None
-        if not snapshot_used and evidence is not None:
-            current_trusted = not evidence["invalid"]
+        if not snapshot_used and evidence is not None and not canonical_native:
+            current_trusted = current_trusted and not evidence["invalid"]
             if evidence["timestamp"] is not None:
                 current_report_ts = evidence["timestamp"].timestamp()
                 current_clock_scope = "retained_vendor_event_timestamp_not_guaranteed_acquisition"
+                current_report_family = "vendor_event"
+                current_report_provenance = vendor_clock_provenance(evidence["snapshot"])
+                current_observation_ids = maximum_ids(getattr(evidence["snapshot"], "current_source_observation_ids", ()))
+                event_source_known = True
+                event_source_ts = evidence["timestamp"].timestamp()
+                raw_times = getattr(evidence["snapshot"], "current_source_timestamps", None)
+                observation_report_times = (tuple((key, stamp.timestamp()) for key, raw_stamp in raw_times
+                    if type(key) is int and key in (182, 183, 184, 185)
+                    and (stamp := self._utc_time(raw_stamp)) is not None) if raw_times is not None else None)
+                observation_sequences = None
             else:
                 current_clock_scope = "native_HA_receipt_with_invalid_matching_vendor_metadata"
+        if not explicit_native_clock:
+            # Preserve the established input contract for injected legacy
+            # adapters without the new evidence API. The real Easee adapter
+            # always exposes that API, including an explicit unknown result;
+            # unavailable real evidence never enters this compatibility path.
+            current_report_family = "legacy"
+            current_report_provenance = None
+            event_source_known = False
+            event_source_ts = None
+            observation_report_times = None
+            observation_sequences = None
         self.source_diagnostics.update({
             "charger_current_entity_reported_at_utc": (self._utc_time(getattr(current_state, "last_reported", None)).isoformat()
                 if self._utc_time(getattr(current_state, "last_reported", None)) else None),
@@ -1086,6 +1262,20 @@ class OneFuseLoaderController:
                 if self._utc_time(getattr(snapshot, "status_source_timestamp", None)) else None),
             "charger_snapshot_source_rejection": snapshot_source_rejection,
             "effective_current_clock_scope": current_clock_scope,
+            "effective_current_report_family": current_report_family,
+            "effective_current_max_observation_ids": current_observation_ids,
+            "native_max_observation_ids": native_maxima,
+            "native_max_received_at_utc": native_receipt.isoformat() if native_receipt else None,
+            "native_max_clock_error": native_clock_error,
+            "native_max_source_timestamps_utc": tuple((key, stamp.isoformat() if isinstance(stamp, datetime) else None)
+                for key, stamp in native_source_times),
+            "current_tuple_increase_ready": increase_ready,
+            "current_event_source_known": event_source_known,
+            "current_event_source_at_utc": (datetime.fromtimestamp(event_source_ts, timezone.utc).isoformat()
+                if event_source_ts is not None else None),
+            "current_observation_report_times": observation_report_times,
+            "current_observation_sequences": observation_sequences,
+            "matching_get_metadata_association": "unassociated_with_native_event" if canonical_native and evidence else None,
             "charger_current_trusted": current_trusted,
             "retained_current_source_timestamp_utc": (
                 evidence["timestamp"].isoformat() if evidence is not None and evidence["timestamp"] is not None else None),
@@ -1118,6 +1308,13 @@ class OneFuseLoaderController:
             charger_snapshot_verified=snapshot_used,
             charger_current_trusted=current_trusted,
             control_source_id=self._configured_control_identity(),
+            charger_report_family=current_report_family,
+            charger_report_provenance=current_report_provenance,
+            charger_increase_ready=increase_ready,
+            charger_event_source_known=event_source_known,
+            charger_event_source_ts=event_source_ts,
+            charger_observation_report_times=observation_report_times,
+            charger_observation_sequences=observation_sequences,
         )
 
     def _configured_control_identity(self) -> str | None:
@@ -1173,7 +1370,10 @@ class OneFuseLoaderController:
         started = self._utc_time(accepted.get("started_at_utc")) if accepted else None
         fresh_ev = bool(inp.charger_current_trusted and (not require_new_current or (
                         started is not None and inp.charger_report_ts is not None
-                        and inp.charger_report_ts > started.timestamp())))
+                        and inp.charger_report_ts > started.timestamp()
+                        and (not inp.charger_event_source_known or (
+                            inp.charger_event_source_ts is not None
+                            and inp.charger_event_source_ts > started.timestamp())))))
         return dict(phases=reported if self.source_diagnostics.get("reported_circuit_available") else None,
                     after_submission=after, report_age=age,
                     ev_current=inp.charger_current if fresh_ev else None,
@@ -1375,6 +1575,11 @@ class OneFuseLoaderController:
         return (inp.status, inp.grid_l1, inp.charger_current, inp.data_valid, inp.data_error,
                 inp.grid_report_ts, inp.charger_report_ts, inp.charger_snapshot_verified,
                 inp.charger_current_trusted, inp.control_source_id,
+                inp.charger_report_family, inp.charger_report_provenance,
+                inp.charger_increase_ready,
+                inp.charger_event_source_known, inp.charger_event_source_ts,
+                inp.charger_observation_report_times,
+                inp.charger_observation_sequences,
                 age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
     async def _async_tick_locked(self) -> None:
@@ -1451,6 +1656,10 @@ class OneFuseLoaderController:
                          inp.grid_report_ts is None or inp.charger_report_ts is None
                          or inp.grid_report_ts < self._overload_restore_receipt_floor
                          or inp.charger_report_ts < self._overload_restore_receipt_floor
+                         or (inp.charger_event_source_known and (
+                             inp.charger_event_source_ts is None
+                             or inp.charger_event_source_ts < self._overload_restore_receipt_floor
+                         ))
                      )))
             )
         ):
@@ -1624,6 +1833,8 @@ class OneFuseLoaderController:
                 "charger_current": number(inp.charger_current), "status": inp.status,
                 "grid_report_utc": report_utc(inp.grid_report_ts),
                 "charger_report_utc": report_utc(inp.charger_report_ts),
+                "charger_report_family": inp.charger_report_family,
+                "charger_max_observation_ids": plan_source_diagnostics.get("effective_current_max_observation_ids"),
                 "source_error": inp.data_error,
                 "product_update_received_at_utc": plan_source_diagnostics.get("easee_stream_pulse_utc"),
                 "previous_submitted_limit_p1": (self.last_accepted_limit.get("target_p1")
@@ -1719,6 +1930,8 @@ class OneFuseLoaderController:
             "grid_report_utc": plan_source_diagnostics.get("grid_reported_at_utc"),
             "charger_report_utc": plan_source_diagnostics.get("effective_charger_reported_at_utc"),
             "charger_clock_scope": plan_source_diagnostics.get("effective_current_clock_scope"),
+            "charger_report_family": inp.charger_report_family,
+            "charger_max_observation_ids": plan_source_diagnostics.get("effective_current_max_observation_ids"),
             "snapshot_source_timestamp_utc": plan_source_diagnostics.get("charger_snapshot_current_source_timestamp_utc"),
             "reported_cap_p1": plan_source_diagnostics.get("reported_circuit_p1"),
         }

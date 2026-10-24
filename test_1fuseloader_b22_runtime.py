@@ -59,7 +59,7 @@ class AcceptedRiseRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.accepted_rise()
         first = await self.tick(60.8, 8.8, 13.909, grid_at=57)
         self.assertEqual((first.mode, first.current_p1), ("settling", 16))
-        self.assertEqual(first.house_load_basis, "positive_response_anchor")
+        self.assertEqual(first.house_load_basis, "prior_coherent_house_ev_first_hold")
         second = await self.tick(62, 17.6, 13.909, ev_at=60.8)
         self.assertEqual(second.current_p1, 16)
         self.assertAlmostEqual(self.regulator._positive_alignment_used_seconds, 1.2)
