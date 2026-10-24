@@ -50,6 +50,37 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Component observations and response clocks (b25)
+
+Easee's Current entity is the maximum of four conductor values. Its HA entity
+receipt can change when a different conductor is updated while the maximum
+itself remains cached. The regulator now observes the selected charger's raw
+current records separately, retaining the contributing component identities,
+value-event sequences and actual local receipt times. A non-winning update
+cannot refresh the maximum's evidence. These receipts are local observations,
+not certified physical acquisition times.
+
+Provider timestamps remain separate. A matching value in an old GET response
+cannot retroactively identify or relabel a newer native event. A response owner
+pins its acknowledgement time and component baselines; metadata enrichment,
+clock-family switches and identical renewals cannot manufacture response,
+refill alignment time or permit another increase. Genuine replay and invalid
+metadata still fail the source checks. A first real post-acceptance component
+event can complete bootstrap without requiring an artificial second value
+change from a steady vehicle.
+
+New positive authority briefly waits for the current tuple to settle. This
+does not delay reductions or zero requests. A qualified EV-first partial rise
+keeps its preceding house anchor only until the first corresponding later grid
+report and within its original response budget. The coherent pair then governs
+normal control, including a lower offer when needed. Source faults, expired
+leases and existing protective conditions retain priority.
+
+This changes neither the overload trial policy nor the configured response
+timeout. An absent qualifying response can still stop control, and a native
+status/current drop can precede the controller's decision. Passing source,
+unit and adapter tests is not proof of uninterrupted physical charging.
+
 ### Accepted reductions and diagnostic history (b24)
 
 An accepted lower circuit limit and the measured vehicle current can describe
@@ -712,6 +743,7 @@ python -m compileall -q .\custom_components\1fuseloader
 ```
 
 The standalone suites use simulated inputs and adapters. CI additionally
-installs Home Assistant 2026.10.1 and 2026.10.2 on Python 3.14 to test actual imports,
-selectors, entity construction and config/options flows. Passing these tests
-does not establish physical charging acceptance.
+installs Home Assistant 2026.10.1, 2026.10.2 and 2026.10.3 on Python 3.14 with
+both supported pyeasee versions to test actual imports, selectors, entity
+construction and config/options flows. Passing these tests does not establish
+physical charging acceptance.

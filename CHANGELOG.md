@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0b25
+
+- Track the selected charger's individual current observations through the
+  additive ProductUpdate observer. An update of another conductor can no
+  longer make an unchanged cached maximum look like a fresh current report.
+- Separate local observation clocks, component identity/sequences and directly
+  associated provider timestamps. Pin response-owner acknowledgement floors;
+  a clock-family change or cached GET receipt supplies no response credit,
+  fresh deadline or increase permission. Preserve per-source replay checks.
+- Keep a qualified positive-response house anchor through an EV-first partial
+  response until its first corresponding grid report, within the original
+  budget. Repeated partial reports cannot move that first-response floor.
+- Coalesce a changing current tuple briefly before new positive authority.
+  Decreases, zero requests and ordinary identical renewals keep their existing
+  dispatch path. Preserve raw-bound bootstrap and the first genuine response
+  without requiring another value change from an otherwise steady vehicle.
+- Add Home Assistant 2026.10.3 to the real HA/SDK test matrix. Preserve all
+  fuse limits, response timeouts, recovery barriers, exposure and explicit
+  trial permissions. This update does not start a period or establish the
+  physical cause of every native status/current drop.
+
 ## 0.4.0b24
 
 - Preserve a qualified unresolved previous current bound when an accepted

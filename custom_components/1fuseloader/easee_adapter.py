@@ -113,6 +113,26 @@ class ChargerCurrentSnapshot:
     status_source_timestamp: datetime | None = None
     current_source_timestamps: tuple[tuple[int, datetime | None], ...] = ()
     source_timestamp_error: str | None = None
+    # The maximum can move between terminals while every individual source
+    # clock remains monotonic. Its selected timestamp is comparable only for
+    # the same set of equally maximal observation IDs.
+    current_source_observation_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class NativeCurrentObservation:
+    """Selected maximum's actual local terminal-event receipts, not HA writes."""
+
+    current: float | None
+    observation_ids: tuple[int, ...]
+    received_at: datetime | None
+    source_identity: tuple[int, ...] = field(repr=False)
+    source_timestamps: tuple[tuple[int, datetime | None], ...] = ()
+    observation_report_times: tuple[tuple[int, datetime], ...] = ()
+    observation_sequences: tuple[tuple[int, int], ...] = ()
+    source_metadata_highwaters: tuple[tuple[int, datetime], ...] = ()
+    error: str | None = None
+    last_tuple_change_monotonic: float | None = None
 
 
 class EaseeCommandAdapter:
@@ -135,6 +155,15 @@ class EaseeCommandAdapter:
         self._hook_identity: tuple[int, ...] | None = None
         self._limit_observed_values: list[float | None] = [None, None, None]
         self._limit_receipts: list[float | None] = [None, None, None]
+        self._current_observation_callback: Any = None
+        self._native_current_identity: tuple[int, ...] | None = None
+        self._native_current_values: dict[int, float] = {}
+        self._native_current_sequences = {key: 0 for key in (182, 183, 184, 185)}
+        self._native_current_receipts: dict[int, datetime] = {}
+        self._native_current_source_times: dict[int, datetime] = {}
+        self._native_current_source_highwaters: dict[int, datetime] = {}
+        self._native_current_errors: dict[int, str] = {}
+        self._native_current_changed_at: float | None = None
         self._closed = False
         self._request_lock = asyncio.Lock()
         self._request_starts: deque[float] = deque()
@@ -229,6 +258,18 @@ class EaseeCommandAdapter:
 
     set_delivery_listener = set_delivery_callback
 
+    def set_current_observation_callback(self, callback: Any):
+        """Wake the local planner after an entire raw ProductUpdate payload."""
+        if callback is not None and not callable(callback):
+            raise TypeError("current_observation_callback_must_be_callable")
+        self._current_observation_callback = callback
+        self._resolve_runtime()
+
+        def unsubscribe():
+            if self._current_observation_callback is callback:
+                self._current_observation_callback = None
+        return unsubscribe
+
     @property
     def delivery_listener_available(self) -> bool:
         return self._resolve_runtime() is None and self._hook_connection is not None
@@ -236,6 +277,15 @@ class EaseeCommandAdapter:
     def _bind_delivery_hook(self) -> None:
         connection = getattr(getattr(self._charger, "easee", None), "sr_connection", None)
         identity = self._snapshot_source_identity()
+        if identity != self._native_current_identity:
+            self._native_current_identity = identity
+            self._native_current_values.clear()
+            self._native_current_sequences = {key: 0 for key in (182, 183, 184, 185)}
+            self._native_current_receipts.clear()
+            self._native_current_source_times.clear()
+            self._native_current_source_highwaters.clear()
+            self._native_current_errors.clear()
+            self._native_current_changed_at = None
         if connection is self._hook_connection and identity == self._hook_identity:
             return
         self._hook_generation += 1
@@ -268,6 +318,7 @@ class EaseeCommandAdapter:
             if generation != owner._hook_generation or identity != owner._snapshot_source_identity():
                 return
             owner._receive_limit_observation(payload, charger_id)
+            owner._receive_current_observations(payload, charger_id)
 
         try:
             connection.on("CommandResponse", received)
@@ -301,6 +352,133 @@ class EaseeCommandAdapter:
                 continue
             self._limit_observed_values[observation_id - 111] = value
             self._limit_receipts[observation_id - 111] = _monotonic()
+
+    def _receive_current_observations(self, payload: Any, charger_id: str) -> None:
+        """Track each conductor independently of HA aggregate-attribute fanout.
+
+        The public SDK requires only mid/id/dataType/value. Optional timestamp
+        metadata is validated when present, never invented from arrival time.
+        An identical cached event does not renew its terminal receipt clock.
+        """
+        records = payload if type(payload) is list else [payload]
+        received = datetime.now(timezone.utc)
+        changed = False
+        seen: dict[int, tuple] = {}
+        conflicts: set[int] = set()
+        for record in records[:64]:
+            if not isinstance(record, Mapping) or record.get("mid") != charger_id:
+                continue
+            key = record.get("id")
+            if type(key) is int and key in (182, 183, 184, 185):
+                signature = (record.get("dataType"), record.get("value"), record.get("timestamp"))
+                if key in seen and seen[key] != signature:
+                    conflicts.add(key)
+                seen[key] = signature
+        for record in records[:64]:
+            if not isinstance(record, Mapping) or record.get("mid") != charger_id:
+                continue
+            key = record.get("id")
+            if type(key) is not int or key not in (182, 183, 184, 185):
+                continue
+            if key in conflicts:
+                self._native_current_errors[key] = "conflicting_terminal_observations"
+                changed = True
+                continue
+            if type(record.get("dataType")) is not int or record["dataType"] != 3:
+                self._native_current_errors[key] = "invalid_terminal_current_type"
+                changed = True
+                continue
+            try:
+                number = self._snapshot_number(record.get("value"), "invalid_terminal_current")
+                if not 0 <= number <= 1000:
+                    raise EaseeAdapterError("invalid_terminal_current")
+            except EaseeAdapterError:
+                self._native_current_errors[key] = "invalid_terminal_current"
+                changed = True
+                continue
+            stamp = None
+            previous_highwater = self._native_current_source_highwaters.get(key)
+            if record.get("timestamp") is not None:
+                stamp, error = self._observation_timestamp(record["timestamp"], received)
+                if stamp is not None and previous_highwater is not None:
+                    if stamp < previous_highwater:
+                        error = "easee_observation_timestamp_regressed"
+                    elif stamp == previous_highwater and number != self._native_current_values.get(key):
+                        error = "easee_observation_timestamp_value_changed"
+                if error:
+                    self._native_current_errors[key] = error
+                    changed = True
+                    continue
+            previous_number = self._native_current_values.get(key)
+            previous_stamp = self._native_current_source_times.get(key)
+            previous_receipt = self._native_current_receipts.get(key)
+            value_changed = previous_number != number
+            # Timestamp-only cache replies cannot label an intervening new A
+            # value as an older A event. A later raw observation can establish
+            # a NEW event in an unbound value epoch only when its source UTC is
+            # strictly after both that epoch's receipt and prior source highwater.
+            # Its new local receipt/sequence never rewrites the earlier event.
+            source_advanced = stamp is not None and (
+                previous_stamp is not None and stamp > previous_stamp
+                or previous_stamp is None and previous_receipt is not None and stamp > previous_receipt
+                   and (previous_highwater is None or stamp > previous_highwater))
+            advanced = value_changed or source_advanced
+            recovered = self._native_current_errors.pop(key, None) is not None
+            changed = changed or recovered
+            if advanced:
+                self._native_current_values[key] = number
+                self._native_current_receipts[key] = received
+                self._native_current_sequences[key] += 1
+                # A genuinely new unchanged-value source event can also be
+                # one frame of a multi-conductor burst. Defer only new offer
+                # authority until that evidence burst has had time to settle.
+                self._native_current_changed_at = _monotonic()
+                changed = True
+            if value_changed and stamp is None:
+                self._native_current_source_times.pop(key, None)
+            if stamp is not None and (value_changed or previous_stamp is not None or source_advanced):
+                self._native_current_source_times[key] = stamp
+            if stamp is not None:
+                self._native_current_source_highwaters[key] = stamp
+        if changed and callable(self._current_observation_callback):
+            try:
+                self._current_observation_callback()
+            except Exception:
+                # Observer failure cannot break native SDK stream dispatch.
+                pass
+
+    @property
+    def native_current_observation(self) -> NativeCurrentObservation | None:
+        """Return only matched winning-conductor evidence; no HA-time fallback."""
+        if self._resolve_runtime() is not None:
+            return None
+        identity = self._snapshot_source_identity()
+        state = self._product_data.state
+        try:
+            numbers = {key: state[f"inCurrentT{key - 180}"] for key in (182, 183, 184, 185)}
+            if any(type(value) not in (int, float) or not isfinite(value) or not 0 <= value <= 1000
+                   for value in numbers.values()):
+                raise ValueError("invalid_terminal_current")
+        except (KeyError, TypeError, ValueError):
+            return NativeCurrentObservation(None, (), None, identity,
+                error="native_terminal_values_unavailable",
+                observation_sequences=tuple(sorted(self._native_current_sequences.items())),
+                last_tuple_change_monotonic=self._native_current_changed_at)
+        current = max(numbers.values())
+        maxima = tuple(key for key in (182, 183, 184, 185) if numbers[key] == current)
+        error = next((self._native_current_errors[key] for key in maxima
+                      if key in self._native_current_errors), None)
+        matched = error is None and all(self._native_current_values.get(key) == numbers[key]
+                    and key in self._native_current_receipts for key in maxima)
+        receipt = min(self._native_current_receipts[key] for key in maxima) if matched else None
+        return NativeCurrentObservation(float(current), maxima, receipt, identity,
+            source_timestamps=tuple((key, self._native_current_source_times.get(key)) for key in numbers),
+            observation_report_times=tuple((key, self._native_current_receipts[key]) for key in numbers
+                if self._native_current_values.get(key) == numbers[key]
+                and key in self._native_current_receipts and key not in self._native_current_errors),
+            observation_sequences=tuple(sorted(self._native_current_sequences.items())),
+            source_metadata_highwaters=tuple(sorted(self._native_current_source_highwaters.items())),
+            error=error, last_tuple_change_monotonic=self._native_current_changed_at)
 
     @property
     def reported_limit_receipts(self) -> tuple[float | None, float | None, float | None]:
@@ -364,8 +542,16 @@ class EaseeCommandAdapter:
         self._hook_generation += 1
         self._hook_connection = None
         self._delivery_callback = None
+        self._current_observation_callback = None
         self._limit_observed_values = [None, None, None]
         self._limit_receipts = [None, None, None]
+        self._native_current_values.clear()
+        self._native_current_sequences = {key: 0 for key in (182, 183, 184, 185)}
+        self._native_current_receipts.clear()
+        self._native_current_source_times.clear()
+        self._native_current_source_highwaters.clear()
+        self._native_current_errors.clear()
+        self._native_current_changed_at = None
         pending = tuple(self._pending_requests)
         for task in pending:
             task.cancel()
@@ -431,6 +617,17 @@ class EaseeCommandAdapter:
         return tuple(id(value) for value in (
             self._controller, self._charger, self._circuit, self._product_data
         ))
+
+    @property
+    def observation_clock_identity(self) -> tuple[int, ...] | None:
+        """Opaque process-local owner of current clocks, never persisted.
+
+        A SignalR reconnect alone does not replace the selected product's
+        observation clocks. Replaced SDK/controller objects do.
+        """
+        if self._resolve_runtime() is not None:
+            return None
+        return self._snapshot_source_identity()
 
     def snapshot_is_current(self, snapshot: ChargerCurrentSnapshot) -> bool:
         """Revalidate a cached receipt against healthy, currently loaded objects."""
@@ -540,6 +737,7 @@ class EaseeCommandAdapter:
                 status_source_timestamp=timestamps[109],
                 current_source_timestamps=tuple((key, timestamps[key]) for key in SNAPSHOT_OBSERVATION_IDS[1:]),
                 source_timestamp_error=source_error,
+                current_source_observation_ids=tuple(maxima),
             )
         except EaseeAdapterError:
             raise
