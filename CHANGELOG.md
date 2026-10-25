@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0b28
+
+- Add a separate, default-off `grid_confirmation_seconds` setting (0–30 s)
+  for awaiting a later grid report after a qualifying minimum-current EV
+  response. The original EV response window remains at most 10 seconds.
+- Anchor the optional wait to the first qualifying response and the accepted
+  offer's existing lease. Repeated reports and GET receipts do not restart it;
+  no API command or TTL renewal is sent while awaiting confirmation.
+- Keep peak, source, lease, cumulative exposure and stronger guard protections.
+  A new grid report above the applicable normal/trial ceiling still stops the
+  wait. The setting grants neither an unconditional 30-second hold nor a new
+  overload allowance.
+- Freeze the setting in explicit trial policies. Accept older policies with
+  the missing setting interpreted as disabled only in the validation copy;
+  retain original history, exposure and failures. Restored active/pending
+  periods remain interrupted.
+
 ## 0.4.0b26
 
 - Match HA's 15-significant-digit numeric representation without adding an

@@ -169,7 +169,9 @@ Storage, command, source and normal-recovery barriers must be clear.
 Each period freezes this policy: reduce to 7 A at high load, require at most
 29 A total after the observed response, and count at most 1800 cumulative
 seconds above 25 A, including the bounded response phase. The existing peak
-ceiling of 38 A and fixed response window of at most 10 seconds still apply.
+ceiling of 38 A still applies. The minimum-current EV response must qualify
+inside the original fixed response window of at most 10 seconds. A separately
+selected grid-confirmation window may follow only after that timely response.
 An infeasible 7 A offer, missing or invalid measurements, failed response or
 other protective condition may request zero earlier. This is not a fuse
 temperature model or a guarantee of an uninterrupted 30-minute session.
@@ -187,6 +189,45 @@ source faults interrupt the period. Every restored pending or active period is
 interrupted, so a late write or restart cannot resume it automatically. A later
 period requires a new eligible, explicit start. No automatic cooling or rearm
 is inferred.
+
+### Optional grid confirmation after a timely response (b28)
+
+**Grid Confirmation After Timely Minimum Response** is a separate setting,
+`grid_confirmation_seconds`, with **0** as its default. Zero keeps the existing
+deadlines; upgrading does not automatically grant additional waiting time.
+The setting accepts whole seconds up to **30** and is available in Configure
+and as a Number entity.
+
+When explicitly selected, this window applies only after a qualifying reported
+minimum-current EV response inside the original response deadline, which remains
+at most **10 seconds**. It permits waiting for a later grid observation in the
+bounded nominal-reduction path or an explicit overload trial. For a setting of
+30, the fixed grid deadline is anchored to the **first** qualifying response.
+Repeated current reports, HTTP receipts, GET requests and lease renewals cannot
+start another 30 seconds. It grants no time for a late EV response, current
+increase, resume, new exposure budget or bypass of source/current protections.
+While waiting, the controller retains only the already accepted live minimum
+offer: it sends no API command and does not renew its TTL. The wait is also
+bounded by that offer's existing lease expiry.
+
+Only a high grid observation from before the qualifying minimum-current
+response may remain unconfirmed during this phase. A new grid report at or
+after the response that exceeds the applicable ceiling requests protection:
+the full normal buffer for a nominal reduction, or at most 29 A in the
+explicit default overload trial. The 38 A peak ceiling, source faults, lease
+expiry and any stronger configured guards retain priority. Thirty seconds is
+an upper bound for awaiting confirmation, not an unconditional hold.
+
+All elapsed exposure still contributes to the existing cumulative accounting.
+The trial freezes this setting with the rest of its policy. Changing it
+interrupts an active trial; it does not extend a running deadline or erase saved
+exposure and failures. Earlier trial policies without this setting retain their
+original behavior, and restored active/pending trials remain interrupted.
+
+Set this option through Home Assistant only after b28 has been loaded by an
+approved restart. A newly downloaded component is not yet the loaded runtime.
+Observed reports and cloud commands still do not establish synchronized physical
+measurements or guarantee delivery within either software window.
 
 The three **Overload Trial** sensors show state, used seconds and remaining
 seconds. Their attributes distinguish period failure from historical failure

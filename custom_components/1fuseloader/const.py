@@ -65,6 +65,7 @@ OPT_OVERLOAD_MARGIN_AMPS = "overload_margin_amps"
 OPT_OVERLOAD_BUDGET_SECONDS = "overload_budget_seconds"
 OPT_OVERLOAD_TRANSITION_LIMIT_AMPS = "overload_transition_limit_amps"
 OPT_OVERLOAD_RESPONSE_SECONDS = "overload_response_seconds"
+OPT_GRID_CONFIRMATION_SECONDS = "grid_confirmation_seconds"
 
 DEFAULT_OPTIONS = {
     OPT_MAIN_FUSE_AMPS: 25.0,
@@ -110,6 +111,9 @@ DEFAULT_OPTIONS = {
     OPT_OVERLOAD_BUDGET_SECONDS: 1800,
     OPT_OVERLOAD_TRANSITION_LIMIT_AMPS: 38.0,
     OPT_OVERLOAD_RESPONSE_SECONDS: 10,
+    # Separate post-response publication wait. Zero preserves legacy deadlines;
+    # it never adds time for the vehicle to reach the minimum current.
+    OPT_GRID_CONFIRMATION_SECONDS: 0,
 }
 
 OPTION_KEYS = set(DEFAULT_OPTIONS)
@@ -145,6 +149,7 @@ OPTION_NUMBER_RANGES = {
     OPT_OVERLOAD_BUDGET_SECONDS: (60, 1800, 1),
     OPT_OVERLOAD_TRANSITION_LIMIT_AMPS: (10, 38, 0.5),
     OPT_OVERLOAD_RESPONSE_SECONDS: (1, 10, 1),
+    OPT_GRID_CONFIRMATION_SECONDS: (0, 30, 1),
 }
 
 

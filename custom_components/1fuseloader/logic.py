@@ -82,6 +82,8 @@ class RegulatorSettings:
     overload_budget_seconds: int = 1800
     overload_transition_limit_amps: float = 38.0
     overload_response_seconds: int = 10
+    # Explicit post-response observation tolerance; zero preserves legacy timing.
+    grid_confirmation_seconds: int = 0
 
 
 @dataclass(slots=True)
@@ -189,6 +191,8 @@ class RegulatorDecision:
     raw_budget_rise_context: Optional[RawBudgetRiseContext] = None
     raw_budget_response_deadline_ts: Optional[float] = None
     source_processing_deadline_ts: Optional[float] = None
+    grid_confirmation_deadline_ts: Optional[float] = None
+    grid_confirmation_remaining_seconds: Optional[float] = None
 
 
 class OneFuseRegulator:
@@ -698,7 +702,9 @@ class OneFuseRegulator:
                 or not 0.5 <= settings.overload_margin_amps <= 4
                 or not 60 <= settings.overload_budget_seconds <= 1800
                 or not 25 + settings.overload_margin_amps <= settings.overload_transition_limit_amps <= 38
-                or not 1 <= settings.overload_response_seconds <= 10):
+                or not 1 <= settings.overload_response_seconds <= 10
+                or type(settings.grid_confirmation_seconds) is not int
+                or not 0 <= settings.grid_confirmation_seconds <= 30):
             raise ValueError("Trial requires the approved bounded 25 A / 7 A profile")
         return dict(main_fuse_amps=25.0, minimum_current=7,
                     ceiling_amps=25.0 + settings.overload_margin_amps,
@@ -894,6 +900,8 @@ class OneFuseRegulator:
             raise ValueError("Nominal import-only fallback must be a boolean")
         if type(settings.bounded_nominal_shedding) is not bool:
             raise ValueError("Bounded nominal shedding must be a boolean")
+        if type(settings.grid_confirmation_seconds) is not int or not 0 <= settings.grid_confirmation_seconds <= 30:
+            raise ValueError("Post-response grid confirmation must be an integer from 0 to 30 seconds")
         overload_values = (
             settings.overload_margin_amps, settings.overload_budget_seconds,
             settings.overload_transition_limit_amps, settings.overload_response_seconds,
@@ -919,6 +927,10 @@ class OneFuseRegulator:
             self._restart_required = True
         if getattr(self, "_normal_shed_sync_deadline", None) is not None:
             self._normal_shed_failure = "settings_changed_during_sync"
+            self._restart_required = True
+        if getattr(self, "_overload_grid_confirmation_deadline", None) is not None:
+            self._fail_overload("settings_changed_during_grid_confirmation")
+            self._clear_overload_transition()
             self._restart_required = True
         # An options change cannot extend an alignment deadline using old bounds.
         self._clear_positive_alignment()
@@ -1234,6 +1246,7 @@ class OneFuseRegulator:
         self._normal_shed_sync_floor: Optional[float] = None
         self._normal_shed_sync_last_ev_ts: Optional[float] = None
         self._normal_shed_sync_last_grid_ts: Optional[float] = None
+        self._normal_shed_grid_wait = False
 
     def _nominal_sync_plan(self, now: float, grid: float, current: float,
                            response_valid: bool, stop, complete):
@@ -1246,16 +1259,20 @@ class OneFuseRegulator:
         s = self.settings
         cap = self._normal_shed_cap
         active = self._normal_shed_sync_deadline is not None
+        grid_wait = self._normal_shed_grid_wait if active else s.grid_confirmation_seconds > 0
+        mode = "normal_shedding_grid_wait" if grid_wait else "normal_shedding_sync"
         identity = self._last_input_control_source_id
         wall, gt, et = self._last_input_wall_now_ts, self._last_input_grid_ts, self._last_input_charger_ts
         if not active:
             if (self._normal_shed_source_id is None or not response_valid
+                    or grid_wait and self._last_input_snapshot_verified
                     or self._normal_shed_response_monotonic is None
                     or self._normal_shed_accepted_at is None
                     or self._normal_shed_ev_floor is None
                     or self._normal_shed_grid_floor is None
-                    or gt is None or gt <= max(self._normal_shed_grid_floor, self._normal_shed_ev_floor)
-                    or grid > s.main_fuse_amps - s.buffer_amps):
+                    or gt is None
+                    or (not grid_wait and (gt <= max(self._normal_shed_grid_floor, self._normal_shed_ev_floor)
+                                           or grid > s.main_fuse_amps - s.buffer_amps))):
                 return None
         if (identity is None or identity != self._normal_shed_source_id
                 or identity != self._accepted_control_source_id
@@ -1264,7 +1281,7 @@ class OneFuseRegulator:
                 or not 0 <= wall - et <= s.max_sensor_age_seconds
                 or not 0 <= wall - gt <= s.max_sensor_age_seconds
                 or cap is None or not 1 <= current <= cap + .5
-                or grid > s.main_fuse_amps - s.buffer_amps
+                or (not grid_wait and grid > s.main_fuse_amps - s.buffer_amps)
                 or self.last_target is None or self.last_target[0] != cap):
             return stop("sync_source_or_nominal_bounds_invalid")
         if active:
@@ -1277,24 +1294,32 @@ class OneFuseRegulator:
             first = self._normal_shed_response_monotonic
             if not self._normal_shed_accepted_at < first < self._normal_shed_deadline:
                 return None
-            deadline = min(first + min(5.0, window), self._normal_shed_origin + window)
+            deadline = (min(first + s.grid_confirmation_seconds,
+                            self.last_set_limit_ts + self.last_target[3]) if grid_wait else
+                        min(first + min(5.0, window), self._normal_shed_origin + window))
             if now >= deadline:
                 # A grace never used cannot retroactively shorten the still
                 # live original response window. It also cannot be restarted
                 # from this later observation or a new identical EV receipt.
                 return None
             self._normal_shed_sync_deadline = deadline
+            self._normal_shed_grid_wait = grid_wait
             self._normal_shed_sync_value = current
             self._normal_shed_sync_floor = et
         if now >= self._normal_shed_sync_deadline:
-            return stop("sync_timeout")
+            return stop("grid_confirmation_timeout" if grid_wait else "sync_timeout")
+        if (grid_wait and gt >= self._normal_shed_response_ts
+                and grid > s.main_fuse_amps - s.buffer_amps):
+            # A later substantive EV value may require a newer grid for
+            # success, but cannot hide an already observed over-limit grid.
+            return stop("grid_confirmation_outside_nominal_budget")
         if abs(current - self._normal_shed_sync_value) > .1:
             if not self._ev_advanced_since(self._normal_shed_sync_last_ev_ts, "_normal_shed_sync_last_ev_ts"):
                 if self._ev_clock_explicit:
                     # A different reporting clock supplies no new response
                     # just by describing a different cached value. Preserve
                     # only this already fixed no-write synchronization window.
-                    return ("normal_shedding_sync", "The changed observation has no post-ACK event credit yet; retaining the existing offer only inside its original synchronization deadline.",
+                    return (mode, "The changed observation has no post-ACK event credit yet; retaining the existing offer only inside its original synchronization deadline.",
                             None, cap, grid, s.normal_ttl_seconds)
                 return stop("sync_value_changed_without_new_source_event")
             self._normal_shed_sync_value = current
@@ -1306,7 +1331,7 @@ class OneFuseRegulator:
         if (gt > self._normal_shed_sync_floor and current <= grid + 1
                 and grid - current + cap <= s.main_fuse_amps - s.buffer_amps):
             return complete(max(0.0, grid - current))
-        return ("normal_shedding_sync", "The lower accepted offer has a timely reported response; awaiting one later grid observation inside the fixed sampling-tolerance window. No command, increase, resume or lease renewal is permitted.",
+        return (mode, "The lower accepted offer has a timely reported response; awaiting one later grid observation inside the fixed post-response window. No command, increase, resume or lease renewal is permitted.",
                 None, cap, grid, s.normal_ttl_seconds)
 
     def _bounded_normal_shedding_plan(self, now: float, grid: float, current: float,
@@ -1430,7 +1455,8 @@ class OneFuseRegulator:
         self._normal_shed_last_grid_ts, self._normal_shed_last_ev_ts = grid_ts, ev_ts
         if grid > min(38, s.overload_transition_limit_amps):
             return stop("raw_peak_exceeded")
-        if self._normal_shed_sync_deadline is None and now >= self._normal_shed_deadline:
+        if (s.grid_confirmation_seconds == 0 and self._normal_shed_sync_deadline is None
+                and now >= self._normal_shed_deadline):
             return stop("response_timeout")
         soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
         pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
@@ -1456,6 +1482,15 @@ class OneFuseRegulator:
                     self._normal_shed_response_monotonic = min(now, now - (wall - ev_ts))
             elif current > cap + .5:
                 self._normal_shed_response_ts = None
+            if self._normal_shed_sync_deadline is None and now >= self._normal_shed_deadline:
+                # The extra phase can recognize only a genuinely timely EV
+                # response. A late EV event or a cached/GET value never buys
+                # another window, even when a later grid looks favorable.
+                if s.grid_confirmation_seconds > 0:
+                    sync = self._nominal_sync_plan(now, grid, current, response_valid, stop, complete)
+                    if sync is not None:
+                        return sync
+                return stop("response_timeout")
             response = self._normal_shed_response_ts
             ev_proof = bool(response is not None and response_valid and grid_ts > ev_ts
                             and grid_ts > self._normal_shed_grid_floor and current <= grid + 1
@@ -2369,6 +2404,13 @@ class OneFuseRegulator:
         self._overload_entry_charger_ts: Optional[float] = None
         self._overload_anchor_house: Optional[float] = None
         self._overload_minimum_response_ts: Optional[float] = None
+        self._overload_minimum_response_monotonic: Optional[float] = None
+        self._overload_grid_confirmation_deadline: Optional[float] = None
+        self._overload_grid_confirmation_floor: Optional[float] = None
+        self._overload_grid_confirmation_value: Optional[float] = None
+        self._overload_grid_confirmation_last_ev_ts: Optional[float] = None
+        self._overload_grid_confirmation_last_grid_ts: Optional[float] = None
+        self._overload_grid_confirmation_source_id = None
         self._overload_minimum_accepted_at: Optional[float] = None
         self._overload_minimum_ev_floor: Optional[float] = None
         self._overload_minimum_attempted_at: Optional[float] = None
@@ -2427,13 +2469,17 @@ class OneFuseRegulator:
             started = self._trial_started_timestamp(epoch.get("started_at_utc"))
             policy = epoch.get("policy")
             validated = OneFuseRegulator(RegulatorSettings(**policy["settings"]))
+            # Add only the disabled value to a comparison copy. Preserve the
+            # original frozen policy and every historical exposure field.
+            comparable_policy = deepcopy(policy)
+            comparable_policy["settings"].setdefault("grid_confirmation_seconds", 0)
             valid = bool(type(epoch.get("version")) is int and epoch["version"] == 1
                 and isinstance(epoch.get("trial_id"), str) and epoch["trial_id"].strip()
                 and len(epoch["trial_id"]) <= 128 and identity is not None
                 and started <= datetime.now(timezone.utc).timestamp() + 5
                 and not isinstance(baseline, bool) and _valid_number(baseline) is not None
                 and 0 <= baseline <= self._overload_used_seconds
-                and policy == self._trial_policy(validated.settings)
+                and comparable_policy == self._trial_policy(validated.settings)
                 and state in {"pending", "active", "ended", "failed", "interrupted"}
                 and (state in {"pending", "active"} and epoch.get("failure_reason") is None and closed is None
                      or state in {"ended", "failed", "interrupted"}
@@ -2619,8 +2665,6 @@ class OneFuseRegulator:
 
         if pending:
             assert self._overload_transition_started is not None
-            if now - self._overload_transition_started >= s.overload_response_seconds:
-                return stop("response_timeout")
             grid_advanced = (self._last_input_grid_ts is not None and self._overload_entry_grid_ts is not None
                              and self._last_input_grid_ts > self._overload_entry_grid_ts)
             ev_advanced = (self._ev_clock_credit and self._overload_minimum_accepted_at is not None
@@ -2631,8 +2675,74 @@ class OneFuseRegulator:
                     and current <= minimum + 0.5 and ev_advanced):
                 if self._overload_minimum_response_ts is None:
                     self._overload_minimum_response_ts = self._last_input_charger_ts
-            else:
+                    if self._last_input_wall_now_ts is not None:
+                        self._overload_minimum_response_monotonic = min(now, now - (
+                            self._last_input_wall_now_ts - self._last_input_charger_ts))
+            elif self._overload_grid_confirmation_deadline is None:
                 self._overload_minimum_response_ts = None
+                self._overload_minimum_response_monotonic = None
+            physical_deadline = self._overload_transition_started + s.overload_response_seconds
+            response_first = self._overload_minimum_response_monotonic
+            live_minimum = bool(self.last_target is not None and self.last_target[0] == minimum
+                and self.last_set_limit_ts is not None and 0 <= now - self.last_set_limit_ts < self.last_target[3])
+            bound_source = (self._last_input_control_source_id is not None
+                and self._last_input_control_source_id == self._accepted_control_source_id)
+            if (self._overload_grid_confirmation_deadline is None and s.grid_confirmation_seconds > 0
+                    and self._overload_minimum_response_ts is not None and response_first is not None
+                    and self._overload_minimum_accepted_at is not None
+                    and self._overload_minimum_accepted_at < response_first < physical_deadline
+                    and not self._last_input_snapshot_verified and live_minimum and bound_source):
+                deadline = min(response_first + s.grid_confirmation_seconds,
+                               self.last_set_limit_ts + self.last_target[3])
+                if now < deadline:
+                    self._overload_grid_confirmation_deadline = deadline
+                    self._overload_grid_confirmation_floor = self._last_input_charger_ts
+                    self._overload_grid_confirmation_value = current
+                    self._overload_grid_confirmation_last_ev_ts = self._last_input_charger_ts
+                    self._pin_ev_owner("_overload_grid_confirmation_last_ev_ts", copy_from="_overload_minimum_ev_floor")
+                    self._overload_grid_confirmation_last_grid_ts = self._last_input_grid_ts
+                    self._overload_grid_confirmation_source_id = self._last_input_control_source_id
+            if self._overload_grid_confirmation_deadline is not None:
+                if now >= self._overload_grid_confirmation_deadline:
+                    return stop("grid_confirmation_timeout")
+                if (not live_minimum or not bound_source
+                        or self._last_input_control_source_id != self._overload_grid_confirmation_source_id
+                        or not self._last_input_current_trusted or not self._meaningfully_charging(status, current)
+                        or current > minimum + .5 or self._last_input_grid_ts is None
+                        or self._last_input_charger_ts is None
+                        or not 0 <= self._last_input_wall_now_ts - self._last_input_grid_ts <= s.max_sensor_age_seconds
+                        or not 0 <= self._last_input_wall_now_ts - self._last_input_charger_ts <= s.max_sensor_age_seconds):
+                    return stop("grid_confirmation_source_or_control_invalid")
+                if (self._ev_regressed_since(self._overload_grid_confirmation_last_ev_ts)
+                        or self._last_input_grid_ts < self._overload_grid_confirmation_last_grid_ts):
+                    return stop("grid_confirmation_source_clock_regressed")
+                if (self._last_input_grid_ts >= self._overload_minimum_response_ts and grid > ceiling):
+                    return stop("minimum_observed_above_ceiling")
+                if abs(current - self._overload_grid_confirmation_value) > .1:
+                    if not self._ev_advanced_since(self._overload_grid_confirmation_last_ev_ts,
+                                                  "_overload_grid_confirmation_last_ev_ts"):
+                        return stop("grid_confirmation_value_changed_without_event")
+                    self._overload_grid_confirmation_floor = self._last_input_charger_ts
+                    self._overload_grid_confirmation_value = current
+                self._overload_grid_confirmation_last_ev_ts = self._last_input_charger_ts
+                self._pin_ev_owner("_overload_grid_confirmation_last_ev_ts", copy_from="_overload_minimum_ev_floor")
+                self._overload_grid_confirmation_last_grid_ts = self._last_input_grid_ts
+                if self._last_input_grid_ts > self._overload_grid_confirmation_floor:
+                    if current > grid + 1 or grid - current + minimum > ceiling:
+                        return stop("minimum_response_outside_ceiling")
+                    house = max(0.0, grid - current)
+                    self._clear_overload_transition()
+                    self._overload_hold_active = grid > s.main_fuse_amps or needed
+                    self._awaiting_reduction_target = None
+                    self._house_before_reduction = None
+                    self._settle_started = None
+                    if not needed:
+                        return None
+                    return ("overload_minimum", "Minimum current and a later grid report confirm the existing opt-in envelope.", minimum, house)
+                anchor = self._overload_anchor_house if self._overload_anchor_house is not None else house
+                return ("overload_grid_wait", "Minimum current responded inside the original physical deadline; retaining only its live offer while awaiting a later grid report inside the fixed post-response window. No write or lease renewal.", minimum, anchor)
+            if now >= physical_deadline:
+                return stop("response_timeout")
             # A grid report from an earlier partial EV reduction is not proof
             # that the final minimum-current response exceeded the ceiling.
             # Wait only inside the original deadline; identical EV reports do
@@ -3243,6 +3353,7 @@ class OneFuseRegulator:
         self._last_input_charger_ts = (None if isinstance(inp.charger_report_ts, bool) else _valid_number(inp.charger_report_ts))
         self._last_input_wall_now_ts = (None if isinstance(inp.wall_now_ts, bool) else _valid_number(inp.wall_now_ts))
         self._last_input_current_trusted = inp.charger_current_trusted is True
+        self._last_input_snapshot_verified = inp.charger_snapshot_verified is True
         source_id = inp.control_source_id
         self._last_input_control_source_id = source_id if (
             isinstance(source_id, str) and bool(source_id.strip()) or
@@ -3347,6 +3458,9 @@ class OneFuseRegulator:
                 raw_context = RawBudgetRiseContext(self._last_input_control_source_id, self.last_target,
                     self.last_set_limit_ts, target, self._last_input_grid_ts, self._last_input_charger_ts,
                     now-(self._last_input_wall_now_ts-self._last_input_grid_ts)+window, window)
+            grid_confirmation_deadline = (self._normal_shed_sync_deadline
+                if self._normal_shed_grid_wait and self._normal_shed_failure is None else
+                self._overload_grid_confirmation_deadline)
             return RegulatorDecision(
                 mode=f"dry_run_{mode}" if s.dry_run and mode not in {"idle", "unavailable"} else mode,
                 reason=reason, command=command,
@@ -3360,7 +3474,8 @@ class OneFuseRegulator:
                 overload_remaining_seconds=max(0.0, self.effective_overload_budget_seconds - self.effective_overload_used_seconds),
                 overload_transition_remaining_seconds=(
                     max(0.0, s.overload_response_seconds - (now - self._overload_transition_started))
-                    if self._overload_transition_started is not None else None),
+                    if self._overload_transition_started is not None
+                    and self._overload_grid_confirmation_deadline is None else None),
                 overload_failure_latched=self.effective_overload_failure_reason is not None,
                 overload_lifetime_used_seconds=self._overload_used_seconds,
                 overload_historical_failure_reason=self._overload_failure_reason,
@@ -3369,6 +3484,9 @@ class OneFuseRegulator:
                     self._positive_raw_deadline if self._positive_raw_deadline is not None
                     and now < self._positive_raw_deadline else None),
                 source_processing_deadline_ts=source_processing_deadline,
+                grid_confirmation_deadline_ts=grid_confirmation_deadline,
+                grid_confirmation_remaining_seconds=(max(0.0, grid_confirmation_deadline - now)
+                    if grid_confirmation_deadline is not None else None),
                 startup_charge_amps=self.startup_current,
                 waiting_for_vehicle_seconds=(max(0.0, now - self._waiting_for_vehicle_since)
                                              if self._waiting_for_vehicle_since is not None else 0.0),
@@ -3410,7 +3528,7 @@ class OneFuseRegulator:
                     and self._normal_shed_sync_deadline is None else None),
                 recovery_submission_ts=recovery_submission_ts,
                 nominal_sync_deadline_ts=(self._normal_shed_sync_deadline
-                    if self._normal_shed_failure is None else None),
+                    if self._normal_shed_failure is None and not self._normal_shed_grid_wait else None),
                 nominal_sync_remaining_seconds=(max(0.0, self._normal_shed_sync_deadline - now)
                     if self._normal_shed_sync_deadline is not None and self._normal_shed_failure is None else None),
             )
@@ -3578,7 +3696,7 @@ class OneFuseRegulator:
             mode, reason, command, cap, house, ttl = bounded_plan
             house_basis = ("nominal_response_verified" if mode == "normal_shedding_complete"
                            else "raw_grid_bounded_normal_response")
-            refresh_required = mode in {"normal_shedding", "normal_shedding_sync"}
+            refresh_required = mode in {"normal_shedding", "normal_shedding_sync", "normal_shedding_grid_wait"}
             result = decision(mode, reason, command, cap, ttl, emergency=True)
             if mode == "normal_shedding" and result.should_call_service:
                 if (self._normal_shed_attempt_at is not None
@@ -3702,7 +3820,7 @@ class OneFuseRegulator:
             mode, reason, target, house = overload
             # Overload leases must be one minute. The controller additionally
             # refuses a positive lease too close to budget/deadline expiry.
-            return decision(mode, reason, "set_limit", target, 60, emergency=True)
+            return decision(mode, reason, None if mode == "overload_grid_wait" else "set_limit", target, 60, emergency=True)
         physically_charging = self._meaningfully_charging(status, current)
         if physically_charging:
             self._waiting_for_vehicle_since = None
