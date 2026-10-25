@@ -46,6 +46,7 @@ NUMBER_DESCRIPTIONS = [
     OneFuseNumberDescription(key="overload_budget_seconds", option_key="overload_budget_seconds", name="Experimental Cumulative Overload Budget", native_min_value=60, native_max_value=1800, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-sand"),
     OneFuseNumberDescription(key="overload_transition_limit_amps", option_key="overload_transition_limit_amps", name="Experimental Overload Transition Limit", native_min_value=10, native_max_value=38, native_step=0.5, native_unit_of_measurement=UnitOfElectricCurrent.AMPERE, icon="mdi:speedometer"),
     OneFuseNumberDescription(key="overload_response_seconds", option_key="overload_response_seconds", name="Experimental Overload Response Window", native_min_value=1, native_max_value=10, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:timer-alert"),
+    OneFuseNumberDescription(key="grid_confirmation_seconds", option_key="grid_confirmation_seconds", name="Grid Confirmation After Timely Minimum Response", native_min_value=0, native_max_value=30, native_step=1, native_unit_of_measurement=UnitOfTime.SECONDS, icon="mdi:transmission-tower"),
 ]
 
 

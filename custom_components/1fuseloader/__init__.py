@@ -164,6 +164,7 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             "overload_failure_reason", "overload_historical_failure_reason",
             "overload_lifetime_used_seconds", "overload_trial_state", "overload_trial_used_seconds",
             "overload_trial_remaining_seconds", "overload_trial_failure_reason",
+            "grid_confirmation_deadline_ts", "grid_confirmation_remaining_seconds",
             "recent_command_journal_count", "recent_stop_contexts_count", "recent_command_deliveries_count",
             "last_command_attempt", "last_accepted_command", "last_accepted_limit",
             "diagnostics_scope", "diagnostics_truncated",
@@ -1826,7 +1827,8 @@ class OneFuseLoaderController:
                 command="set_limit", current_p1=0, current_p2=0, current_p3=0,
                 should_call_service=self.settings.active_control,
             )
-        if (decision.mode.removeprefix("dry_run_") == "normal_shedding_sync"
+        if (decision.mode.removeprefix("dry_run_") in {
+                "normal_shedding_sync", "normal_shedding_grid_wait", "overload_grid_wait"}
                 and decision.current_p1 > 0):
             # Synchronization retains only an existing live offer. It cannot
             # write, renew a lease, or resume, even if a stale plan says so.
@@ -1886,6 +1888,13 @@ class OneFuseLoaderController:
                 and decision.command is None and not decision.should_call_service
                 and decision.nominal_sync_deadline_ts is not None
                 and self.hass.loop.time() < decision.nominal_sync_deadline_ts)
+            grid_hold = bool(decision.mode.removeprefix("dry_run_") in {
+                    "normal_shedding_grid_wait", "overload_grid_wait"}
+                and decision.command is None and not decision.should_call_service
+                and decision.grid_confirmation_deadline_ts is not None
+                and self.hass.loop.time() < decision.grid_confirmation_deadline_ts
+                and self.regulator.last_target is not None
+                and decision.current_p1 == self.regulator.last_target[0] > 0)
             raw_hold = bool(decision.mode.removeprefix("dry_run_") == "low_grid_raw_hold"
                 and not decision.should_call_service and decision.command in {None, "set_limit"}
                 and decision.nominal_response_deadline_ts is None
@@ -1894,7 +1903,7 @@ class OneFuseLoaderController:
             # The re-evaluation can retire the old response deadline using a
             # fresh, whole-authority raw bound. Retain that existing offer
             # without dispatching the old request or manufacturing a zero.
-            if (decision.current_p1 > 0 or decision.command == "resume") and not (sync_hold or raw_hold):
+            if (decision.current_p1 > 0 or decision.command == "resume") and not (sync_hold or raw_hold or grid_hold):
                 decision = replace(
                     decision, mode="normal_shedding_stop",
                     reason="The fixed nominal response deadline expired before dispatch; requesting 0 A.",
@@ -2214,7 +2223,7 @@ class OneFuseLoaderController:
             # Separate, nonrenewable measurement synchronization; the original
             # high-load response allowance is never extended by this timer.
             delays.append(sync_deadline - self.hass.loop.time() + elapsed)
-        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts"):
+        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts"):
             deadline = getattr(decision, name, None)
             if decision.current_p1 > 0 and deadline is not None:
                 # Fixed source/response clocks survive event churn and every
@@ -2237,7 +2246,10 @@ class OneFuseLoaderController:
             # this removes the avoidable five-second watchdog rounding only.
             self._handle_source_change(None)
 
-        self._unsub_deadline = async_call_later(self.hass, max(0.05, min(delays) - elapsed), deadline_tick)
+        # A near-deadline source event must not replace the fixed post-response
+        # expiry with another 50 ms on every update.
+        minimum_delay = 0.0 if getattr(decision, "grid_confirmation_deadline_ts", None) is not None else 0.05
+        self._unsub_deadline = async_call_later(self.hass, max(minimum_delay, min(delays) - elapsed), deadline_tick)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
