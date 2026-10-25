@@ -1236,8 +1236,18 @@ class OneFuseLoaderController:
                 event_source_ts = min(known_sources).timestamp()
             if native_clock_error and native_clock_error != "native_terminal_values_unavailable":
                 current_trusted = False
-            increase_ready = self._schedule_current_quiet_tick(
-                getattr(native_clock, "last_tuple_change_monotonic", None))
+            tuple_changed_at = getattr(native_clock, "last_tuple_change_monotonic", None)
+            tuple_clock_valid = (tuple_changed_at is None or (
+                type(tuple_changed_at) in (int, float) and isfinite(tuple_changed_at)
+                and 0 <= tuple_changed_at <= self.hass.loop.time()))
+            if not tuple_clock_valid:
+                # False readiness must mean a genuine recent publication,
+                # never a future/nonfinite clock that could open a hold fence.
+                native_clock_error = native_clock_error or "native_current_tuple_clock_invalid"
+                current_trusted = False
+                increase_ready = False
+            else:
+                increase_ready = self._schedule_current_quiet_tick(tuple_changed_at)
             observation_report_times = tuple((key, stamp.timestamp())
                 for key, raw_stamp in getattr(native_clock, "observation_report_times", ())
                 if type(key) is int and key in (182, 183, 184, 185)
@@ -1275,7 +1285,17 @@ class OneFuseLoaderController:
                     "timestamp": None if malformed else source_stamp, "invalid": bool(malformed),
                 }
         snapshot_source_rejection = None
-        canonical_native = bool(explicit_native_clock and native_receipt is not None and native_maxima)
+        # Import-only raw budgeting can use a bound atomic cache value without
+        # using its current as credit. Preserve the native zero-sequence clock
+        # domain at bootstrap: a matching old GET must not replace that baseline
+        # or turn the first actual native response into an unrelated new domain.
+        committed_native_tuple = bool(explicit_native_clock and binding_matches
+            and native_maxima and source_number is not None
+            and getattr(native_clock, "committed", False) is True
+            and native_clock_error is None)
+        canonical_native = bool(explicit_native_clock and native_maxima
+            and (native_receipt is not None
+                 or (self.settings.nominal_import_only_fallback is True and committed_native_tuple)))
         if snapshot is not None:
             if publication_pending:
                 snapshot_source_rejection = "native_current_publication_pending"
@@ -1436,6 +1456,10 @@ class OneFuseLoaderController:
             wall_now_ts=datetime.now(timezone.utc).timestamp(),
             charger_snapshot_verified=snapshot_used,
             charger_current_trusted=current_trusted,
+            # Only the selected atomic native tuple can authorize the narrow
+            # raw-grid recovery path. A matching cloud GET is not that tuple.
+            charger_native_committed=(canonical_native and not snapshot_used
+                and committed_native_tuple and not publication_pending),
             control_source_id=self._configured_control_identity(),
             charger_report_family=current_report_family,
             charger_report_provenance=current_report_provenance,
@@ -1704,7 +1728,7 @@ class OneFuseLoaderController:
                     age <= self.settings.max_sensor_age_seconds)
         return (inp.status, inp.grid_l1, inp.charger_current, inp.data_valid, inp.data_error,
                 inp.grid_report_ts, inp.charger_report_ts, inp.charger_snapshot_verified,
-                inp.charger_current_trusted, inp.control_source_id,
+                inp.charger_current_trusted, inp.charger_native_committed, inp.control_source_id,
                 inp.charger_report_family, inp.charger_report_provenance,
                 inp.charger_increase_ready,
                 inp.charger_publication_pending,
@@ -1833,6 +1857,20 @@ class OneFuseLoaderController:
             return
         positive_submission = decision.command == "resume" or (
             decision.command == "set_limit" and decision.current_p1 > 0)
+        raw_response_deadline = getattr(decision, "raw_budget_response_deadline_ts", None)
+        if (positive_submission and decision.raw_budget_rise_context is not None
+                and raw_response_deadline is not None
+                and self.hass.loop.time() >= raw_response_deadline):
+            # This proposed rise has not been sent. Discard it without turning
+            # a delayed checkpoint into either fresh authority or a new zero.
+            self.regulator.reject_submission(decision, self.hass.loop.time())
+            self.last_service_result = "not_sent"
+            self.last_decision = replace(decision, mode="waiting_for_latest_sources",
+                reason="The raw-grid proposal expired before dispatch; recalculating from current sources.",
+                should_call_service=False)
+            self._handle_source_change(None)
+            self.notify()
+            return
         response_deadline = decision.nominal_response_deadline_ts
         if (positive_submission and response_deadline is not None
                 and self.hass.loop.time() >= response_deadline):
@@ -2005,6 +2043,8 @@ class OneFuseLoaderController:
             action_timeout = ACTION_TIMEOUT_SECONDS
             if positive_submission and response_deadline is not None:
                 action_timeout = min(action_timeout, max(0.001, response_deadline - self.hass.loop.time()))
+            if positive_submission and raw_response_deadline is not None:
+                action_timeout = min(action_timeout, max(0.001, raw_response_deadline - self.hass.loop.time()))
             self._dispatch_task = self.hass.async_create_task(self._adapter.async_execute(decision))
             receipt = await asyncio.wait_for(self._dispatch_task, action_timeout)
             if self._dispatch_superseded or self._stopped or generation != self._generation:
@@ -2082,7 +2122,7 @@ class OneFuseLoaderController:
                     if problem or self._budget_error:
                         latest = replace(latest, data_valid=False, data_error=self._budget_error or problem)
                 if (self._input_revision(latest) != self._input_revision(inp)
-                        or response_deadline is not None):
+                        or response_deadline is not None or raw_response_deadline is not None):
                     self._handle_source_change(None)
         if capture_stop and self.last_stop_context is not None:
             self.last_stop_context.update({
@@ -2174,6 +2214,12 @@ class OneFuseLoaderController:
             # Separate, nonrenewable measurement synchronization; the original
             # high-load response allowance is never extended by this timer.
             delays.append(sync_deadline - self.hass.loop.time() + elapsed)
+        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts"):
+            deadline = getattr(decision, name, None)
+            if decision.current_p1 > 0 and deadline is not None:
+                # Fixed source/response clocks survive event churn and every
+                # await; neither timer renews a limit or adds electrical time.
+                delays.append(deadline - self.hass.loop.time() + elapsed)
         if (self.settings.overload_enabled and decision.mode.removeprefix("dry_run_").startswith("overload")
                 and decision.current_p1 > 0):
             delays.append(decision.overload_remaining_seconds - OVERLOAD_LEASE_RESERVE_SECONDS)

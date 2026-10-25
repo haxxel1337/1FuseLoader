@@ -119,10 +119,27 @@ class RegulatorInput:
     # The native SDK may publish HA state before our full raw payload commits.
     # This fence grants no authority, response credit or additional time.
     charger_publication_pending: bool = False
+    # A complete selected native tuple, including a numeric-only bootstrap.
+    # This capability supplies no EV sample age, response or subtraction.
+    charger_native_committed: bool = False
     charger_event_source_ts: Optional[float] = None
     charger_event_source_known: bool = False
     charger_observation_report_times: Optional[tuple[tuple[int, float], ...]] = None
     charger_observation_sequences: Optional[tuple[tuple[int, int], ...]] = None
+
+
+@dataclass(frozen=True, slots=True)
+class RawBudgetRiseContext:
+    """Immutable planning facts; a late reply cannot select newer baselines."""
+
+    source_id: str | tuple
+    previous_target: tuple[int, int, int, int]
+    previous_limit_ts: float
+    target: int
+    grid_report_ts: float
+    event_report_ts: Optional[float]
+    response_deadline_ts: float
+    response_window_seconds: float
 
 
 @dataclass(slots=True)
@@ -169,6 +186,9 @@ class RegulatorDecision:
     nominal_sync_remaining_seconds: Optional[float] = None
     overload_lifetime_used_seconds: float = 0.0
     overload_historical_failure_reason: Optional[str] = None
+    raw_budget_rise_context: Optional[RawBudgetRiseContext] = None
+    raw_budget_response_deadline_ts: Optional[float] = None
+    source_processing_deadline_ts: Optional[float] = None
 
 
 class OneFuseRegulator:
@@ -476,6 +496,8 @@ class OneFuseRegulator:
         wall, gt = self._last_input_wall_now_ts, self._last_input_grid_ts
         identity = self._last_input_control_source_id
         budget = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+        if self._positive_raw_recovery:
+            budget = min(budget, self._positive_raw_window_seconds or 0.)
         spent = self._positive_alignment_used_seconds
         if (not s.enable_dynamic_limit or self._restart_required or self.paused_by_us
                 or status not in START_ALLOWED_STATUSES or not self._last_input_current_trusted
@@ -499,6 +521,140 @@ class OneFuseRegulator:
                 or s.enable_pause_resume and grid > s.pause_limit_amps):
             return None
         return cap, anchor
+
+    def _raw_budget_recovery_candidate(self, now: float, grid: float, current: float,
+                                       status: str, inp: RegulatorInput) -> Optional[int]:
+        """New nominal authority bounded by raw grid, crediting zero EV amps."""
+        s = self.settings
+        wall, gt = self._last_input_wall_now_ts, self._last_input_grid_ts
+        identity = self._last_input_control_source_id
+        if (s.nominal_import_only_fallback is not True or not s.fast_recovery or not s.enable_dynamic_limit
+                or inp.charger_native_committed is not True or inp.charger_publication_pending is not False
+                or inp.charger_increase_ready is not True or not self._last_input_current_trusted
+                or self._ev_clock_error is not None or not self._ev_clock_explicit
+                or inp.charger_report_family != "native_terminal_receipt"
+                or set(key[2] for key in self._ev_current_sequences) != {182, 183, 184, 185}
+                or not self._meaningfully_charging(status, current) or self.paused_by_us
+                or identity is None or identity != self._accepted_control_source_id
+                or self.last_target is None or not s.min_charge_amps <= self.last_target[0] <= s.max_charge_amps
+                or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                or current > self.last_target[0]+.5 or current > grid+1
+                or self._restart_required or self._uncertainty_ceiling is not None or self._uncertainty_stops > 0
+                or self._uncertainty_retry_submission_pending or self._uncertainty_restart
+                or self._positive_cap is not None or self._awaiting_reduction_target is not None
+                or (self._accepted_reduction_cap is not None or self._reduction_guard_deadline is not None)
+                   and not self._reduction_response_completed
+                or self._low_grid_pending or self._low_grid_failure is not None
+                or self._normal_shed_deadline is not None or self._normal_shed_failure is not None
+                or self._overload_transition_started is not None or self._overload_hold_active
+                or self.effective_overload_failure_reason not in {None, "response_timeout", "cumulative_budget_exhausted"}
+                or wall is None or gt is None or not 0 <= wall-gt < min(s.measurement_settle_seconds, s.max_sensor_age_seconds)):
+            return None
+        if self._ev_event_source_known and (self._ev_event_source_ts is None or self._ev_event_source_ts > wall+5):
+            return None
+        candidate = int(floor(min(s.max_charge_amps, s.main_fuse_amps-s.buffer_amps-grid)))
+        return candidate if self.last_target[0] < candidate <= s.max_charge_amps else None
+
+    def _reduction_source_processing_hold(self, now: float, grid: float, current: float,
+                                          status: str, inp: RegulatorInput):
+        """Preserve only an accepted decrease through one native source cohort.
+
+        A changed nonwinning conductor can expose an old MAX winner before
+        the next conductor arrives. It supplies no EV response. The first
+        process fence is fixed, shares the reduction's spent budget, and is
+        never restarted by channel, heartbeat, GET or same-cap TTL updates.
+        """
+        if self._reduction_processing_accounted is not None:
+            until = min(now, self._reduction_processing_deadline)
+            if until > self._reduction_processing_accounted:
+                if self._settle_started is None:
+                    self._partial_reduction_used_seconds += until-self._reduction_processing_accounted
+                self._reduction_processing_accounted = until
+        s = self.settings
+        def reject():
+            self._reduction_processing_accounted = None
+            return None
+        cap = self.last_target[0] if self.last_target is not None else None
+        previous, anchor = self._reduction_previous_cap, self._house_before_reduction
+        wall, gt, et = self._last_input_wall_now_ts, self._last_input_grid_ts, self._last_input_charger_ts
+        identity = self._last_input_control_source_id
+        reason = self._numeric_source_rejection()
+        if (s.nominal_import_only_fallback is not True or not s.enable_dynamic_limit
+                or inp.charger_native_committed is not True or inp.charger_report_family != "native_terminal_receipt"
+                or not (inp.charger_increase_ready is False or inp.charger_publication_pending is True)
+                or not self._last_input_current_trusted or self._ev_clock_error is not None
+                or status != "charging" or self.paused_by_us or self._restart_required
+                or self._uncertainty_ceiling is not None or self._uncertainty_stops > 0
+                or self._uncertainty_retry_submission_pending or self._uncertainty_restart
+                or identity is None or identity != self._accepted_control_source_id
+                or cap is None or previous is None or not s.min_charge_amps <= cap < previous <= s.max_charge_amps
+                or self._awaiting_reduction_target != cap or self._accepted_reduction_cap != cap
+                or not cap+.5 < current <= previous+.5
+                or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                or anchor is None or anchor < 0 or anchor+cap > s.main_fuse_amps-s.buffer_amps
+                or grid > s.main_fuse_amps-s.buffer_amps or current > grid+1
+                or wall is None or gt is None or et is None or et > wall+5
+                or not 0 <= wall-gt < min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+                or self._reduction_grid_ts is None or gt < self._reduction_grid_ts
+                or self._positive_cap is not None or self._normal_shed_deadline is not None
+                or self._normal_shed_failure is not None or self._low_grid_pending or self._low_grid_failure is not None
+                or self._overload_transition_started is not None or self._overload_hold_active
+                or self.effective_overload_failure_reason not in {None, "response_timeout", "cumulative_budget_exhausted"}
+                or reason not in {None, "charger_receipt_stale", "report_skew_exceeds_alignment_window"}
+                or self._fast_sources_fresh()):
+            return reject()
+        if self._ev_event_source_known and (self._ev_event_source_ts is None or self._ev_event_source_ts > wall+5):
+            return reject()
+        remaining = self._reduction_alignment_remaining(now)
+        if remaining <= 0:
+            return reject()
+        if self._reduction_processing_deadline is None:
+            self._reduction_processing_deadline = min(now+min(1., s.measurement_settle_seconds),
+                now+remaining, self.last_set_limit_ts+self.last_target[3])
+            self._reduction_processing_accounted = now
+        if now >= self._reduction_processing_deadline:
+            return reject()
+        if self._reduction_processing_accounted is None:
+            self._reduction_processing_accounted = now
+        return cap, anchor, self._reduction_processing_deadline
+
+    def _raw_positive_response(self, now: float, grid: float, current: float, status: str):
+        """Use the existing positive owner and its original sample-aged clock."""
+        if not self._positive_raw_recovery or self._positive_cap is None:
+            return None
+        s = self.settings
+        cap, anchor = self._positive_cap, self._positive_house
+        wall, gt, et = self._last_input_wall_now_ts, self._last_input_grid_ts, self._last_input_charger_ts
+        budget = min(s.measurement_settle_seconds, s.max_sensor_age_seconds, self._positive_raw_window_seconds or 0.)
+        remaining = (self._positive_skew_since+budget-self._positive_alignment_used_seconds-now
+                     if self._positive_skew_since is not None else 0.)
+        if (self._restart_required or self.paused_by_us or status not in START_ALLOWED_STATUSES
+                or not self._last_input_current_trusted or self._ev_clock_error is not None
+                or self.last_target is None or self.last_target[0] != cap
+                or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                or self._last_input_control_source_id is None
+                or self._last_input_control_source_id != self._accepted_control_source_id
+                or wall is None or gt is None or not 0 <= wall-gt <= s.max_sensor_age_seconds
+                or anchor is None or anchor+cap > s.main_fuse_amps-s.buffer_amps
+                or current > cap+.5 or self._positive_grid_ts is None or gt < self._positive_grid_ts):
+            return "invalid"
+        if grid > s.main_fuse_amps-s.buffer_amps:
+            return None  # The actual raw-load guards own this observation.
+        response = bool(et is not None and self._ev_advanced_since(self._positive_ev_ts, "_positive_ev_ts")
+            and self._fast_sources_fresh() and cap-.5 <= current <= cap+.5
+            and gt > et and current <= grid+1 and grid-current+cap <= s.main_fuse_amps-s.buffer_amps)
+        if remaining <= 0:
+            return None if grid+cap <= s.main_fuse_amps-s.buffer_amps else "timeout"
+        if response:
+            return None  # Existing positive alignment retires the same owner.
+        return "hold"
+
+    @property
+    def _positive_raw_deadline(self) -> Optional[float]:
+        if not self._positive_raw_recovery or self._positive_skew_since is None:
+            return None
+        return (self._positive_skew_since+min(self.settings.measurement_settle_seconds,
+            self.settings.max_sensor_age_seconds, self._positive_raw_window_seconds or 0.)-self._positive_alignment_used_seconds)
 
     @staticmethod
     def _trial_identity(value: object):
@@ -1235,13 +1391,17 @@ class OneFuseRegulator:
                 return stop("source_or_prior_control_invalid")
             age = wall - grid_ts
             deadline = now - age + min(10, s.overload_response_seconds)
+            raw_owner_deadline = (self._positive_raw_deadline
+                if self._positive_raw_recovery and self._positive_cap == accepted else None)
+            if raw_owner_deadline is not None:
+                deadline = min(deadline, raw_owner_deadline)
             if inherited is not None:
                 # A later high-grid report changes the required lower offer,
                 # not the owner of the already unobserved decrease. Preserve
                 # its finite remaining clock, including spent alignment time.
                 deadline = min(deadline, inherited[1])
             if deadline <= now:
-                return stop("inherited_response_window_expired") if inherited is not None else None
+                return stop("inherited_response_window_expired") if inherited is not None or raw_owner_deadline is not None else None
             self._normal_shed_deadline = deadline
             self._normal_shed_origin = now - age
             self._normal_shed_cap = self.startup_current
@@ -1500,6 +1660,8 @@ class OneFuseRegulator:
         self._positive_verified_low_ts: Optional[float] = None
         self._positive_grid_first_ts: Optional[float] = None
         self._positive_grid_first_closed = False
+        self._positive_raw_recovery = False
+        self._positive_raw_window_seconds: Optional[float] = None
 
     def _positive_reports_advanced(self) -> bool:
         return (self._last_input_grid_ts is not None and self._positive_grid_ts is not None
@@ -1639,6 +1801,9 @@ class OneFuseRegulator:
         self._partial_reduction_response_ts: Optional[float] = None
         self._partial_reduction_used_seconds = 0.0
         self._partial_reduction_budget: Optional[float] = None
+        self._reduction_response_completed = False
+        self._reduction_processing_deadline: Optional[float] = None
+        self._reduction_processing_accounted: Optional[float] = None
 
     def _reduction_alignment_remaining(self, now: float) -> float:
         budget = min(self._partial_reduction_budget or 0.0,
@@ -1666,6 +1831,7 @@ class OneFuseRegulator:
         self._awaiting_reduction_target = None
         self._partial_reduction_current = None
         self._partial_reduction_response_ts = None
+        self._reduction_response_completed = True
         # Keep the accepted-cap history and spent time until an actual changed
         # cap is accepted. A proposed increase or API failure proves nothing.
 
@@ -2613,12 +2779,41 @@ class OneFuseRegulator:
             self._normal_shed_failure = "ack_after_deadline_or_terminal_stop"
             self._restart_required = True
             return
+        raw_context = decision.raw_budget_rise_context
+        if decision.house_load_basis == "raw_grid_bounded_recovery":
+            valid_raw_reply = bool(isinstance(raw_context, RawBudgetRiseContext)
+                and type(now_ts) in (int, float) and isfinite(now_ts)
+                and now_ts < raw_context.response_deadline_ts
+                and decision.current_p1 == raw_context.target
+                and self.last_target == raw_context.previous_target
+                and self.last_set_limit_ts == raw_context.previous_limit_ts
+                and 0 <= now_ts-raw_context.previous_limit_ts < raw_context.previous_target[3]
+                and self._last_input_control_source_id == raw_context.source_id == self._accepted_control_source_id
+                and self._last_input_status == "charging" and self._last_input_current_trusted
+                and not self._restart_required and not self.paused_by_us
+                and self._positive_cap is None and self._awaiting_reduction_target is None
+                and not self._low_grid_pending and self._low_grid_failure is None
+                and self._normal_shed_deadline is None and self._normal_shed_failure is None
+                and self._uncertainty_ceiling is None and self._uncertainty_stops == 0
+                and not self._uncertainty_retry_submission_pending
+                and self._overload_transition_started is None and not self._overload_hold_active)
+            if not valid_raw_reply:
+                self.last_action_ts = self.last_set_limit_ts = now_ts
+                self.last_command = "set_limit"
+                self.last_target = (decision.current_p1, decision.current_p2, decision.current_p3, decision.ttl_seconds)
+                self._restart_required = True
+                self._clear_positive_alignment()
+                return
         self.last_action_ts = now_ts
         self.last_command = decision.command
         if decision.command == "set_limit":
             old_target = self.last_target[0] if self.last_target is not None else None
             target = decision.current_p1
             changed = old_target != target
+            raw_rise_ack = bool(changed and old_target is not None and old_target > 0 and target > old_target
+                and decision.house_load_basis == "raw_grid_bounded_recovery")
+            raw_prior_lease_live = bool(self.last_set_limit_ts is not None and self.last_target is not None
+                and 0 <= now_ts-self.last_set_limit_ts < self.last_target[3])
             same_cap_restart = not changed and target > 0 and self._restart_required
             accepted_restart = target > 0 and self._restart_required
             self._accepted_control_source_id = self._last_input_control_source_id
@@ -2642,6 +2837,8 @@ class OneFuseRegulator:
             if (changed and target > 0 and old_target is not None and target < old_target
                     and self._positive_cap == old_target and self._positive_skew_since is not None):
                 budget = min(self.settings.measurement_settle_seconds, self.settings.max_sensor_age_seconds)
+                if self._positive_raw_recovery:
+                    budget = min(budget, self._positive_raw_window_seconds or 0.)
                 positive_shedding_budget = (
                     budget,
                     self._positive_alignment_used_seconds + max(0.0, now_ts - self._positive_skew_since),
@@ -2690,6 +2887,17 @@ class OneFuseRegulator:
                     self._positive_ev_ts = self._last_input_charger_ts
                     self._pin_ev_owner("_positive_ev_ts", wall_floor=self._ack_wall(now_ts))
                     self._positive_before_current = decision.charger_current
+            if raw_rise_ack and self._positive_cap == target:
+                # This is the same positive owner and original raw sample,
+                # not a second response window. API/checkpoint latency spends
+                # its existing alignment budget before acknowledgement.
+                self._positive_raw_recovery = True
+                self._positive_raw_window_seconds = raw_context.response_window_seconds
+                self._positive_skew_since = raw_context.response_deadline_ts-raw_context.response_window_seconds
+                self._positive_grid_ts = raw_context.grid_report_ts
+                self._positive_ev_ts = raw_context.event_report_ts
+                if not raw_prior_lease_live:
+                    self._restart_required = True
             if changed and (target < decision.charger_current or
                             (old_target is not None and target < old_target)):
                 # A submitted cap is not a measured current. Retain the last
@@ -2858,7 +3066,7 @@ class OneFuseRegulator:
     def _limit_with_continuity(self, now: float, desired: int, available: int,
                                house: float, current: float, status: str,
                                allow_minimum: bool = True, raw_zero_restart: bool = False,
-                               raw_zero_fresh: bool = False) -> int:
+                               raw_zero_fresh: bool = False, raw_budget_rise: bool = False) -> int:
         """Lower promptly, retain minimum within budget, and raise slowly.
 
         The reserve may spend part of the normal operating buffer, but never
@@ -2952,6 +3160,8 @@ class OneFuseRegulator:
         load_rose = self._previous_desired is not None and desired < self._previous_desired
         self._previous_desired = desired
         if s.fast_recovery:
+            if raw_budget_rise:
+                return desired
             if (self._awaiting_reduction_target is not None
                     or (self._positive_cap is not None and not self._snapshot_aligned)):
                 self._fast_recovery_wait = "aligned"
@@ -3048,6 +3258,7 @@ class OneFuseRegulator:
         current_fresh = self._fast_sources_fresh()
         refresh_required = False
         house_basis = "grid_minus_reported_ev"
+        source_processing_deadline = None
         if self.last_target is None and not current_fresh:
             # Initial takeover cannot be seeded from an old retained EV value.
             available, house = self.calculate_available_l1(grid, 0.0)
@@ -3129,6 +3340,13 @@ class OneFuseRegulator:
                     self._uncertainty_last_attempt = now
                     self._uncertainty_last_attempt_cap = target
                     recovery_submission_ts = now
+            raw_context = None
+            if (house_basis == "raw_grid_bounded_recovery" and command == "set_limit" and target > 0
+                    and self.last_target is not None and target > self.last_target[0]):
+                window = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+                raw_context = RawBudgetRiseContext(self._last_input_control_source_id, self.last_target,
+                    self.last_set_limit_ts, target, self._last_input_grid_ts, self._last_input_charger_ts,
+                    now-(self._last_input_wall_now_ts-self._last_input_grid_ts)+window, window)
             return RegulatorDecision(
                 mode=f"dry_run_{mode}" if s.dry_run and mode not in {"idle", "unavailable"} else mode,
                 reason=reason, command=command,
@@ -3146,10 +3364,17 @@ class OneFuseRegulator:
                 overload_failure_latched=self.effective_overload_failure_reason is not None,
                 overload_lifetime_used_seconds=self._overload_used_seconds,
                 overload_historical_failure_reason=self._overload_failure_reason,
+                raw_budget_rise_context=raw_context,
+                raw_budget_response_deadline_ts=(raw_context.response_deadline_ts if raw_context else
+                    self._positive_raw_deadline if self._positive_raw_deadline is not None
+                    and now < self._positive_raw_deadline else None),
+                source_processing_deadline_ts=source_processing_deadline,
                 startup_charge_amps=self.startup_current,
                 waiting_for_vehicle_seconds=(max(0.0, now - self._waiting_for_vehicle_since)
                                              if self._waiting_for_vehicle_since is not None else 0.0),
                 measurement_alignment_remaining_seconds=(
+                    max(0.0, self._positive_raw_deadline-now) if self._positive_raw_recovery
+                    and self._positive_raw_deadline is not None else
                     max(0.0, min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
                         - self._positive_alignment_used_seconds - (now - self._positive_skew_since))
                     if self._positive_skew_since is not None else
@@ -3258,6 +3483,26 @@ class OneFuseRegulator:
             self._restart_required = True
             return decision("unavailable", "Accepted positive response source binding changed; requesting 0 A.",
                             "set_limit", emergency=True)
+        raw_recovery_candidate = self._raw_budget_recovery_candidate(now, grid, current, status, inp)
+        reduction_processing = self._reduction_source_processing_hold(now, grid, current, status, inp)
+        if reduction_processing is not None:
+            cap, house, source_processing_deadline = reduction_processing
+            house_basis = "accepted_reduction_owner_during_native_cohort"
+            refresh_required = True
+            soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+            pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+            self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+            if s.enable_pause_resume and pause:
+                return decision("pause", "Pause guard overrides native source-cohort processing.", "pause", emergency=True)
+            if s.enable_soft_guard and soft and s.soft_current_amps < cap:
+                target = max(0, s.soft_current_amps)
+                if target < s.min_charge_amps:
+                    target = 0
+                    self._restart_required = True
+                return decision("soft_limit", "Soft guard overrides native source-cohort processing.",
+                    "set_limit", target, s.soft_ttl_seconds, emergency=True)
+            return decision("waiting_for_current_cohort", "Preserving only the live accepted decrease while native conductor publications complete; no command, EV credit, lease renewal or new response time.",
+                None, cap, self.last_target[3])
         publication_owner = (self._publication_pending_positive_owner(now, grid, current, status)
                              if inp.charger_publication_pending is True else None)
         if publication_owner is not None:
@@ -3270,7 +3515,30 @@ class OneFuseRegulator:
             self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
             return decision("waiting_for_current_publication", "Retaining only the existing live nominal offer and its prior qualified house anchor while the raw payload commits; no command, response credit or additional response time.",
                             None, cap, self.last_target[3])
-        baseline_hold = self._clock_baseline_raw_hold(now, grid, current, status)
+        raw_response = self._raw_positive_response(now, grid, current, status)
+        if raw_response in {"invalid", "timeout"}:
+            self.reset_timers()
+            self._clear_positive_alignment()
+            self._restart_required = True
+            return decision("unavailable", f"Raw-budget positive response {raw_response}; requesting 0 A.", "set_limit", emergency=True)
+        if raw_response == "hold":
+            cap, house = self._positive_cap, self._positive_house
+            house_basis = "raw_budget_positive_response_anchor"
+            refresh_required = True
+            soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+            pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+            self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+            if s.enable_pause_resume and pause:
+                return decision("pause", "Pause guard overrides raw-budget response alignment.", "pause", emergency=True)
+            if s.enable_soft_guard and soft and s.soft_current_amps < cap:
+                target = max(0, s.soft_current_amps)
+                if target < s.min_charge_amps:
+                    target = 0
+                    self._restart_required = True
+                return decision("soft_limit", "Soft guard overrides raw-budget response alignment.",
+                    "set_limit", target, s.soft_ttl_seconds, emergency=True)
+            return decision("settling", "Keeping only the accepted raw-budget offer inside its original sample-aged response window; no EV subtraction, rise, resume or lease renewal.", None, cap, self.last_target[3])
+        baseline_hold = (None if raw_recovery_candidate is not None else self._clock_baseline_raw_hold(now, grid, current, status))
         if baseline_hold is not None:
             cap, house = baseline_hold
             available, _ = self.calculate_available_l1(grid, 0.0)
@@ -3815,11 +4083,15 @@ class OneFuseRegulator:
         if self._uncertainty_ceiling is not None:
             target = min(target, self.startup_current if self._uncertainty_restart else self._uncertainty_ceiling)
             original_target = target
+        raw_budget_rise = raw_recovery_candidate is not None and target == raw_recovery_candidate
+        if raw_budget_rise:
+            house, house_basis = grid, "raw_grid_bounded_recovery"
         target = self._limit_with_continuity(
             now, target, available, house, current, status,
             allow_minimum=not (s.enable_soft_guard and soft and s.soft_current_amps < s.min_charge_amps),
             raw_zero_restart=raw_zero_restart,
             raw_zero_fresh=raw_zero_fresh,
+            raw_budget_rise=raw_budget_rise,
         )
         if target > original_target:
             mode = "minimum_continuity"

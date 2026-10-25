@@ -50,6 +50,30 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Raw-budget recovery and pending-reduction cohorts (b27)
+
+With the verified import-only option enabled, unchanged EV telemetry need not
+block every increase. A fresh raw-grid sample can authorize a higher offer
+only when the **entire proposed offer plus raw grid current** fits the normal
+fuse-minus-buffer budget. No old EV current is subtracted. The selected atomic
+native tuple must remain valid and bound to the same charger. At bootstrap,
+missing native receipts and zero event sequences stay missing and zero;
+matching cloud reads cannot replace them with new measurement evidence.
+
+An accepted raw-budget increase has one original, sample-aged response window.
+Only genuine post-acceptance conductor observations and a later coherent grid
+sample can establish its response. Renewals, checkpoint/API latency and late
+replies cannot refill that window or revive a terminal stop.
+
+When a qualified reduction is already accepted, sequential conductor updates
+can briefly select another maximum with an old clock. A narrow processing
+fence may retain that same lower offer **without a write** while the actual
+tuple settles. Its first deadline is at most one second, bounded further by
+the existing lease and response deadlines. Fresh raw grid must remain within
+the normal buffer; invalid sources, high raw load, expired protection and
+custom guards retain priority. Churn and cloud reads cannot extend the fence.
+This adds no overload permission, budget, EV credit, restart or lease renewal.
+
 ### Numeric representation and atomic current records (b26)
 
 Home Assistant serializes floating sensor values to 15 significant digits.
