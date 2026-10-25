@@ -50,6 +50,40 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Numeric representation and atomic current records (b26)
+
+Home Assistant serializes floating sensor values to 15 significant digits.
+The selected SDK current and its HA state therefore need not be identical
+binary floats. Match that exact representation boundary, then keep the
+source-bound SDK number for control. This adds no current tolerance: different
+representation buckets, invalid values and mismatched source bindings remain
+different observations.
+
+The native SDK can publish conductor states before the additive raw observer
+has received the whole payload. The adapter now commits the four-conductor
+record atomically and returns its numeric maximum together with the matching
+component IDs, receipts, sequences and errors. An incomplete native/HA update
+cannot replace that committed number or erase its actual observation clock.
+Replayed values with unchanged source metadata grant no response credit.
+
+While native publication differs from the committed record, positive writes
+(including reductions and lease renewals) wait for coherence. A fixed watchdog
+starts at the first mismatch, lasts at most one second and is capped by the
+configured measurement-alignment window. Churn and reads cannot extend it.
+Source faults, invalid raw records on any conductor, peak protection and zero
+requests retain priority. Existing response, lease and overload deadlines
+continue to run; this is no additional electrical response allowance.
+
+A still-qualified accepted positive offer can be retained without a write
+during this publication fence when fresh raw L1 fits the normal buffer and
+the preceding qualified house estimate plus the entire accepted offer also
+fits that buffer. This preserves the same response owner and its remaining
+time; it supplies no new start, renewal or retry.
+
+No historical failure, exposure, recovery barrier or explicit overload-period
+permission is cleared. An enabled experimental switch still does not mean a
+new 30-minute period has been started.
+
 ### Component observations and response clocks (b25)
 
 Easee's Current entity is the maximum of four conductor values. Its HA entity
@@ -743,7 +777,7 @@ python -m compileall -q .\custom_components\1fuseloader
 ```
 
 The standalone suites use simulated inputs and adapters. CI additionally
-installs Home Assistant 2026.10.1, 2026.10.2 and 2026.10.3 on Python 3.14 with
+installs Home Assistant 2026.10.1, 2026.10.2, 2026.10.3 and 2026.10.4 on Python 3.14 with
 both supported pyeasee versions to test actual imports, selectors, entity
 construction and config/options flows. Passing these tests does not establish
 physical charging acceptance.

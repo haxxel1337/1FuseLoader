@@ -5,11 +5,12 @@ import hashlib
 import json
 import logging
 import os
+import sys
 from collections import deque
 from pathlib import Path
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
-from math import isfinite
+from math import floor, isfinite, log10
 from typing import Any
 from uuid import uuid4
 
@@ -44,7 +45,11 @@ CURRENT_SNAPSHOT_MIN_INTERVAL_SECONDS = 5
 CURRENT_SNAPSHOT_REQUEST_TIMEOUT_SECONDS = 10
 CURRENT_SNAPSHOT_MAX_BACKOFF_SECONDS = 300
 CURRENT_TUPLE_QUIET_SECONDS = 0.25
+CURRENT_PUBLICATION_WATCHDOG_SECONDS = 1.0
 _NO_NATIVE_CURRENT_CLOCK = object()
+# Match Entity._stringify_state in supported HA Core exactly. This is a
+# representation identity, not an electrical tolerance or a sampling clock.
+_HA_FLOAT_PRECISION = abs(floor(log10(abs(sys.float_info.epsilon)))) - 1
 SNAPSHOT_ERROR_CODES = frozenset({
     "easee_snapshot_api_unavailable", "easee_snapshot_missing_or_invalid",
     "easee_snapshot_invalid_current", "easee_snapshot_invalid_operation_mode",
@@ -62,6 +67,30 @@ _PENDING_BUDGET_WRITES_KEY = f"{DOMAIN}_pending_budget_writes"
 OVERLOAD_LEASE_RESERVE_SECONDS = 90
 # Leave room for HA's own entity attributes below Recorder's 16 KiB limit.
 DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES = 11 * 1024
+
+
+def _finite_current_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+        return number if not isinstance(value, bool) and isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _native_current_for_ha_state(state: Any, native_value: Any) -> float | None:
+    """Recover only the exact source number represented by HA's state text.
+
+    HA Core limits float states to its machine-epsilon precision. Parsing that
+    display string need not round-trip to the source float. Compare its exact
+    canonical representation instead of allowing any amp-sized difference.
+    Full-precision input remains valid for injected legacy state publishers.
+    """
+    number, native = _finite_current_number(state), _finite_current_number(native_value)
+    if number is None or native is None:
+        return None
+    if number == native or number == float(f"{native:.{_HA_FLOAT_PRECISION}}"):
+        return native
+    return None
 
 
 def _limit_receipt_summary(record: dict[str, Any]) -> dict[str, Any]:
@@ -224,6 +253,10 @@ class OneFuseLoaderController:
         self._current_observation_unsub = None
         self._current_quiet_unsub = None
         self._current_quiet_token: object | None = None
+        self._current_publication_unsub = None
+        self._current_publication_token: object | None = None
+        self._current_publication_deadline: float | None = None
+        self._current_publication_key: tuple | None = None
         self._control_identity = None
         self._delivery_binding = None
         self._positive_retry_after = 0.0
@@ -687,6 +720,7 @@ class OneFuseLoaderController:
         if self._current_quiet_unsub is not None:
             self._current_quiet_unsub()
             self._current_quiet_unsub = None
+        self._cancel_current_publication_watchdog()
         self._pending_refresh = False
         snapshot_task = self._charger_snapshot_task
         self._cancel_snapshot_refresh(cancel_request=True)
@@ -739,11 +773,26 @@ class OneFuseLoaderController:
             current_id = data.get(CONF_CHARGER_CURRENT_ENTITY)
             current = self.hass.states.get(current_id)
             receipt = self._utc_time(getattr(native, "received_at", None))
+            current_value = getattr(current, "state", None)
+            try:
+                clock_owner = getattr(self._adapter, "observation_clock_identity", None)
+            except Exception:
+                clock_owner = None
+            if clock_owner is not None and getattr(native, "source_identity", None) == clock_owner:
+                source_number = (_finite_current_number(getattr(native, "current", None))
+                    if getattr(native, "committed", False) is True and _finite_current_number(current_value) is not None
+                    else _native_current_for_ha_state(current_value, getattr(native, "current", None)))
+                if source_number is not None:
+                    current_value = source_number
             return (data.get(CONF_DEVICE_ID), status_id, getattr(status, "state", None),
-                    changed.timestamp() if changed else None, current_id, getattr(current, "state", None),
+                    changed.timestamp() if changed else None, current_id, current_value,
                     receipt.timestamp() if receipt else None,
                     ("native_terminal_receipt", getattr(native, "source_identity", None),
-                     getattr(native, "observation_ids", ()), getattr(native, "error", None)))
+                     getattr(native, "observation_ids", ()), getattr(native, "error", None),
+                     getattr(native, "observation_sequences", ()),
+                     getattr(native, "native_publication_pending", False),
+                     getattr(native, "publication_generation", 0),
+                     getattr(native, "divergence_started_monotonic", None)))
         for key in (CONF_STATUS_ENTITY, CONF_CHARGER_CURRENT_ENTITY):
             entity_id = data.get(key)
             state = self.hass.states.get(entity_id)
@@ -781,6 +830,59 @@ class OneFuseLoaderController:
             self.hass, max(0.001, CURRENT_TUPLE_QUIET_SECONDS - (now - changed_at)), ready)
         return False
 
+    def _cancel_current_publication_watchdog(self) -> None:
+        if self._current_publication_unsub is not None:
+            self._current_publication_unsub()
+        self._current_publication_unsub = None
+        self._current_publication_token = None
+        self._current_publication_deadline = None
+        self._current_publication_key = None
+
+    def _current_publication_state(self, native: Any) -> tuple[bool, str | None]:
+        """One finite coherence watchdog, independent of electrical deadlines."""
+        if getattr(native, "native_publication_pending", False) is not True:
+            self._cancel_current_publication_watchdog()
+            return False, None
+        now = self.hass.loop.time()
+        started = getattr(native, "divergence_started_monotonic", None)
+        episode = getattr(native, "publication_generation", 0)
+        window = _finite_current_number(self.settings.measurement_settle_seconds)
+        if (type(started) not in (int, float) or not isfinite(started) or started > now
+                or type(episode) is not int or episode < 0 or window is None or window <= 0):
+            return True, "native_publication_clock_invalid"
+        key = (getattr(native, "source_identity", None), episode)
+        if key != self._current_publication_key:
+            # A generation changes only after an adapter-proven complete
+            # coherent raw commit ends the previous publication episode.
+            self._cancel_current_publication_watchdog()
+            self._current_publication_key = key
+        deadline = started + min(CURRENT_PUBLICATION_WATCHDOG_SECONDS, window)
+        if self._current_publication_deadline is not None:
+            deadline = min(deadline, self._current_publication_deadline)
+        if now >= deadline:
+            if self._current_publication_unsub is not None:
+                self._current_publication_unsub()
+            self._current_publication_unsub = None
+            self._current_publication_token = None
+            self._current_publication_deadline = deadline
+            return True, "native_publication_diverged"
+        if self._current_publication_unsub is None or self._current_publication_deadline != deadline:
+            if self._current_publication_unsub is not None:
+                self._current_publication_unsub()
+            self._current_publication_deadline = deadline
+            self._current_publication_token = token = object()
+            generation = self._generation
+
+            async def expired(_now: datetime) -> None:
+                if self._stopped or generation != self._generation or token is not self._current_publication_token:
+                    return
+                self._current_publication_unsub = None
+                self._current_publication_token = None
+                self._handle_source_change(None)
+
+            self._current_publication_unsub = async_call_later(self.hass, deadline-now, expired)
+        return True, None
+
     def _cancel_snapshot_refresh(self, *, cancel_request: bool = False) -> None:
         if self._charger_snapshot_refresh_unsub is not None:
             self._charger_snapshot_refresh_unsub()
@@ -795,6 +897,8 @@ class OneFuseLoaderController:
                             float(self.settings.max_sensor_age_seconds), CURRENT_SNAPSHOT_MAX_AGE_SECONDS))
 
     def _snapshot_prefetch_allowed(self, inp: RegulatorInput) -> bool:
+        if inp.charger_publication_pending:
+            return False  # A GET cannot complete an in-flight raw publication.
         try:
             charging = inp.status == "charging" and float(inp.charger_current) >= 1
         except (TypeError, ValueError):
@@ -1082,18 +1186,14 @@ class OneFuseLoaderController:
                 owner = clock_owner
             maxima = maximum_ids(getattr(item, "current_source_observation_ids", ()))
             return (*owner, "max_terminals", *maxima) if maxima else (*owner, "unknown_maximum")
-        def current_number(value: Any) -> float | None:
-            try:
-                number = float(value)
-                return number if not isinstance(value, bool) and isfinite(number) else None
-            except (TypeError, ValueError, OverflowError):
-                return None
-        native_number = current_number(current_value)
+        native_number = _finite_current_number(current_value)
         increase_ready = True
         native_receipt = None
         native_clock_error = None
         native_maxima = ()
         native_source_times: tuple = ()
+        publication_pending = False
+        publication_error = None
         event_source_known = False
         event_source_ts = None
         observation_report_times = None
@@ -1102,11 +1202,24 @@ class OneFuseLoaderController:
             native_maxima = maximum_ids(getattr(native_clock, "observation_ids", ()))
             native_clock_error = getattr(native_clock, "error", None)
             native_receipt = self._utc_time(getattr(native_clock, "received_at", None))
+            publication_pending, publication_error = self._current_publication_state(native_clock)
+            native_clock_error = native_clock_error or publication_error
             # Numeric state and this terminal receipt must describe the same
             # winning value. A missing receipt is explicit unknown provenance,
             # never an excuse to adopt a fresh HA attribute-fanout timestamp.
-            if native_number is None or current_number(getattr(native_clock, "current", None)) != native_number:
+            source_number = (_finite_current_number(getattr(native_clock, "current", None))
+                if getattr(native_clock, "committed", False) is True and native_number is not None and native_number >= 0
+                else _native_current_for_ha_state(current_value, getattr(native_clock, "current", None)))
+            binding_matches = bool(native_clock is not None
+                and getattr(native_clock, "source_identity", None) == clock_owner)
+            if not binding_matches or not native_maxima or source_number is None:
                 native_receipt = None
+            else:
+                # The adapter owns the validated conductor number and event.
+                # HA's rounded display supplies no substitute measurement.
+                current_value = native_number = source_number
+            if native_clock is not None and not binding_matches:
+                native_clock_error = "native_terminal_source_mismatch"
             current_report_ts = native_receipt.timestamp() if native_receipt else None
             current_report_family = "native_terminal_receipt"
             current_report_provenance = (*clock_owner, "max_terminals", *native_maxima)
@@ -1130,6 +1243,13 @@ class OneFuseLoaderController:
                 if type(key) is int and key in (182, 183, 184, 185)
                 and (stamp := self._utc_time(raw_stamp)) is not None)
             observation_sequences = getattr(native_clock, "observation_sequences", ())
+            if native_clock_error and native_clock_error != "native_terminal_values_unavailable":
+                error = ("Easee native current publication is inconsistent: " + publication_error + "."
+                    if publication_error else "Easee native current observation evidence is invalid.")
+                errors.append(error)
+                source_errors = [*self.source_diagnostics.get("source_errors", ()), error]
+                self.source_diagnostics.update(source_health="unhealthy", source_errors=source_errors,
+                    source_health_reason=" ".join(source_errors))
         evidence = self._charger_vendor_evidence
         if evidence is not None and (
                 self._stopped or errors or health_error or evidence["generation"] != self._generation
@@ -1138,11 +1258,11 @@ class OneFuseLoaderController:
                 or native_number is None or native_number != evidence["value"]
                 or not callable(snapshot_is_current) or not snapshot_is_current(evidence["snapshot"])):
             evidence = self._charger_vendor_evidence = None
-        if (snapshot is not None and not errors and not health_error
+        if (snapshot is not None and not errors and not health_error and current_trusted and not publication_pending
                 and self._charger_snapshot_selection == self._charger_source_revision()
                 and 0 <= snapshot_age <= CURRENT_SNAPSHOT_MAX_AGE_SECONDS
                 and callable(snapshot_is_current) and snapshot_is_current(snapshot)
-                and native_number is not None and native_number == current_number(snapshot.current)):
+                and native_number is not None and native_number == _finite_current_number(snapshot.current)):
             missing = source_stamp is None and (source_error is None
                 or source_error == "easee_observation_timestamp_missing")
             malformed = (bool(source_error) and source_error != "easee_observation_timestamp_missing"
@@ -1157,7 +1277,9 @@ class OneFuseLoaderController:
         snapshot_source_rejection = None
         canonical_native = bool(explicit_native_clock and native_receipt is not None and native_maxima)
         if snapshot is not None:
-            if source_error:
+            if publication_pending:
+                snapshot_source_rejection = "native_current_publication_pending"
+            elif source_error:
                 snapshot_source_rejection = "observation_timestamp_invalid"
             elif source_stamp is None:
                 snapshot_source_rejection = "observation_timestamp_missing"
@@ -1180,7 +1302,7 @@ class OneFuseLoaderController:
                 elif (snapshot.status != status_value and entity_report_times[1] is not None
                       and status_source_stamp.timestamp() <= entity_report_times[1]):
                     snapshot_source_rejection = "status_observation_precedes_native_report"
-            if canonical_native and native_number == current_number(getattr(snapshot, "current", None)):
+            if canonical_native and native_number == _finite_current_number(getattr(snapshot, "current", None)):
                 # Equality of float/winner/device does not establish event
                 # identity: an older A value can predate an intervening B.
                 # Keep the actual native event canonical and the GET metadata
@@ -1188,7 +1310,8 @@ class OneFuseLoaderController:
                 snapshot_source_rejection = "matching_get_not_native_event_identity"
         # A new HA status/current event supersedes the whole REST pair. Never
         # combine a new current with an old authorization/schedule status.
-        snapshot_used = bool(snapshot is not None and not errors and not health_error
+        snapshot_used = bool(snapshot is not None and not errors and not health_error and current_trusted
+            and native_number is not None and native_number >= 0
             and snapshot_source_rejection is None
             and self._charger_snapshot_selection == self._charger_source_revision()
             and 0 <= snapshot_age <= CURRENT_SNAPSHOT_MAX_AGE_SECONDS
@@ -1216,7 +1339,7 @@ class OneFuseLoaderController:
         elif snapshot is not None:
             self._charger_snapshot = None
             self._charger_snapshot_selection = None
-        if not snapshot_used and evidence is not None and not canonical_native:
+        if not snapshot_used and evidence is not None and not canonical_native and not publication_pending:
             current_trusted = current_trusted and not evidence["invalid"]
             if evidence["timestamp"] is not None:
                 current_report_ts = evidence["timestamp"].timestamp()
@@ -1249,7 +1372,8 @@ class OneFuseLoaderController:
                 if self._utc_time(getattr(current_state, "last_reported", None)) else None),
             "charger_status_entity_reported_at_utc": (self._utc_time(getattr(status_state, "last_reported", None)).isoformat()
                 if self._utc_time(getattr(status_state, "last_reported", None)) else None),
-            "charger_current_source": "selected_charger_rest_snapshot" if snapshot_used else "ha_entity",
+            "charger_current_source": ("selected_charger_rest_snapshot" if snapshot_used else
+                "selected_native_raw_observation" if getattr(native_clock, "committed", False) is True else "ha_entity"),
             "charger_snapshot_received_at_utc": received.isoformat() if received else None,
             "charger_snapshot_used": snapshot_used,
             "charger_snapshot_error_type": self._charger_snapshot_error,
@@ -1267,6 +1391,11 @@ class OneFuseLoaderController:
             "native_max_observation_ids": native_maxima,
             "native_max_received_at_utc": native_receipt.isoformat() if native_receipt else None,
             "native_max_clock_error": native_clock_error,
+            "native_current_committed": getattr(native_clock, "committed", False) is True,
+            "native_sdk_current": getattr(native_clock, "sdk_current", None),
+            "native_publication_pending": publication_pending,
+            "native_publication_watchdog_remaining_seconds": (max(0., self._current_publication_deadline-self.hass.loop.time())
+                if self._current_publication_deadline is not None else None),
             "native_max_source_timestamps_utc": tuple((key, stamp.isoformat() if isinstance(stamp, datetime) else None)
                 for key, stamp in native_source_times),
             "current_tuple_increase_ready": increase_ready,
@@ -1311,6 +1440,7 @@ class OneFuseLoaderController:
             charger_report_family=current_report_family,
             charger_report_provenance=current_report_provenance,
             charger_increase_ready=increase_ready,
+            charger_publication_pending=publication_pending,
             charger_event_source_known=event_source_known,
             charger_event_source_ts=event_source_ts,
             charger_observation_report_times=observation_report_times,
@@ -1577,6 +1707,7 @@ class OneFuseLoaderController:
                 inp.charger_current_trusted, inp.control_source_id,
                 inp.charger_report_family, inp.charger_report_provenance,
                 inp.charger_increase_ready,
+                inp.charger_publication_pending,
                 inp.charger_event_source_known, inp.charger_event_source_ts,
                 inp.charger_observation_report_times,
                 inp.charger_observation_sequences,

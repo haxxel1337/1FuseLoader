@@ -31,6 +31,7 @@ ADMISSION_PERIOD_SECONDS = 60.01
 REQUEST_TIMEOUT_SECONDS = 10
 MAX_TELEMETRY_AGE_SECONDS = 120
 OBSERVATION_FUTURE_TOLERANCE_SECONDS = 2
+NATIVE_PUBLICATION_MAX_DIVERGENCE_SECONDS = 1.0
 SNAPSHOT_OBSERVATION_IDS = (109, 182, 183, 184, 185)
 
 # Raw numeric modes in the audited pyeasee 0.8.17 operation-mode enum.
@@ -133,6 +134,14 @@ class NativeCurrentObservation:
     source_metadata_highwaters: tuple[tuple[int, datetime], ...] = ()
     error: str | None = None
     last_tuple_change_monotonic: float | None = None
+    # Numeric state and event clocks are one committed raw ProductUpdate view.
+    # Bootstrap values have no receipt/sequence proof. Live SDK publication is
+    # a separate projection and cannot overwrite this observation's identity.
+    committed: bool = False
+    sdk_current: float | None = None
+    native_publication_pending: bool = False
+    divergence_started_monotonic: float | None = None
+    publication_generation: int = 0
 
 
 class EaseeCommandAdapter:
@@ -164,6 +173,9 @@ class EaseeCommandAdapter:
         self._native_current_source_highwaters: dict[int, datetime] = {}
         self._native_current_errors: dict[int, str] = {}
         self._native_current_changed_at: float | None = None
+        self._native_current_seeded = False
+        self._native_divergence_started: float | None = None
+        self._native_publication_generation = 0
         self._closed = False
         self._request_lock = asyncio.Lock()
         self._request_starts: deque[float] = deque()
@@ -286,6 +298,10 @@ class EaseeCommandAdapter:
             self._native_current_source_highwaters.clear()
             self._native_current_errors.clear()
             self._native_current_changed_at = None
+            self._native_current_seeded = False
+            self._native_divergence_started = None
+            self._native_publication_generation = 0
+        self._seed_native_current()
         if connection is self._hook_connection and identity == self._hook_identity:
             return
         self._hook_generation += 1
@@ -360,6 +376,7 @@ class EaseeCommandAdapter:
         metadata is validated when present, never invented from arrival time.
         An identical cached event does not renew its terminal receipt clock.
         """
+        self._seed_native_current()
         records = payload if type(payload) is list else [payload]
         received = datetime.now(timezone.utc)
         changed = False
@@ -413,6 +430,7 @@ class EaseeCommandAdapter:
             previous_stamp = self._native_current_source_times.get(key)
             previous_receipt = self._native_current_receipts.get(key)
             value_changed = previous_number != number
+            first_observation = previous_receipt is None
             # Timestamp-only cache replies cannot label an intervening new A
             # value as an older A event. A later raw observation can establish
             # a NEW event in an unbound value epoch only when its source UTC is
@@ -422,7 +440,7 @@ class EaseeCommandAdapter:
                 previous_stamp is not None and stamp > previous_stamp
                 or previous_stamp is None and previous_receipt is not None and stamp > previous_receipt
                    and (previous_highwater is None or stamp > previous_highwater))
-            advanced = value_changed or source_advanced
+            advanced = value_changed or source_advanced or first_observation
             recovered = self._native_current_errors.pop(key, None) is not None
             changed = changed or recovered
             if advanced:
@@ -436,10 +454,15 @@ class EaseeCommandAdapter:
                 changed = True
             if value_changed and stamp is None:
                 self._native_current_source_times.pop(key, None)
-            if stamp is not None and (value_changed or previous_stamp is not None or source_advanced):
+            if stamp is not None and (value_changed or previous_stamp is not None or source_advanced or first_observation):
                 self._native_current_source_times[key] = stamp
             if stamp is not None:
                 self._native_current_source_highwaters[key] = stamp
+        # Only a complete valid raw publication can finish a divergence
+        # episode. A poll briefly returning the old tuple cannot renew the
+        # watchdog by making an intermediate getter appear coherent.
+        if seen and not self._native_current_errors and self._sdk_current_tuple() == self._native_current_values:
+            self._native_divergence_started = None
         if changed and callable(self._current_observation_callback):
             try:
                 self._current_observation_callback()
@@ -447,27 +470,59 @@ class EaseeCommandAdapter:
                 # Observer failure cannot break native SDK stream dispatch.
                 pass
 
-    @property
-    def native_current_observation(self) -> NativeCurrentObservation | None:
-        """Return only matched winning-conductor evidence; no HA-time fallback."""
-        if self._resolve_runtime() is not None:
-            return None
-        identity = self._snapshot_source_identity()
-        state = self._product_data.state
+    def _sdk_current_tuple(self) -> dict[int, float] | None:
+        """Read the SDK projection only; never turn a poll into event evidence."""
         try:
+            state = self._product_data.state
             numbers = {key: state[f"inCurrentT{key - 180}"] for key in (182, 183, 184, 185)}
             if any(type(value) not in (int, float) or not isfinite(value) or not 0 <= value <= 1000
                    for value in numbers.values()):
                 raise ValueError("invalid_terminal_current")
-        except (KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return None
+        return numbers
+
+    def _seed_native_current(self) -> None:
+        if not self._native_current_seeded:
+            numbers = self._sdk_current_tuple()
+            if numbers is not None:
+                # A one-time coherent bootstrap tuple supplies numeric bounds,
+                # never a receipt, event sequence, response or fresh authority.
+                self._native_current_values.update(numbers)
+                self._native_current_seeded = True
+
+    @property
+    def native_current_observation(self) -> NativeCurrentObservation | None:
+        """Return a committed raw tuple, independent of earlier HA publication.
+
+        The SDK's first registered handler can publish several native sensors
+        and await unrelated work before our additive handler gets that same
+        batch. Its partial projection is diagnostic, not a replacement clock.
+        """
+        if self._resolve_runtime() is not None:
+            return None
+        identity = self._snapshot_source_identity()
+        sdk = self._sdk_current_tuple()
+        numbers = dict(self._native_current_values)
+        committed = self._native_current_seeded and len(numbers) == 4
+        if not committed:
             return NativeCurrentObservation(None, (), None, identity,
                 error="native_terminal_values_unavailable",
-                observation_sequences=tuple(sorted(self._native_current_sequences.items())),
-                last_tuple_change_monotonic=self._native_current_changed_at)
+                observation_sequences=tuple(sorted(self._native_current_sequences.items())))
         current = max(numbers.values())
         maxima = tuple(key for key in (182, 183, 184, 185) if numbers[key] == current)
-        error = next((self._native_current_errors[key] for key in maxima
-                      if key in self._native_current_errors), None)
+        # Any invalid conductor could have become the maximum. Its previous
+        # lower value cannot hide malformed new input in a committed tuple.
+        error = next((self._native_current_errors[key] for key in sorted(self._native_current_errors)), None)
+        if sdk is not None and sdk != numbers:
+            if self._native_divergence_started is None:
+                self._native_divergence_started = _monotonic()
+                self._native_publication_generation += 1
+        pending = self._native_divergence_started is not None
+        if pending and _monotonic() - self._native_divergence_started >= NATIVE_PUBLICATION_MAX_DIVERGENCE_SECONDS:
+            error = error or "native_publication_diverged"
+        if sdk is None:
+            error = "native_sdk_current_invalid"
         matched = error is None and all(self._native_current_values.get(key) == numbers[key]
                     and key in self._native_current_receipts for key in maxima)
         receipt = min(self._native_current_receipts[key] for key in maxima) if matched else None
@@ -478,7 +533,11 @@ class EaseeCommandAdapter:
                 and key in self._native_current_receipts and key not in self._native_current_errors),
             observation_sequences=tuple(sorted(self._native_current_sequences.items())),
             source_metadata_highwaters=tuple(sorted(self._native_current_source_highwaters.items())),
-            error=error, last_tuple_change_monotonic=self._native_current_changed_at)
+            error=error, last_tuple_change_monotonic=self._native_current_changed_at,
+            committed=True, sdk_current=max(sdk.values()) if sdk is not None else None,
+            native_publication_pending=pending,
+            divergence_started_monotonic=self._native_divergence_started,
+            publication_generation=self._native_publication_generation)
 
     @property
     def reported_limit_receipts(self) -> tuple[float | None, float | None, float | None]:
@@ -552,6 +611,9 @@ class EaseeCommandAdapter:
         self._native_current_source_highwaters.clear()
         self._native_current_errors.clear()
         self._native_current_changed_at = None
+        self._native_current_seeded = False
+        self._native_divergence_started = None
+        self._native_publication_generation = 0
         pending = tuple(self._pending_requests)
         for task in pending:
             task.cancel()

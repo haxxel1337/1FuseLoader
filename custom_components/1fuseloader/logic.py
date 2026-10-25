@@ -116,6 +116,9 @@ class RegulatorInput:
     charger_report_family: str = "legacy"
     charger_report_provenance: Optional[tuple[str | int, ...]] = None
     charger_increase_ready: bool = True
+    # The native SDK may publish HA state before our full raw payload commits.
+    # This fence grants no authority, response credit or additional time.
+    charger_publication_pending: bool = False
     charger_event_source_ts: Optional[float] = None
     charger_event_source_known: bool = False
     charger_observation_report_times: Optional[tuple[tuple[int, float], ...]] = None
@@ -460,6 +463,42 @@ class OneFuseRegulator:
                    and self._reduction_alignment_remaining(now) <= 0):
             return None
         return cap, grid
+
+    def _publication_pending_positive_owner(self, now: float, grid: float, current: float, status: str):
+        """Retain only an existing nominal rise owner through raw publication.
+
+        The caller's finite process-coherence fence is not an electrical
+        response owner. All earlier accepted authority, spent response time,
+        source floors and failures remain exactly as they were.
+        """
+        s = self.settings
+        cap, anchor = self._positive_cap, self._positive_house
+        wall, gt = self._last_input_wall_now_ts, self._last_input_grid_ts
+        identity = self._last_input_control_source_id
+        budget = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+        spent = self._positive_alignment_used_seconds
+        if (not s.enable_dynamic_limit or self._restart_required or self.paused_by_us
+                or status not in START_ALLOWED_STATUSES or not self._last_input_current_trusted
+                or identity is None or identity != self._accepted_control_source_id
+                or cap is None or anchor is None or self.last_target is None
+                or self.last_target[0] != cap or not s.min_charge_amps <= cap <= s.max_charge_amps
+                or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                or _valid_number(anchor) is None or anchor < 0
+                or grid > s.main_fuse_amps-s.buffer_amps or anchor+cap > s.main_fuse_amps-s.buffer_amps
+                or current > cap+.5 or wall is None or gt is None
+                or not 0 <= wall-gt <= s.max_sensor_age_seconds
+                or self._positive_grid_ts is None or gt < self._positive_grid_ts
+                or self._awaiting_reduction_target is not None or self._low_grid_pending
+                or self._low_grid_failure is not None or self._normal_shed_failure is not None
+                or self._normal_shed_deadline is not None
+                or self._uncertainty_ceiling is not None or self._uncertainty_retry_submission_pending
+                or self._overload_transition_started is not None or self._overload_hold_active
+                or not 0 <= spent < budget
+                or self._positive_skew_since is not None and spent+max(0., now-self._positive_skew_since) >= budget
+                or s.enable_soft_guard and grid > s.soft_limit_amps
+                or s.enable_pause_resume and grid > s.pause_limit_amps):
+            return None
+        return cap, anchor
 
     @staticmethod
     def _trial_identity(value: object):
@@ -3065,6 +3104,14 @@ class OneFuseRegulator:
                 should_call = False
                 mode = "waiting_for_stable_current_frame"
                 reason = "Current-conductor reports are still changing; deferring only new positive authority until the bounded quiet period ends."
+            if (inp.charger_publication_pending is True and should_call
+                    and (command == "resume" or command == "set_limit" and target > 0)):
+                # This is before retry reservation. Waiting for the additive
+                # raw observer must spend neither an API attempt nor a lease.
+                # All existing safety/owner deadlines were still evaluated.
+                should_call = False
+                mode = "waiting_for_current_publication"
+                reason = "The native current payload is not yet committed; deferring positive commands without changing source clocks, accepted authority or response deadlines."
             recovery_submission_ts = None
             if (self._uncertainty_restart and command == "set_limit" and target > 0 and should_call):
                 if self._uncertainty_retry_submission_pending:
@@ -3211,6 +3258,18 @@ class OneFuseRegulator:
             self._restart_required = True
             return decision("unavailable", "Accepted positive response source binding changed; requesting 0 A.",
                             "set_limit", emergency=True)
+        publication_owner = (self._publication_pending_positive_owner(now, grid, current, status)
+                             if inp.charger_publication_pending is True else None)
+        if publication_owner is not None:
+            cap, house = publication_owner
+            available = int(floor(min(s.max_charge_amps, s.main_fuse_amps-s.buffer_amps-house)))
+            house_basis = "accepted_positive_owner_during_raw_publication"
+            refresh_required = True
+            self._timer_reached(now, "above_soft_since", False, s.soft_for_seconds)
+            self._timer_reached(now, "above_pause_since", False, s.pause_for_seconds)
+            self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+            return decision("waiting_for_current_publication", "Retaining only the existing live nominal offer and its prior qualified house anchor while the raw payload commits; no command, response credit or additional response time.",
+                            None, cap, self.last_target[3])
         baseline_hold = self._clock_baseline_raw_hold(now, grid, current, status)
         if baseline_hold is not None:
             cap, house = baseline_hold
