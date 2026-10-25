@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0b26
+
+- Match HA's 15-significant-digit numeric representation without adding an
+  ampere tolerance. Retain the selected source's exact current and real receipt
+  instead of discarding its clock because the sensor state was serialized.
+- Commit complete raw conductor records atomically. Native/HA publication can
+  precede the additive observer; it must not mix a new number with old metadata
+  or manufacture a missing-receipt stop during that publication.
+- Fence positive writes during native/raw divergence with one nonrenewable
+  local watchdog of at most one second, bounded by the existing alignment
+  setting. Keep source, peak, zero, lease and original response protections.
+  Invalid raw records on any conductor invalidate the current tuple.
+- Add HA 2026.10.4 to real HA/SDK CI coverage. Preserve all electrical limits,
+  historical exposure/failures and explicit overload-period permissions.
+
 ## 0.4.0b25
 
 - Track the selected charger's individual current observations through the
