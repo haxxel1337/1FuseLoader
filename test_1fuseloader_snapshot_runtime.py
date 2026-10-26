@@ -248,7 +248,7 @@ class SnapshotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.controller.settings.active_control)
         self.assertEqual(self.adapter.calls, [])
 
-    async def test_reconfigure_during_checkpoint_write_cannot_execute_old_command(self):
+    async def test_unchanged_reconfigure_during_checkpoint_keeps_valid_command(self):
         entered, release = asyncio.Event(), asyncio.Event()
         original_save = self.controller._budget_store.async_save
         async def save(state):
@@ -259,11 +259,60 @@ class SnapshotRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.controller.regulator._overload_used_seconds = 1
         tick = asyncio.create_task(self.controller.async_tick())
         await entered.wait()
+        generation = self.controller._generation
         reconfigure = asyncio.create_task(self.controller.async_reconfigure())
         await asyncio.sleep(0)
         release.set()
         await asyncio.gather(tick, reconfigure)
-        self.assertEqual(self.adapter.calls, [])
+        self.assertEqual(self.controller._generation, generation)
+        self.assertEqual(len(self.adapter.calls), 1)
+        self.assertGreater(self.adapter.calls[0].current_p1, 0)
+
+    async def test_real_maximum_change_during_checkpoint_discards_old_higher_plan(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_save = self.controller._budget_store.async_save
+        async def save(state):
+            entered.set()
+            await release.wait()
+            await original_save(state)
+        self.controller._budget_store.async_save = save
+        self.controller.regulator._overload_used_seconds = 1
+        tick = asyncio.create_task(self.controller.async_tick())
+        await entered.wait()
+        generation = self.controller._generation
+        self.entry.options["max_charge_amps"] = 7
+        reconfigure = asyncio.create_task(self.controller.async_reconfigure())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(tick, reconfigure)
+        self.assertGreater(self.controller._generation, generation)
+        self.assertEqual(self.controller.settings.max_charge_amps, 7)
+        self.assertTrue(all(d.current_p1 <= 7 for d in self.adapter.calls))
+
+    async def test_changed_entity_selection_is_not_noop_when_both_hashes_are_none(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_save = self.controller._budget_store.async_save
+        async def save(state):
+            entered.set()
+            await release.wait()
+            await original_save(state)
+        self.controller._budget_store.async_save = save
+        self.controller.regulator._overload_used_seconds = 1
+        tick = asyncio.create_task(self.controller.async_tick())
+        await entered.wait()
+        self.assertIsNone(self.controller._configured_control_identity())
+        self.assertIsNone(self.controller._applied_control_binding)
+        generation = self.controller._generation
+        self.states["sensor.new_car"] = SimpleNamespace(state="0",
+            last_reported=datetime.now(timezone.utc), attributes={"unit_of_measurement":"A"})
+        self.entry.data["charger_current_entity"] = "sensor.new_car"
+        reconfigure = asyncio.create_task(self.controller.async_reconfigure())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(tick, reconfigure)
+        self.assertGreater(self.controller._generation, generation)
+        self.assertIn("sensor.new_car", self.controller._applied_control_selection)
+        self.assertTrue(all(d.current_p1 <= 7 for d in self.adapter.calls))
 
     async def test_new_grid_during_checkpoint_write_cannot_execute_old_increase(self):
         now = datetime.now(timezone.utc)

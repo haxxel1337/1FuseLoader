@@ -235,13 +235,13 @@ class StartMinimumConfirmationControllerTests(unittest.IsolatedAsyncioTestCase):
             if self.controller._refresh_task is not None:
                 await self.controller._refresh_task
         self.assertAlmostEqual(self.controller.last_decision.positive_response_deadline_ts, 160.3, places=6)
-        self.assertEqual(r.last_set_limit_ts, 135.4)
+        self.assertEqual(r.last_set_limit_ts, 135.)  # conservative SDK-dispatch origin
         self.publish(160.3, "charging", 22., 6.4,
             receipt=160.1, grid_at=159.8)
         await self.tick()
         self.assertEqual([d.current_p1 for d in self.adapter.calls], [7])
         self.assertAlmostEqual(self.controller.last_decision.grid_confirmation_deadline_ts, 190.1, places=6)
-        self.assertEqual(r.last_set_limit_ts, 135.4)
+        self.assertEqual(r.last_set_limit_ts, 135.)
 
     async def test_runtime_never_executes_forged_renewal_or_resume_in_confirmation(self):
         for command in ("set_limit", "resume"):

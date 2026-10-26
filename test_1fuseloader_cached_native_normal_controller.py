@@ -175,7 +175,7 @@ class CachedNativeNormalControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("trial_epoch", state)
         self.assertEqual(r.effective_overload_failure_reason, "automatic_cycle_not_admitted")
 
-    async def test_inactive_real_reduction_envelope_keeps_only_same_cap_and_old_response_floors(self):
+    async def test_real_post_dispatch_feedback_then_cached_winner_keeps_only_same_cap(self):
         for at in (100., 160.):
             self.publish(at, "awaiting_start", 4., .012, receipt=None, changed=90.)
             self.pulse()
@@ -189,8 +189,9 @@ class CachedNativeNormalControllerTests(unittest.IsolatedAsyncioTestCase):
         await self.tick()
         r = self.controller.regulator
         self.assertEqual(r.last_target[0], 14)
-        # This trusted numeric value has a source bound BEFORE the14 A ACK.
-        # It can establish the cached measurement, never response to that ACK.
+        # The provider bucket precedes the14 A dispatch, but the genuine local
+        # receipt and sequence advance after actual dispatch. A provider clock
+        # is not the local command clock, so the accepted response can complete.
         self.publish(201., "charging", 22.6, 14.2, receipt=200.7, grid_at=201.)
         self.native_vector(float32(14.2), (182,), {182:200.7, 183:200.8},
             {182:3, 183:3}, 200.8)
@@ -198,7 +199,9 @@ class CachedNativeNormalControllerTests(unittest.IsolatedAsyncioTestCase):
         self.pulse()
         await self.tick()
         self.assertEqual(r._ev_established_value, float32(14.2))
-        self.assertEqual((r._awaiting_reduction_target, r._reduction_previous_cap), (14,16))
+        self.assertEqual((r._awaiting_reduction_target, r._reduction_previous_cap), (None,16))
+        self.assertEqual(r.last_target[0], 14)
+        self.assertFalse(r.export_overload_state()["normal_control"]["response_pending"])
         self.assertIsNone(r._normal_shed_deadline)
         self.assertIsNone(r._settle_started)
         for at in range(230, 1101, 30):
@@ -224,6 +227,7 @@ class CachedNativeNormalControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((r._awaiting_reduction_target, r._reduction_previous_cap,
             r._house_before_reduction, r._reduction_charger_ts), prior)
         self.assertFalse(r._ev_clock_credit)
+
         self.assertEqual(r._ev_established_value, float32(14.2))
         self.assertEqual(self.controller._read_input().charger_report_ts, self.wall(200.8).timestamp())
         self.now = 1109.
@@ -236,6 +240,15 @@ class CachedNativeNormalControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((r._awaiting_reduction_target, r._reduction_previous_cap,
             r._house_before_reduction, r._reduction_charger_ts), prior)
         self.assertFalse(r._ev_clock_credit)
+
+        # Cached reported-state continuity cannot extend an expired lease.
+        expiry = r.last_set_limit_ts+r.last_target[3]
+        self.now = expiry
+        self.grid(18.5)
+        self.pulse()
+        await self.tick()
+        self.assertEqual(self.adapter.calls[-1].current_p1, 0)
+        self.assertEqual(r.last_target[0], 0)
 
     async def test_unsafe_whole_offer_cannot_be_retained_from_old_winner(self):
         await self.established()

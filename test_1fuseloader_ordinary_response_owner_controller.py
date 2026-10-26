@@ -113,6 +113,13 @@ class OrdinaryResponseOwnerControllerTests(unittest.IsolatedAsyncioTestCase):
         self.publish(ramp+12., "charging", 11., 8.,
             receipt=ramp+11.7, grid_at=ramp+12.)
         await self.tick()
+        self.assertEqual(r.last_target[0], 14)
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [15, 7, 14])
+        self.assertEqual((self.controller.last_decision.command,
+            self.controller.last_decision.should_call_service), (None, False))
+        self.now = ramp+17.
+        self.grid(11.)
+        await self.tick()
         self.assertEqual(r.last_target[0], 16, self.controller.last_decision)
         self.assertEqual([d.current_p1 for d in self.adapter.calls], [15, 7, 14, 16])
 

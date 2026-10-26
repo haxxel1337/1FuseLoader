@@ -64,12 +64,21 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_raw_bounded_conflict_holds_lower_offer_past_old_cutoffs(self):
         r = await self.ordinary()
+        original_ack = r.last_set_limit_ts
+        original_observation_end = r._ordinary_lower.observation_deadline
         for at in (211., 226., 240.):
             self.now = at
             self.grid(13.7)
             await self.controller.async_tick()
             self.assertEqual(self.controller.last_decision.current_p1, 7)
-            self.assertEqual(self.controller.last_decision.mode, "ordinary_lower_offer")
+            self.assertIn(self.controller.last_decision.mode,
+                {"ordinary_lower_offer", "ordinary_response_hold"})
+            if self.controller.last_decision.mode == "ordinary_response_hold":
+                self.assertIsNone(self.controller.last_decision.command)
+                self.assertFalse(self.controller.last_decision.should_call_service)
+                self.assertEqual(r.last_set_limit_ts, original_ack)
+                self.assertEqual(self.controller.last_decision.ordinary_response_deadline_ts,
+                    original_observation_end)
             self.assertIsNone(self.controller.last_decision.nominal_response_deadline_ts)
         self.assertTrue(all(d.current_p1 == 7 for d in self.adapter.calls))
         self.assertEqual(r._ordinary_lower.previous, 16)
@@ -95,7 +104,7 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.last_decision.mode, "waiting_for_latest_sources")
         self.assertEqual(self.adapter.calls, [])
         self.assertEqual(r.last_target[0], 16)
-        self.assertIsNone(r._ordinary_lower.accepted_at)
+        self.assertIsNone(r._ordinary_lower)  # known unsent proposal is discarded
         self.assertIsNone(r._low_grid_attempt_at)
         self.assertIsNone(r._normal_shed_attempt_at)
         self.assertFalse(r._uncertainty_retry_submission_pending)

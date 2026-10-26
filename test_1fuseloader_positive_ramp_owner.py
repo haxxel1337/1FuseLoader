@@ -51,16 +51,22 @@ class PositiveRampOwnerTests(unittest.TestCase):
         self.assertEqual(d.measurement_alignment_remaining_seconds, 22.)
         self.assertEqual(r.last_set_limit_ts, 60.)
 
-    def test_direct_provider_event_must_be_post_ack_and_cannot_move_receiver_clock(self):
+    def test_provider_clock_does_not_replace_the_native_receiver_order(self):
         for provider in (59., 60.):
             r = self.bootstrap()
             d = r.evaluate(self.frame(70., grid_at=69., charger_event_source_known=True,
                 charger_event_source_ts=EPOCH+provider))
-            # A genuine new grid may own bounded observation, but an old
-            # provider event supplies NO EV response credit or earlier origin.
+            # A genuine native record owns receiver ordering even when the
+            # associated provider clock predates the HTTP receipt.
             self.assertEqual(d.mode, "positive_ramp_hold")
-            self.assertEqual(d.positive_response_deadline_ts, 94.)
-            self.assertIsNone(r._positive_response_ts)
+            self.assertEqual(d.positive_response_deadline_ts, 92.)
+            self.assertEqual(r._positive_response_ts, EPOCH+67.)
+            self.assertEqual(r._ev_event_source_ts, EPOCH+provider)
+        r = self.bootstrap()
+        older = r.evaluate(self.frame(70., grid_at=69., receipt=59.,
+            charger_event_source_known=True, charger_event_source_ts=EPOCH+59.))
+        self.assertEqual(older.positive_response_deadline_ts, 94.)
+        self.assertIsNone(r._positive_response_ts)
         r = self.bootstrap()
         future = r.evaluate(self.frame(70., grid_at=69., charger_event_source_known=True,
             charger_event_source_ts=EPOCH+76.))

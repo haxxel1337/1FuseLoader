@@ -127,7 +127,7 @@ class ExpiredStartHandoffControllerTests(unittest.IsolatedAsyncioTestCase):
         await self.expire(deadline)
         self.assert_lower_ack(r, cap)
 
-    async def test_event_during_lower_http_call_cannot_prove_the_not_yet_accepted_lower(self):
+    async def test_post_dispatch_event_during_http_can_qualify_only_after_actual_ack(self):
         r, cap, deadline = await self.late_partial()
         self.adapter.gate = asyncio.Event()
         self.adapter.entered.clear()
@@ -147,7 +147,10 @@ class ExpiredStartHandoffControllerTests(unittest.IsolatedAsyncioTestCase):
         self.grid(11.)
         await self.tick()
         self.assertEqual(r.last_target[0], 7)
-        self.assertIsNone(r._ordinary_lower.first_response)
+        # The pre-ACK tick above had no accepted7 A permission. Once HTTP
+        # succeeds, the genuine post-dispatch frame plus later grid can retire
+        # that observation without asking for another changed current event.
+        self.assertIsNone(r._ordinary_lower)
         self.assertIsNone(r._minimum_confirmation)
         self.assertEqual([d.current_p1 for d in self.adapter.calls], [cap, 7])
 

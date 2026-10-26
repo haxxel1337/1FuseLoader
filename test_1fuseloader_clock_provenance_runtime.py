@@ -276,14 +276,18 @@ class ClockProvenanceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(inp.charger_event_source_ts, self.wall(accepted_at).timestamp())
         await self.steady_cache()
 
-    async def test_pre_ack_source_event_cannot_acknowledge_post_ack_native_response(self):
+    async def test_provider_before_ack_does_not_hide_actual_post_dispatch_native_response(self):
         accepted_at = await self.bootstrap_response(source_offset=-1)
         inp = self.controller._read_input()
         self.assertGreater(inp.charger_report_ts, self.wall(accepted_at).timestamp())
         self.assertLess(inp.charger_event_source_ts, self.wall(accepted_at).timestamp())
         regulator = self.controller.regulator
-        self.assertFalse(regulator._ev_advanced_since(regulator._positive_ev_ts, '_positive_ev_ts'))
-        self.assertIsNone(regulator._positive_response_ts)
+        # Provider UTC is a coarse source clock, not the local dispatch clock.
+        # This actual seq0->seq1 observation arrived after real SDK entry.
+        self.assertTrue(regulator._ev_advanced_since(regulator._positive_ev_ts, '_positive_ev_ts'))
+        self.assertIsNone(regulator._positive_cap)
+        self.assertEqual(regulator._ev_established_value, 16.)
+        self.assertEqual(regulator.last_target[0], 16)
 
     async def test_new_zero_proof_requires_source_event_after_command_when_available(self):
         self.controller.last_accepted_limit = dict(started_at_utc=self.wall(99).isoformat())

@@ -73,8 +73,12 @@ class RawBudgetRecoveryTests(unittest.TestCase):
         ev = self.sample(r, 208, 16.5, 12.05, et=208, gt=207, sequence=3, accept=False)
         self.assertEqual(ev.current_p1, 12)
         later = self.sample(r, 210, 16.5, 12.05, et=208, sequence=3, accept=False)
-        self.assertEqual(later.current_p1, 16)
-        self.assertTrue(later.should_call_service)
+        self.assertEqual((later.mode, later.current_p1, later.command), ("normal_continuity", 12, None))
+        self.assertFalse(later.should_call_service)
+        self.assertIsNone(r._positive_cap)
+        rise = self.sample(r, 211, 16.5, 12.05, et=208, sequence=3, accept=False)
+        self.assertEqual(rise.current_p1, 16)
+        self.assertTrue(rise.should_call_service)
         self.assertEqual(r.export_overload_state()["failure_reason"], "response_timeout")
         self.assertNotIn("trial_epoch", r.export_overload_state())
 
@@ -84,7 +88,10 @@ class RawBudgetRecoveryTests(unittest.TestCase):
         first = self.sample(r, 207, 10.5, 12.05, et=207, gt=205, sequence=3, accept=False)
         self.assertEqual((first.current_p1, first.command), (12, None))
         later = self.sample(r, 210, 16.5, 12.05, et=207, sequence=3, accept=False)
-        self.assertEqual(later.current_p1, 16)
+        self.assertEqual((later.current_p1, later.command), (12, None))
+        self.assertIsNone(r._positive_cap)
+        rise = self.sample(r, 211, 16.5, 12.05, et=207, sequence=3, accept=False)
+        self.assertEqual(rise.current_p1, 16)
 
     def test_bootstrap_numeric_only_tuple_needs_one_actual_post_ack_event(self):
         r = self.regulator()
@@ -95,7 +102,10 @@ class RawBudgetRecoveryTests(unittest.TestCase):
         self.assertEqual((pending.current_p1, pending.command), (12, None))
         self.sample(r, 43, 16.5, 12.05, et=43, gt=42, sequence=1, accept=False)
         done = self.sample(r, 45, 16.5, 12.05, et=43, sequence=1, accept=False)
-        self.assertEqual(done.current_p1, 16)
+        self.assertEqual((done.current_p1, done.command), (12, None))
+        self.assertIsNone(r._positive_cap)
+        rise = self.sample(r, 46, 16.5, 12.05, et=43, sequence=1, accept=False)
+        self.assertEqual(rise.current_p1, 16)
 
     def test_declines_missing_opt_in_commit_trust_identity_or_complete_tuple(self):
         cases = [dict(charger_native_committed=False), dict(charger_native_committed="yes"),

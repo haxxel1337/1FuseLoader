@@ -104,12 +104,14 @@ class RawMinimumHandoffTests(unittest.TestCase):
         first = self.handoff(regulator, accept=False)
         self.assertAlmostEqual(first.nominal_response_deadline_ts, 240, places=6)
         for at in (233, 236, 239):
-            attempted = self.handoff(regulator, now=at, gt=at-.1, et=at-.2,
+            # This pair does NOT independently prove the still accepted13A
+            # cap fits normal headroom. The unsent minimum keeps its clock.
+            attempted = self.handoff(regulator, now=at, grid=22., current=5., gt=at-.1, et=at-.2,
                                      sequence=4+int(at), accept=False)
             self.assertEqual(attempted.current_p1, 7)
             self.assertEqual(attempted.nominal_response_deadline_ts, first.nominal_response_deadline_ts)
             self.assertEqual(regulator.last_target[0], 13)
-        stopped = self.handoff(regulator, now=first.nominal_response_deadline_ts, et=239.8, gt=239.9,
+        stopped = self.handoff(regulator, now=first.nominal_response_deadline_ts, grid=22., current=5., et=239.8, gt=239.9,
                                sequence=300, accept=False)
         self.assertEqual(stopped.current_p1, 0)
         self.assertTrue(regulator._restart_required)
@@ -123,8 +125,19 @@ class RawMinimumHandoffTests(unittest.TestCase):
         self.assertEqual(reported.current_p1, 7)
         self.assertIsNone(regulator._normal_shed_accepted_at)
         self.assertIsNone(regulator._minimum_confirmation)
-        stopped = self.helper.sample(regulator, regulator._normal_shed_deadline, 15.1, 7.1,
+        # A later grid can prove the OLD actual13A normal offer independently;
+        # it never claims that the unsent7A command was accepted or responded.
+        normal = self.helper.sample(regulator, regulator._normal_shed_deadline, 15.1, 7.1,
             et=234, gt=239, sequence=4, accept=False)
+        self.assertEqual((normal.mode, normal.current_p1, normal.command), ("normal_continuity", 13, None))
+        self.assertEqual(regulator.last_target[0], 13)
+        self.assertIsNone(regulator._normal_shed_accepted_at)
+        self.assertIsNone(regulator._minimum_confirmation)
+        regulator = self.prepared()
+        first = self.handoff(regulator, accept=False)
+        self.helper.sample(regulator, 235, 15.1, 7.1, et=234, gt=233, sequence=4, accept=False)
+        stopped = self.helper.sample(regulator, first.nominal_response_deadline_ts, 15.1, 7.1,
+            et=234, gt=233, sequence=4, accept=False)
         self.assertEqual(stopped.current_p1, 0)
 
     def test_late_ack_cannot_purchase_another_minimum_response_window(self):

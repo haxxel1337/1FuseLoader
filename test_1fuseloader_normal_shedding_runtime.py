@@ -278,7 +278,8 @@ class NormalSheddingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.async_tick()
         self.assertEqual(len(self.adapter.calls), count)
         recovery = self.regulator.export_overload_state()["normal_control"]
-        self.assertEqual(recovery["stops"], 2)
+        # No actual SDK entry occurred, so the old one real stop is preserved.
+        self.assertEqual(recovery["stops"], 1)
         self.assertFalse(recovery["retry_submission_pending"])
 
 

@@ -154,6 +154,15 @@ class AutomaticNormalRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.now = 305.
         self.grid(16.)
         await self.controller.async_tick()
+        # Qualifying the accepted12 A offer discharges measurement work;
+        # it does not authorize a higher offer in that same evaluation.
+        self.assertEqual((self.controller.last_decision.current_p1,
+            self.controller.last_decision.command), (12, None))
+        self.assertEqual(r.last_set_limit_ts, 300.)
+        self.assertEqual(self.adapter.calls, [])
+        self.now = 310.
+        self.grid(16.)
+        await self.controller.async_tick()
         self.assertEqual([v.current_p1 for v in self.adapter.calls], [16])
         self.assert_history(r)
 
@@ -218,22 +227,25 @@ class AutomaticNormalRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.calls[-1].current_p1, 0)
         self.assertEqual(r._positive_raw_deadline, None)
 
-    async def test_automatic_ready_retains_only_live_fifteen_for_one_source_cohort(self):
+    async def test_automatic_ready_retains_live_fifteen_inside_original_normal_bound(self):
         r = await self.reduction_cohort()
         await self.controller.async_tick()
         d = self.controller.last_decision
-        self.assertEqual((d.current_p1, d.command, d.should_call_service), (15, None, False))
-        self.assertEqual(d.mode, "waiting_for_current_cohort")
+        self.assertEqual((d.current_p1, d.should_call_service), (15, False))
+        self.assertEqual(d.mode, "normal")
         self.assertEqual(self.adapter.calls, [])
         self.assertEqual(r.last_set_limit_ts, 195.)
-        self.assertAlmostEqual(d.source_processing_deadline_ts, 201.36, places=6)
+        self.assertIsNone(d.source_processing_deadline_ts)
+        self.assertEqual(r._committed_normal.observation_deadline, 220.)
+        self.assertLessEqual(r._committed_normal.house + r._committed_normal.unresolved_cap, 23.)
         self.assert_history(r)
 
     async def test_same_cohort_with_automatic_off_preserves_existing_hold(self):
         r = await self.reduction_cohort(False)
         await self.controller.async_tick()
         self.assertEqual((self.controller.last_decision.current_p1,
-            self.controller.last_decision.command), (15, None))
+            self.controller.last_decision.should_call_service), (15, False))
+        self.assertEqual(r.last_set_limit_ts, 195.)
         self.assertEqual(self.adapter.calls, [])
         self.assert_history(r, False)
 
@@ -245,7 +257,9 @@ class AutomaticNormalRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     await self.asyncSetUp()
                 r = await self.reduction_cohort()
                 if invalid == "raw":
-                    self.grid(24.)
+                    # A partial ordinary batch below25 A can use its bounded
+                    # cohort fence. Actual above-nominal load must leave it.
+                    self.grid(25.01)
                 elif invalid == "lease":
                     self.now = r.last_set_limit_ts+r.last_target[3]+.1
                     self.grid(21.)
@@ -261,17 +275,18 @@ class AutomaticNormalRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(self.controller.last_decision.mode, "waiting_for_current_cohort")
                 self.assertFalse(any(v.current_p1 == 15 for v in self.adapter.calls))
 
-    async def test_cohort_churn_cannot_restart_one_second_fence_or_renew_lease(self):
+    async def test_cohort_churn_cannot_refill_committed_observation_or_renew_lease(self):
         r = await self.reduction_cohort()
         await self.controller.async_tick()
-        deadline = self.controller.last_decision.source_processing_deadline_ts
+        deadline = r._committed_normal.observation_deadline
+        self.assertEqual(deadline, 220.)
         self.now = 200.75
         self.grid(21., 200.7)
         self.native_vector(float32(16.139), (183,), {182: 200.70, 183: 173.},
             {182: 4, 183: 2}, 200.70)
         await self.controller.async_tick()
         self.assertEqual(self.controller.last_decision.current_p1, 15)
-        self.assertEqual(self.controller.last_decision.source_processing_deadline_ts, deadline)
+        self.assertEqual(r._committed_normal.observation_deadline, deadline)
         self.assertEqual(self.adapter.calls, [])
         self.assertEqual(r.last_set_limit_ts, 195.)
         self.now = deadline
@@ -279,9 +294,11 @@ class AutomaticNormalRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.native_vector(float32(16.139), (183,), {182: deadline-.05, 183: 173.},
             {182: 5, 183: 2}, deadline-.05)
         await self.controller.async_tick()
-        self.assertNotEqual(self.controller.last_decision.mode, "waiting_for_current_cohort")
-        self.assertFalse(any(v.current_p1 == 15 for v in self.adapter.calls))
-        self.assertIn(r._reduction_processing_deadline, (None, deadline))
+        # A partial native update cannot create a fresh processing interval
+        # after the original accepted lower observation budget is exhausted.
+        self.assertEqual([v.current_p1 for v in self.adapter.calls], [0])
+        self.assertEqual(r.last_target[0], 0)
+        self.assertIsNone(r._committed_normal)
 
 
 if __name__ == "__main__":

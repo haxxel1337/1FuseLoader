@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.0b36
+
+- Keep committed normal command authority separate from proposed changes.
+  One shared normal-operating proof can preserve the accepted cap across
+  delayed reports, connected waiting labels and unfinished metadata writes.
+  It grants no increase, resume, lease renewal or overload permission.
+- Preserve a qualified accepted normal decrease through an incomplete native
+  publication/cohort at nominal grid load, using the existing fixed one-second
+  processing fence and original response/lease bounds. A completed coherent
+  pair can independently qualify the same cap during a pending checkpoint.
+- Pin native event baselines at actual SDK dispatch, before the HTTP reply.
+  Compare provider timestamps within their own domain; a coarse provider
+  timestamp need not be later than the local acknowledgement. Genuine in-flight
+  observations retain their original response time and electrical deadline.
+- Handle ordered native value changes inside one provider timestamp bucket.
+  Duplicate and ambiguous repeated values receive no new response credit;
+  replay, future-clock, source-binding and numeric checks remain in force.
+- Distinguish a proven local refusal before SDK dispatch from an ambiguous
+  dispatched command. Defer locally refused work without inventing an API
+  attempt, protective zero or retry debit. Reserve request capacity for real
+  protective minimum decreases and zero commands within the existing SDK
+  circuit-limit quota.
+- Validate configuration before canceling in-flight work, make identical
+  settings updates inert, enforce effective automatic-profile current bounds,
+  and handle an absent raw-restart observation without a background exception.
+- Save a small private native-event timeline at an incident, including offered
+  pilot zero before a software stop. Normal diagnostic telemetry stays in memory and does
+  not create periodic journal writes or control evaluations.
+- Add an independent synthetic plant and virtual event scheduler covering
+  source clocks, partial ramps, HTTP/Store delays, physical TTL and electrical
+  protection. Installation still requires supervised physical verification.
+
 ## 0.4.0b35
 
 - Let a qualified expired startup hand off to an independently raw-bounded
