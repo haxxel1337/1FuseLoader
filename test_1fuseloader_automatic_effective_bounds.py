@@ -2,7 +2,7 @@
 from copy import deepcopy
 from dataclasses import replace
 import importlib
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
 
@@ -70,8 +70,20 @@ class EffectiveAutomaticBoundsRealHATests(unittest.IsolatedAsyncioTestCase):
     asyncSetUp = ha.RealHomeAssistantTests.asyncSetUp
     asyncTearDown = ha.RealHomeAssistantTests.asyncTearDown
 
+    def profile_entry(self):
+        # Real HA deliberately exposes immutable entry options. Configure a
+        # real entry through the same public constructor as the base fixture.
+        entry = self.entry
+        return type(entry)(
+            version=entry.version, minor_version=entry.minor_version,
+            domain=entry.domain, title=entry.title, data=dict(entry.data),
+            options={**entry.options, **PROFILE}, source=entry.source,
+            unique_id=entry.unique_id, discovery_keys=MappingProxyType({}),
+            subentries_data=None,
+        )
+
     async def test_options_flow_rejects_effectively_non_seven_profile_atomically(self):
-        self.entry.options.update(PROFILE)
+        self.entry = self.profile_entry()
         self.hass.config_entries = SimpleNamespace(async_get_known_entry=lambda _: self.entry)
         for change in ({"min_charge_amps": 8}, {"max_charge_amps": 6}):
             with self.subTest(change=change):
@@ -84,7 +96,7 @@ class EffectiveAutomaticBoundsRealHATests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(dict(self.entry.options), previous)
 
     async def test_numbers_reject_invalid_effective_profile_before_controller_update(self):
-        self.entry.options.update(PROFILE)
+        self.entry = self.profile_entry()
         numbers = importlib.import_module("custom_components.1fuseloader.number")
         for key, value in (("min_charge_amps", 8), ("max_charge_amps", 6)):
             with self.subTest(key=key):
