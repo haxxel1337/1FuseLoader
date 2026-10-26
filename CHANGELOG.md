@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0b33
+
+- Permit independently raw-bounded normal recovery while an automatic
+  overload cycle has not been admitted. This prevents a steady low-current
+  EV report from leaving the accepted cap stuck solely because the extra
+  overload allowance is unavailable. No uncertain EV current is subtracted.
+- Preserve the existing one-second, no-write native publication hold for
+  an accepted normal decrease under that same automatic-cycle condition.
+  Its original lease, household anchor, source checks and fixed deadline
+  remain binding. This grants no renewal, increase or overload permission.
+
 ## 0.4.0b32
 
 - Add default-off Charging Readiness While Disconnected. Fresh raw grid
