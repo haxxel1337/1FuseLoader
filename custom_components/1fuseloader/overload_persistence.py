@@ -62,6 +62,18 @@ class OverloadBudgetStore:
     def last_error_type(self) -> str | None:
         return self._gate.error_type
 
+    @property
+    def verification_pending(self) -> bool:
+        return self._gate.pending is not None and not self._gate.pending.done()
+
+    def add_pending_callback(self, callback: Callable[[asyncio.Task], None]) -> bool:
+        """Observe completion without cancelling or bypassing the shared gate."""
+        if not self.verification_pending:
+            return False
+        assert self._gate.pending is not None
+        self._gate.pending.add_done_callback(callback)
+        return True
+
     @staticmethod
     def fingerprint(value: Any) -> str:
         """Hash every field without rounding away running exposure."""

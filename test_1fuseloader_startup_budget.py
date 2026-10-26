@@ -165,7 +165,8 @@ class StartupBudgetTests(unittest.IsolatedAsyncioTestCase):
                 fixtures.runtime.EXPOSURE_STORE_TIMEOUT_SECONDS * 2, release.set)
             await starting
             self.assertTrue(self.controller._budget_loaded)
-            self.assertEqual(self.controller._budget_error, "overload_budget_save_failed")
+            self.assertEqual(self.controller._budget_error, "overload_budget_save_pending")
+            self.assertTrue(self.controller._budget_store.verification_pending)
             self.assertEqual(self.controller._budget_error_type, "TimeoutError")
             self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
             pending = self.controller._budget_store._gate.pending
