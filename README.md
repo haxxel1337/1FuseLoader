@@ -70,6 +70,53 @@ binding changes, invalid clocks, actual peaks and stronger guards retain
 priority. Neither path admits a cycle, refunds exposure or extends an overload
 deadline.
 
+### Startup expiry and accepted minimum confirmation (b35)
+
+An expired accepted startup offer can hand off to an independently safe
+strictly lower ordinary offer. This is considered even if a partial EV report
+is numerically consistent with the grid but still lacks a later meter sample.
+The entire lower offer must fit beside fresh raw grid current within the
+normal buffer. This ends the old startup owner without granting more time or
+retaining the expired higher offer. The earlier higher authority remains
+recorded until the actual lower ACK and subsequent physical-report evidence.
+
+After that lower ACK, the same decrease can retain only its accepted cap
+through delayed feedback from the previous higher offer. Its conservative
+whole-raw proposal anchor, source-aged observation end and original lower
+lease are fixed. Fresh raw L1 must remain at or below the main fuse rating;
+waiting sends no write, renewal, increase or resume and subtracts no uncertain
+EV current. A higher raw load is delegated to the existing overload and peak
+policy. This observation phase cannot grant a 29 A allowance or restart an
+electrical response clock.
+
+An already accepted startup minimum of at most 7 A can use the configured
+shared grid-confirmation phase when a genuine native post-ACK response
+qualified within the original startup window. The first qualifying response
+owns its fixed grid deadline, capped by the existing lease. A copied GET,
+late response or same-cap renewal cannot create another window. This is the
+same configured post-minimum confirmation duration used by the other response
+routes, not an extension of the original startup window or permission to
+hold a higher startup offer for longer.
+
+Both waiting routes use absolute watchdogs and prohibit charger calls.
+Checkpoint completion rechecks the latest sources and the original deadline;
+a later proposal cannot silently replace the retained accepted cap. Restoring
+an interrupted pending observation does not resume it with fresh time.
+Invalid sources, changed bindings, expired authority, actual peaks and stronger
+configured guards retain priority. Physical current and power must still be
+observed after activation.
+
+An established normal offer can also survive a change between already known
+cached native current records. The original native receiver, report family,
+source binding and replay-clean observation vector must still match. The
+lower of the established and cached current values gives a conservative
+subtraction floor, and any retained house-load bound remains a lower bound.
+The entire existing offer must still fit the normal buffered budget. This
+only retains or renews the same accepted cap: it does not create a new current
+measurement, authorize an increase or restart, retire an unresolved reduction,
+or bypass an active response owner. A new receiver, invalid clocks, replay,
+insufficient budget or stronger guard still rejects this continuation.
+
 ### Charging readiness while disconnected (b32, explicit opt-in)
 
 **Charging Readiness While Disconnected** (`disconnected_readiness`) is off by

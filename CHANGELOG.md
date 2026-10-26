@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0b35
+
+- Let a qualified expired startup hand off to an independently raw-bounded
+  lower offer even when its partial current and grid values look numerically
+  consistent. Keep the previous higher authority unresolved until the new
+  lower acknowledgement and genuine response are observed.
+- Preserve that accepted decrease through delayed higher-current feedback
+  with its frozen proposal anchor, source-aged observation budget and finite
+  lease. Waiting makes no charger call and grants no overload permission.
+- Connect an already accepted minimum of at most 7 A to the configured
+  shared grid-confirmation phase after a timely genuine minimum response.
+  Its first response owns the fixed deadline; renewals and late feedback
+  cannot extend it or revive it after expiry.
+- Apply absolute watchdogs, hard no-write guards, checkpoint revalidation and
+  conservative interrupted-state restore to these observation handoffs.
+- Preserve an already established normal cap across a replay-clean cached
+  native MAX-winner change only when that entire existing offer still fits
+  the buffered budget. Keep the original receiver provenance and conservative
+  current/house bounds; grant no increase, restart or response credit.
+- Include the resolved house basis and transition proof context in the
+  private stop journal to distinguish these decisions from charger-first
+  interruptions.
+
 ## 0.4.0b34
 
 - Keep an already accepted startup/rise response with its existing owner
