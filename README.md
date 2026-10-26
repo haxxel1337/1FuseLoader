@@ -50,6 +50,26 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Normal recovery beside an unadmitted automatic cycle (b33)
+
+An automatic overload cycle that has not qualified grants no extra overload
+permission. That condition alone does not veto separately proved normal
+operation. With the explicit verified import-only option, an already accepted
+7 A offer beside fresh raw L1 of 11 A can qualify a conservative 12 A offer:
+the entire proposed offer plus raw grid current fits the 23 A normal buffer,
+without subtracting old EV current. A genuine vehicle response and later grid
+feedback can then qualify further normal recovery. A matching cloud read
+still cannot manufacture a new native current event or permission to jump
+directly to maximum.
+
+The same distinction preserves the existing native publication hold during
+an already accepted normal decrease. It retains that cap without an API call
+for its original fixed interval of at most one second, bounded by the original
+lease and remaining observation budget. Churn cannot renew it. Source faults,
+binding changes, invalid clocks, actual peaks and stronger guards retain
+priority. Neither path admits a cycle, refunds exposure or extends an overload
+deadline.
+
 ### Charging readiness while disconnected (b32, explicit opt-in)
 
 **Charging Readiness While Disconnected** (`disconnected_readiness`) is off by

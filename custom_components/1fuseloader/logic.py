@@ -702,7 +702,7 @@ class OneFuseRegulator:
                 or self._low_grid_pending or self._low_grid_failure is not None
                 or self._normal_shed_deadline is not None or self._normal_shed_failure is not None
                 or self._overload_transition_started is not None or self._overload_hold_active
-                or self.effective_overload_failure_reason not in {None, "response_timeout", "cumulative_budget_exhausted"}
+                or self.effective_overload_failure_reason not in {None, "response_timeout", "cumulative_budget_exhausted", "automatic_cycle_not_admitted"}
                 or wall is None or gt is None or not 0 <= wall-gt < min(s.measurement_settle_seconds, s.max_sensor_age_seconds)):
             return None
         if self._ev_event_source_known and (self._ev_event_source_ts is None or self._ev_event_source_ts > wall+5):
@@ -754,7 +754,7 @@ class OneFuseRegulator:
                 or self._positive_cap is not None or self._normal_shed_deadline is not None
                 or self._normal_shed_failure is not None or self._low_grid_pending or self._low_grid_failure is not None
                 or self._overload_transition_started is not None or self._overload_hold_active
-                or self.effective_overload_failure_reason not in {None, "response_timeout", "cumulative_budget_exhausted"}
+                or self.effective_overload_failure_reason not in {None, "response_timeout", "cumulative_budget_exhausted", "automatic_cycle_not_admitted"}
                 or reason not in {None, "charger_receipt_stale", "report_skew_exceeds_alignment_window"}
                 or self._fast_sources_fresh()):
             return reject()
