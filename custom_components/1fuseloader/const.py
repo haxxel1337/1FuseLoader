@@ -51,6 +51,7 @@ OPT_NOMINAL_IMPORT_ONLY_FALLBACK = "nominal_import_only_fallback"
 OPT_BOUNDED_NOMINAL_SHEDDING = "bounded_nominal_shedding"
 OPT_PEAK_ONLY_RESPONSE = "peak_only_response"
 OPT_AUTOMATIC_OVERLOAD_CYCLES = "automatic_overload_cycles"
+OPT_DISCONNECTED_READINESS = "disconnected_readiness"
 OPT_ENABLE_DYNAMIC_LIMIT = "enable_dynamic_limit"
 OPT_ENABLE_SOFT_GUARD = "enable_soft_guard"
 OPT_ENABLE_PAUSE_RESUME = "enable_pause_resume"
@@ -99,6 +100,8 @@ DEFAULT_OPTIONS = {
     OPT_PEAK_ONLY_RESPONSE: False,
     # Separate automatic lifecycle; the default/manual exposure policy stays unchanged.
     OPT_AUTOMATIC_OVERLOAD_CYCLES: False,
+    # Keep only a normally buffered offer ready; this grants no overload authority.
+    OPT_DISCONNECTED_READINESS: False,
     OPT_ENABLE_DYNAMIC_LIMIT: True,
     OPT_ENABLE_SOFT_GUARD: True,
     OPT_ENABLE_PAUSE_RESUME: True,

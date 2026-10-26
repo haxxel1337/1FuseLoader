@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0b32
+
+- Add default-off Charging Readiness While Disconnected. Fresh raw grid
+  headroom can prepare a finite normal limit before plug-in, without cached
+  EV subtraction, overload permission or start/resume commands.
+- Carry a genuinely acknowledged readiness offer into a healthy connected
+  startup without an idle restart delay or an intervening zero. Preserve its
+  original lease, source identity and protective barriers; cached EV values
+  are not a new vehicle response.
+- Withhold a proposed normal increase during pending checkpoint verification
+  while retaining a separately proved, already accepted normal offer. This
+  sends no charger call and extends no lease.
+
 ## 0.4.0b31
 
 - Preserve an already accepted startup/rise offer through partial vehicle
