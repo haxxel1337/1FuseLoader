@@ -360,10 +360,6 @@ class OneFuseLoaderController:
             self.control_block_reason = command_adapter.control_block_reason
 
     @property
-    def name(self) -> str:
-        return self.entry.title
-
-    @property
     def settings(self) -> RegulatorSettings:
         return self.regulator.settings
 

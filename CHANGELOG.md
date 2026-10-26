@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0b30
+
+- Remove unused internal state and the unused controller name property, while
+  retaining saved-option and frozen-policy compatibility.
+- Make manual trial buttons unavailable during automatic overload cycles.
+  Availability follows live controller updates; direct stale-UI calls are
+  rejected before any manual transaction or charger action.
+- Remove help labels for already hidden legacy options and correct outdated
+  import-fallback, ordinary-response and legacy 6 A wording. Current electrical
+  thresholds, response rules and exposure accounting are unchanged.
+
 ## 0.4.0b29
 
 - Add default-off **Automatic Overload Cycles**, requiring the peak-triggered

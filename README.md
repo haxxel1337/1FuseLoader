@@ -60,6 +60,10 @@ profile grants extra overload permission only for a 25 A main fuse, an EV offer
 of at most 7 A and a sustained raw L1 ceiling of at most 29 A. Independently
 proven normal offers may still use the normal buffered capacity. An already accepted lower offer is
 never raised merely to enter this mode, and an idle vehicle is not started.
+The manual **Start New Overload Trial (7 A)** and **End Overload Trial** buttons
+are unavailable in automatic mode. Their availability updates when the mode
+changes; a direct call from an outdated UI is also rejected before any manual
+trial transaction or charger action.
 
 | Phase | Observation and effect |
 | --- | --- |
@@ -416,7 +420,10 @@ guarantee is made.
 
 With the existing default-off **verified import-only** option enabled, a
 source-bound low-grid/EV conflict can reduce a live accepted cap to 7 A for
-one fixed window of at most ten seconds. The whole 7 A offer must fit below
+one fixed window of at most ten seconds under the default response policy.
+With peak-triggered response selected, ordinary observation has no invented
+electrical ten-second deadline; actual raw peaks retain their separate bound.
+The whole 7 A offer must fit below
 the fresh raw-grid normal ceiling without subtracting EV current. A genuinely
 advanced EV event and later coherent grid event complete alignment. GETs,
 renewals, changing measurements and restarts cannot grant a new window.
@@ -703,7 +710,9 @@ The operational limits below are not a fuse time/current curve or certification
 that a particular installation may run overloaded. Leave physical protection
 in place.
 
-The default experimental profile for a configured 25 A main fuse is:
+The default/manual experimental profile with `peak_only_response=False` and
+a configured 25 A main fuse is shown below. Its legacy 6 A example is separate
+from the selected 7 A peak-triggered/automatic profile described above.
 
 | Setting | Default | Behavior |
 | --- | --- | --- |
