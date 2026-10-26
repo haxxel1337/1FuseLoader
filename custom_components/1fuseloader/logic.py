@@ -2430,7 +2430,6 @@ class OneFuseRegulator:
         self._uncertainty_ceiling: Optional[int] = None
         self._uncertainty_previous_offer: Optional[int] = None
         self._uncertainty_recovery_since: Optional[float] = None
-        self._uncertainty_recovery_ev_ts: Optional[float] = None
         self._uncertainty_recovery_grid_ts: Optional[float] = None
         self._uncertainty_recovery_epochs = 0
         self._uncertainty_stops = 0
@@ -2475,16 +2474,14 @@ class OneFuseRegulator:
         if not valid:
             self._uncertainty_recovery_since = None
             self._uncertainty_recovery_epochs = 0
-            self._uncertainty_recovery_ev_ts = self._uncertainty_recovery_grid_ts = None
+            self._uncertainty_recovery_grid_ts = None
             return False
         if self._uncertainty_recovery_since is None:
             self._uncertainty_recovery_since = now
             self._uncertainty_recovery_epochs = 1
-            self._uncertainty_recovery_ev_ts = self._last_input_charger_ts
             self._uncertainty_recovery_grid_ts = self._last_input_grid_ts
         elif self._last_input_grid_ts > self._uncertainty_recovery_grid_ts:
             self._uncertainty_recovery_epochs += 1
-            self._uncertainty_recovery_ev_ts = self._last_input_charger_ts
             self._uncertainty_recovery_grid_ts = self._last_input_grid_ts
         if now - self._uncertainty_recovery_since < 30 or self._uncertainty_recovery_epochs < 2:
             return False
@@ -3284,16 +3281,10 @@ class OneFuseRegulator:
         self._clear_minimum_confirmation("overload")
         self._overload_transition_started: Optional[float] = None
         self._overload_entry_grid_ts: Optional[float] = None
-        self._overload_entry_charger_ts: Optional[float] = None
         self._overload_anchor_house: Optional[float] = None
         self._overload_minimum_response_ts: Optional[float] = None
         self._overload_minimum_response_monotonic: Optional[float] = None
         self._overload_grid_confirmation_deadline: Optional[float] = None
-        self._overload_grid_confirmation_floor: Optional[float] = None
-        self._overload_grid_confirmation_value: Optional[float] = None
-        self._overload_grid_confirmation_last_ev_ts: Optional[float] = None
-        self._overload_grid_confirmation_last_grid_ts: Optional[float] = None
-        self._overload_grid_confirmation_source_id = None
         self._overload_minimum_accepted_at: Optional[float] = None
         self._overload_minimum_ev_floor: Optional[float] = None
         self._overload_minimum_attempted_at: Optional[float] = None
@@ -3618,8 +3609,6 @@ class OneFuseRegulator:
                 window = self._minimum_confirmation
                 if window is not None:
                     self._overload_grid_confirmation_deadline = window.deadline
-                    self._overload_grid_confirmation_floor = window.floor
-                    self._overload_grid_confirmation_value = window.value
                 if outcome == "complete":
                     house = basis
                     if peak_policy:
@@ -3729,7 +3718,6 @@ class OneFuseRegulator:
             return stop("response_timeout")
         self._overload_transition_started = origin
         self._overload_entry_grid_ts = self._last_input_grid_ts
-        self._overload_entry_charger_ts = self._last_input_charger_ts
         self._overload_anchor_house = house
         self._increase_since = None
         return ("overload_shedding", "Requesting minimum current; a bounded transition starts now, including API latency.",

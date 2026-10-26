@@ -84,7 +84,8 @@ class RealHomeAssistantTests(unittest.IsolatedAsyncioTestCase):
         module = importlib.import_module("custom_components.1fuseloader.button")
         controller = SimpleNamespace(async_start_overload_trial=AsyncMock(),
                                      async_end_overload_trial=AsyncMock(),
-                                     async_tick=AsyncMock(), async_reset_state=AsyncMock())
+                                     async_tick=AsyncMock(), async_reset_state=AsyncMock(),
+                                     settings=SimpleNamespace(automatic_overload_cycles=False))
         for key in ("start_overload_trial", "end_overload_trial"):
             description = next(item for item in module.BUTTON_DESCRIPTIONS if item.key == key)
             entity = module.OneFuseButton(controller, self.entry, description)
