@@ -120,6 +120,49 @@ class SharedConfirmationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
         self.assertIn("outside_ceiling", self.controller.last_decision.reason)
 
+    async def known_post_provider_high_grid(self, kind):
+        r = await self.establish(kind)
+        await self.controller.async_tick()
+        self.adapter.calls.clear()
+        self.now = 203.
+        self.grid(30.4, 202.5)
+        self.native_vector(float32(7.05), (182, 183),
+            {182: 202.8, 183: 202.8}, {182: 3, 183: 3}, 201.)
+        self.native.source_timestamps = tuple((key, self.wall(201.) if key in (182, 183) else None)
+                                              for key in (182, 183, 184, 185))
+        await self.controller.async_tick()
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+        self.assertIn({"low_grid": "grid_confirmation_outside_ceiling",
+                       "normal": "grid_confirmation_outside_nominal_budget",
+                       "overload": "minimum_observed_above_ceiling"}[kind],
+                      self.controller.last_decision.reason)
+        self.assertIsNone(r._minimum_confirmation)
+
+    async def test_low_grid_known_provider_high_sample_cannot_hide_behind_receipt(self):
+        await self.known_post_provider_high_grid("low_grid")
+
+    async def test_nominal_known_provider_high_sample_cannot_hide_behind_receipt(self):
+        await self.known_post_provider_high_grid("normal")
+
+    async def test_trial_known_provider_high_sample_cannot_hide_behind_receipt(self):
+        await self.known_post_provider_high_grid("overload")
+
+    async def test_provider_floor_can_reject_high_grid_but_cannot_create_success(self):
+        r = await self.establish("low_grid")
+        await self.controller.async_tick()
+        self.adapter.calls.clear()
+        self.now = 203.
+        self.grid(9.2, 202.5)
+        self.native_vector(float32(7.05), (182, 183),
+            {182: 202.8, 183: 202.8}, {182: 3, 183: 3}, 202.8)
+        self.native.source_timestamps = tuple((key, self.wall(201.) if key in (182, 183) else None)
+                                              for key in (182, 183, 184, 185))
+        await self.controller.async_tick()
+        self.assertEqual(self.controller.last_decision.mode, "low_grid_grid_wait")
+        self.assertEqual(self.adapter.calls, [])
+        self.assertAlmostEqual(r._minimum_confirmation.deadline, 232.8, places=5)
+        self.assertAlmostEqual(r._minimum_confirmation.floor, self.epoch+202.8, places=5)
+
     async def test_expired_unsent_plan_recognizes_the_shared_low_grid_wait(self):
         r = await self.waiting()
         self.now = 205.

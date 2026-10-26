@@ -10,6 +10,10 @@
 - Debit retry throttles only immediately before an actual adapter invocation.
   A proposed 7 A request discarded during checkpoint/source verification no
   longer consumes the action interval without ever reaching the adapter.
+- Reject a known post-response high grid sample using its directly associated
+  EV provider-event floor even when the local EV receipt arrives later. This
+  stricter rejection floor cannot create response credit, shorten the original
+  response interval or prove successful confirmation from an earlier sample.
 - Retire a fully qualified raw-budget rise response before its unconfirmed
   response-timeout branch. If an unconfirmed rise times out and explicit
   import-only/bounded control prove that the complete minimum fits beside raw

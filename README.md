@@ -237,6 +237,13 @@ While waiting, the controller retains only the already accepted live minimum
 offer: it sends no API command and does not renew its TTL. The wait is also
 bounded by that offer's existing lease expiry.
 
+For rejection of a high grid sample, a directly associated, valid post-ACK EV
+provider event supplies an additional conservative floor when available. A
+later local EV receipt must not disguise a grid sample already after that
+known event. This floor cannot prove successful confirmation or create EV
+response credit; success retains the stricter report-order requirement, and
+the duration is still anchored to the first qualified local response receipt.
+
 Only a high grid observation from before the qualifying minimum-current
 response may remain unconfirmed during this phase. A new grid report at or
 after the response that exceeds the applicable ceiling requests protection:

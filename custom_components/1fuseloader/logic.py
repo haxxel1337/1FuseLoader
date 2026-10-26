@@ -163,12 +163,14 @@ class MinimumGridConfirmation:
     value: float
     last_ev_ts: float
     last_grid_ts: float
+    high_grid_floor: Optional[float] = None
 
     @classmethod
     def start(cls, *, owner: str, source_id: str | tuple, cap: int,
               now: float, accepted_at: float, response_at: float,
               response_deadline: float, seconds: int, lease_expires: float,
-              ev_ts: float, grid_ts: float, current: float):
+              ev_ts: float, grid_ts: float, current: float,
+              high_grid_floor: Optional[float] = None):
         values = (now, accepted_at, response_at, response_deadline,
                   lease_expires, ev_ts, grid_ts, current)
         if (any(isinstance(v, bool) or _valid_number(v) is None for v in values)
@@ -176,11 +178,14 @@ class MinimumGridConfirmation:
                 or not accepted_at < response_at < response_deadline
                 or not 1 <= current <= cap + .5):
             return None
+        if high_grid_floor is not None and (isinstance(high_grid_floor, bool)
+                or _valid_number(high_grid_floor) is None or high_grid_floor > ev_ts):
+            return None
         deadline = min(response_at + seconds, lease_expires)
         if now >= deadline:
             return None
         return cls(owner, source_id, cap, deadline, ev_ts, ev_ts,
-                   current, ev_ts, grid_ts)
+                   current, ev_ts, grid_ts, high_grid_floor)
 
     def observe(self, *, now: float, grid: float, current: float,
                 grid_ts: float, ev_ts: float, ceiling: float,
@@ -194,7 +199,8 @@ class MinimumGridConfirmation:
             return "timeout"
         if event_regressed or grid_ts < self.last_grid_ts:
             return "source_clock_regressed"
-        if grid_ts >= self.first_ev_ts and grid > ceiling:
+        high_floor = self.first_ev_ts if self.high_grid_floor is None else self.high_grid_floor
+        if grid_ts >= high_floor and grid > ceiling:
             return "outside_ceiling"
         if abs(current - self.value) > .1:
             if not event_advanced:
@@ -1107,12 +1113,22 @@ class OneFuseRegulator:
                     or response_deadline is None or et is None or gt is None
                     or self.last_target is None or self.last_set_limit_ts is None):
                 return None
+            if (self._ev_event_source_known and (self._ev_event_source_ts is None
+                    or wall is None
+                    or self._ev_event_source_ts <= wall-(now-accepted_at))):
+                return None
             window = MinimumGridConfirmation.start(owner=owner,
                 source_id=source_id, cap=cap, now=now, accepted_at=accepted_at,
                 response_at=response_at, response_deadline=response_deadline,
                 seconds=s.grid_confirmation_seconds,
                 lease_expires=self.last_set_limit_ts+self.last_target[3],
-                ev_ts=et, grid_ts=gt, current=current)
+                ev_ts=et, grid_ts=gt, current=current,
+                # A directly associated source event can conservatively reject
+                # an already later HIGH sample despite network receipt lag. It
+                # cannot shorten the response clock, prove success or supply
+                # physical acquisition time; success retains its later floor.
+                high_grid_floor=min(et, self._ev_event_source_ts)
+                    if self._ev_event_source_known else None)
             if window is None:
                 return None
             self._minimum_confirmation = window
@@ -1470,14 +1486,13 @@ class OneFuseRegulator:
                     None, cap, grid, s.normal_ttl_seconds)
         if not active:
             if (self._normal_shed_source_id is None or not response_valid
-                    or grid_wait and self._last_input_snapshot_verified
                     or self._normal_shed_response_monotonic is None
                     or self._normal_shed_accepted_at is None
                     or self._normal_shed_ev_floor is None
                     or self._normal_shed_grid_floor is None
                     or gt is None
-                    or (not grid_wait and (gt <= max(self._normal_shed_grid_floor, self._normal_shed_ev_floor)
-                                           or grid > s.main_fuse_amps - s.buffer_amps))):
+                    or gt <= max(self._normal_shed_grid_floor, self._normal_shed_ev_floor)
+                    or grid > s.main_fuse_amps - s.buffer_amps):
                 return None
         if (identity is None or identity != self._normal_shed_source_id
                 or identity != self._accepted_control_source_id
@@ -1486,7 +1501,7 @@ class OneFuseRegulator:
                 or not 0 <= wall - et <= s.max_sensor_age_seconds
                 or not 0 <= wall - gt <= s.max_sensor_age_seconds
                 or cap is None or not 1 <= current <= cap + .5
-                or (not grid_wait and grid > s.main_fuse_amps - s.buffer_amps)
+                or grid > s.main_fuse_amps - s.buffer_amps
                 or self.last_target is None or self.last_target[0] != cap):
             return stop("sync_source_or_nominal_bounds_invalid")
         if active:
@@ -1499,25 +1514,18 @@ class OneFuseRegulator:
             first = self._normal_shed_response_monotonic
             if not self._normal_shed_accepted_at < first < self._normal_shed_deadline:
                 return None
-            deadline = (min(first + s.grid_confirmation_seconds,
-                            self.last_set_limit_ts + self.last_target[3]) if grid_wait else
-                        min(first + min(5.0, window), self._normal_shed_origin + window))
+            deadline = min(first + min(5.0, window), self._normal_shed_origin + window)
             if now >= deadline:
                 # A grace never used cannot retroactively shorten the still
                 # live original response window. It also cannot be restarted
                 # from this later observation or a new identical EV receipt.
                 return None
             self._normal_shed_sync_deadline = deadline
-            self._normal_shed_grid_wait = grid_wait
+            self._normal_shed_grid_wait = False
             self._normal_shed_sync_value = current
             self._normal_shed_sync_floor = et
         if now >= self._normal_shed_sync_deadline:
-            return stop("grid_confirmation_timeout" if grid_wait else "sync_timeout")
-        if (grid_wait and gt >= self._normal_shed_response_ts
-                and grid > s.main_fuse_amps - s.buffer_amps):
-            # A later substantive EV value may require a newer grid for
-            # success, but cannot hide an already observed over-limit grid.
-            return stop("grid_confirmation_outside_nominal_budget")
+            return stop("sync_timeout")
         if abs(current - self._normal_shed_sync_value) > .1:
             if not self._ev_advanced_since(self._normal_shed_sync_last_ev_ts, "_normal_shed_sync_last_ev_ts"):
                 if self._ev_clock_explicit:
