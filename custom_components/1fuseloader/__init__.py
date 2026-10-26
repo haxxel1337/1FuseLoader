@@ -165,6 +165,7 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             "overload_lifetime_used_seconds", "overload_trial_state", "overload_trial_used_seconds",
             "overload_trial_remaining_seconds", "overload_trial_failure_reason",
             "grid_confirmation_deadline_ts", "grid_confirmation_remaining_seconds",
+            "ordinary_response_deadline_ts",
             "readiness_deadline_ts",
             "peak_only_response", "response_policy", "peak_response_trigger_amps",
             "peak_response_active", "peak_response_deadline_ts", "ordinary_lower_offer_pending",
@@ -1778,6 +1779,17 @@ class OneFuseLoaderController:
         inp = self._read_input()
         no_overload_authority = (not r.automatic_cycle_requires_checkpoint
             and not r._overload_hold_active and r._overload_transition_started is None)
+        if (decision.mode.removeprefix("dry_run_") == "ordinary_response_hold"
+                and self._budget_loaded and no_overload_authority):
+            # This accepted decrease keeps only its frozen birth bound and
+            # original response time; a pending write cannot renew either.
+            return r.can_retain_ordinary_response(inp, decision)
+        if (decision.mode.removeprefix("dry_run_") == "startup_grid_wait"
+                and self._budget_loaded and no_overload_authority):
+            # Only the already accepted minimum and its original observation
+            # deadline survive an unfinished metadata write. The core checks
+            # the latest sources again; no command or lease is created here.
+            return r.can_retain_startup_grid_confirmation(inp, decision)
         if (decision.mode.removeprefix("dry_run_") == "readiness_wait"
                 and self._budget_loaded and no_overload_authority):
             # This connected waiting phase can retain only the old accepted
@@ -1883,6 +1895,35 @@ class OneFuseLoaderController:
             budget_fault = self._budget_error if self._budget_error != "overload_budget_save_pending" else None
             if offline_problem or budget_fault:
                 inp = replace(inp, data_valid=False, data_error=budget_fault or offline_problem)
+        # A protective evaluation may clear the owner that explains its cause.
+        # Keep only bounded scalar diagnostics for the private incident journal;
+        # these snapshots have no control authority or public entity attribute.
+        r = self.regulator
+        ordinary = r._ordinary_lower
+        confirmation = r._minimum_confirmation
+        private_plan_context = {
+            "established_current_before": _finite_current_number(r._ev_established_value),
+            "established_value_match_before": r._ev_established_value is not None
+                and inp.charger_current == r._ev_established_value,
+            "established_binding_match_before": r._ev_established_binding is not None
+                and inp.control_source_id == r._ev_established_binding,
+            "active_owner_caps_before": {key: value for key, value in {
+                "positive": r._positive_cap,
+                "ordinary": ordinary.cap if ordinary is not None else None,
+                "minimum_confirmation": confirmation.cap if confirmation is not None else None,
+            }.items() if value is not None},
+            "active_owner_deadlines_before": {key: value for key, value in {
+                "positive": r._positive_ramp_deadline,
+                "ordinary": ordinary.observation_deadline if ordinary is not None else None,
+                "minimum_confirmation": confirmation.deadline if confirmation is not None else None,
+                "nominal": r._normal_shed_deadline,
+                "low_grid": r._low_grid_deadline,
+                "readiness": r._readiness_wait_deadline,
+                "peak": getattr(r._peak_response, "deadline", None),
+            }.items() if value is not None},
+            "shared_confirmation_owner_before": confirmation.owner if confirmation is not None else None,
+            "owner_clock_scope": "monotonic_seconds_not_utc",
+        }
         decision = self.regulator.evaluate(inp)
         if self._protective_zero_pending and self.settings.active_control and not self.settings.dry_run:
             self.regulator.reject_submission(decision, self.hass.loop.time())
@@ -1989,7 +2030,7 @@ class OneFuseLoaderController:
                 decision = replace(decision, command=None, service=None, should_call_service=False)
         if (decision.mode.removeprefix("dry_run_") in {
                 "normal_shedding_sync", "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait",
-                "ordinary_grid_wait", "overload_peak_hold", "positive_ramp_hold", "readiness_wait"}
+                "ordinary_grid_wait", "ordinary_response_hold", "startup_grid_wait", "overload_peak_hold", "positive_ramp_hold", "readiness_wait"}
                 and decision.current_p1 > 0):
             # Synchronization retains only an existing live offer. It cannot
             # write, renew a lease, or resume, even if a stale plan says so.
@@ -2063,10 +2104,16 @@ class OneFuseLoaderController:
                 and decision.nominal_sync_deadline_ts is not None
                 and self.hass.loop.time() < decision.nominal_sync_deadline_ts)
             grid_hold = bool(decision.mode.removeprefix("dry_run_") in {
-                    "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait", "ordinary_grid_wait"}
+                    "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait", "ordinary_grid_wait", "startup_grid_wait"}
                 and decision.command is None and not decision.should_call_service
                 and decision.grid_confirmation_deadline_ts is not None
                 and self.hass.loop.time() < decision.grid_confirmation_deadline_ts
+                and self.regulator.last_target is not None
+                and decision.current_p1 == self.regulator.last_target[0] > 0)
+            ordinary_hold = bool(decision.mode.removeprefix("dry_run_") == "ordinary_response_hold"
+                and decision.command is None and not decision.should_call_service
+                and decision.ordinary_response_deadline_ts is not None
+                and self.hass.loop.time() < decision.ordinary_response_deadline_ts
                 and self.regulator.last_target is not None
                 and decision.current_p1 == self.regulator.last_target[0] > 0)
             raw_hold = bool(decision.mode.removeprefix("dry_run_") == "low_grid_raw_hold"
@@ -2092,7 +2139,7 @@ class OneFuseLoaderController:
             # The re-evaluation can retire the old response deadline using a
             # fresh, whole-authority raw bound. Retain that existing offer
             # without dispatching the old request or manufacturing a zero.
-            if (decision.current_p1 > 0 or decision.command == "resume") and not (sync_hold or raw_hold or grid_hold or ordinary_replan):
+            if (decision.current_p1 > 0 or decision.command == "resume") and not (sync_hold or raw_hold or grid_hold or ordinary_hold or ordinary_replan):
                 decision = replace(
                     decision, mode="normal_shedding_stop",
                     reason="The fixed nominal response deadline expired before dispatch; requesting 0 A.",
@@ -2337,7 +2384,19 @@ class OneFuseLoaderController:
                 "command_completed_at_utc": attempt["completed_at_utc"],
                 "command_result": attempt["result"], "command_error": attempt["error"],
             })
-            self._recent_stop_contexts.append(dict(self.last_stop_context))
+            self._recent_stop_contexts.append({**self.last_stop_context,
+                "decision_diagnostics": {
+                    **private_plan_context,
+                    "house_load_basis": decision.house_load_basis,
+                    "house_load_l1": _finite_current_number(decision.house_load_l1),
+                    "native_committed": inp.charger_native_committed is True,
+                    "snapshot_used": inp.charger_snapshot_verified is True,
+                    "established_current_after": _finite_current_number(self.regulator._ev_established_value),
+                    "established_value_match_after": self.regulator._ev_established_value is not None
+                        and inp.charger_current == self.regulator._ev_established_value,
+                    "established_binding_match_after": self.regulator._ev_established_binding is not None
+                        and inp.control_source_id == self.regulator._ev_established_binding,
+                }})
             self._queue_incident_journal()
         self.notify()
 
@@ -2422,7 +2481,7 @@ class OneFuseLoaderController:
             # Separate, nonrenewable measurement synchronization; the original
             # high-load response allowance is never extended by this timer.
             delays.append(sync_deadline - self.hass.loop.time() + elapsed)
-        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts", "positive_response_deadline_ts", "readiness_deadline_ts"):
+        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts", "ordinary_response_deadline_ts", "positive_response_deadline_ts", "readiness_deadline_ts"):
             deadline = getattr(decision, name, None)
             if decision.current_p1 > 0 and deadline is not None:
                 # Fixed source/response clocks survive event churn and every
@@ -2447,7 +2506,9 @@ class OneFuseLoaderController:
 
         # A near-deadline source event must not replace the fixed post-response
         # expiry with another 50 ms on every update.
-        minimum_delay = 0.0 if getattr(decision, "grid_confirmation_deadline_ts", None) is not None else 0.05
+        minimum_delay = 0.0 if (
+            getattr(decision, "grid_confirmation_deadline_ts", None) is not None
+            or getattr(decision, "ordinary_response_deadline_ts", None) is not None) else 0.05
         self._unsub_deadline = async_call_later(self.hass, max(minimum_delay, min(delays) - elapsed), deadline_tick)
 
 
