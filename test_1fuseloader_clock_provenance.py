@@ -176,15 +176,25 @@ class ClockProvenanceTests(unittest.TestCase):
         self.assertGreaterEqual(r.effective_overload_used_seconds,3)
         self.assertEqual(r.export_overload_state()["failure_reason"],"response_timeout")
 
-    def test_first_post_ack_winner_with_known_pre_ack_source_does_not_confirm(self):
+    def test_native_receiver_order_is_not_compared_to_the_provider_clock(self):
         r = self.regulator()
         zeros=tuple((item,0) for item in IDS)
         self.step(r,0,2.2,.02,et=None,vector=(),sequences=zeros,status="awaiting_start")
         self.step(r,60,2.2,.02,et=None,vector=(),sequences=zeros,status="awaiting_start")
         d = self.step(r,65,18.3,16.1,et=65,vector=((183,65),),
             sequences=((182,0),(183,1),(184,0),(185,0)),source_known=True,source_ts=59)
-        self.assertIsNone(r._positive_response_current)
-        self.assertNotEqual(d.house_load_basis,"prior_coherent_house_ev_first_hold")
+        self.assertEqual(r._positive_response_current, 16.1)
+        self.assertEqual(r._positive_response_ts, EPOCH+65)
+        self.assertEqual(r._ev_event_source_ts, EPOCH+59)
+        self.assertEqual(d.current_p1, 16)
+        # A genuinely older LOCAL native receipt still cannot respond. The
+        # provider clock is not rewritten to manufacture receiver ordering.
+        old = self.regulator()
+        self.step(old,0,2.2,.02,et=None,vector=(),sequences=zeros,status="awaiting_start")
+        self.step(old,60,2.2,.02,et=None,vector=(),sequences=zeros,status="awaiting_start")
+        self.step(old,65,18.3,16.1,et=59,vector=((183,59),),
+            sequences=((182,0),(183,1),(184,0),(185,0)),source_known=True,source_ts=59)
+        self.assertIsNone(old._positive_response_current)
 
     def test_first_post_ack_winner_with_known_post_ack_source_completes(self):
         r = self.regulator()

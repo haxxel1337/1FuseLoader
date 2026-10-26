@@ -222,6 +222,9 @@ class DisconnectedReadinessRuntimeTests(unittest.IsolatedAsyncioTestCase):
         inherited = (self.controller.last_decision.positive_response_deadline_ts
             or self.controller.last_decision.readiness_deadline_ts)
         self.assertEqual(inherited, deadline)
+        self.assertEqual(r.last_set_limit_ts, 100.)
+        self.assertEqual((self.controller.last_decision.command,
+            self.controller.last_decision.should_call_service), (None, False))
 
     async def test_waiting_then_charging_cannot_extend_original_connected_mismatch_window(self):
         r = await self.ready()

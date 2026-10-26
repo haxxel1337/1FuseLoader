@@ -263,10 +263,13 @@ class DispatchRaceTests(unittest.IsolatedAsyncioTestCase):
         self.adapter.async_execute = send
         await self.controller.async_tick()
         self.assertTrue(self.controller._protective_zero_pending)
-        positive = replace(self.controller.last_decision, current_p1=7, should_call_service=True)
         self.states["sensor.grid"].state = "2"
         self.states["sensor.car"].state = "0"
         self.fresh_control_reports()
+        # A new evaluation owns a new transaction; a reused SDK-entered plan
+        # is deliberately rejected by the separate replay/tombstone guard.
+        positive = replace(self.controller.regulator.evaluate(self.controller._read_input()),
+            current_p1=7, should_call_service=True)
         with patch.object(self.controller.regulator, "evaluate", return_value=positive):
             await self.controller.async_tick()
         self.assertEqual(calls, [0, 0])
@@ -351,12 +354,31 @@ class DispatchRaceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_protective_zero_is_not_suppressed_by_sync_guard(self):
         await self.controller.async_tick()
-        decision = replace(self.controller.last_decision, mode="normal_shedding_sync", command="set_limit",
+        decision = replace(self.controller.regulator.evaluate(self.controller._read_input()),
+                           mode="normal_shedding_sync", command="set_limit",
                            current_p1=0, should_call_service=True, nominal_response_deadline_ts=None,
                            nominal_sync_deadline_ts=None)
         with patch.object(self.controller.regulator, "evaluate", return_value=decision):
             await self.controller.async_tick()
         self.assertEqual(self.adapter.calls[-1].current_p1, 0)
+
+    async def test_reused_transaction_cannot_dispatch_or_acknowledge_another_offer(self):
+        await self.controller.async_tick()
+        stale = replace(self.controller.last_decision, command="set_limit",
+            current_p1=7, should_call_service=True)
+        calls = len(self.adapter.calls)
+        accepted = dict(self.controller.last_accepted_command)
+        lease_origin = self.controller.regulator.last_set_limit_ts
+        target = self.controller.regulator.last_target
+        delivery_sequence = self.controller._delivery.latest.sequence
+        with patch.object(self.controller.regulator, "evaluate", return_value=stale):
+            await self.controller.async_tick()
+        self.assertEqual(len(self.adapter.calls), calls)
+        self.assertEqual(self.controller.last_accepted_command, accepted)
+        self.assertEqual(self.controller.regulator.last_set_limit_ts, lease_origin)
+        self.assertEqual(self.controller.regulator.last_target, target)
+        self.assertEqual(self.controller._delivery.latest.sequence, delivery_sequence)
+        self.assertEqual(self.controller.last_service_result, "not_sent_local")
 
     async def test_ev_age_crossing_checkpoint_invalidates_positive_dispatch(self):
         original = self.controller._read_input()

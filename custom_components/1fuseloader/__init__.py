@@ -27,7 +27,7 @@ from .const import (
     CONF_L3_ENTITY, CONF_STATUS_ENTITY, CONF_CONTROLLED_PHASE, DEFAULT_OPTIONS,
     DOMAIN, PLATFORMS, validate_options,
 )
-from .easee_adapter import EaseeCommandAdapter
+from .easee_adapter import CommandNotSent, EaseeCommandAdapter, NativeTelemetryObservation
 from .command_delivery import CommandDeliveryTracker
 from .bmw_context import BMWContext
 from .logic import ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, START_ALLOWED_STATUSES, PEAK_RESPONSE_TRIGGER_AMPS, OneFuseRegulator, RegulatorInput, RegulatorSettings
@@ -166,6 +166,7 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             "overload_trial_remaining_seconds", "overload_trial_failure_reason",
             "grid_confirmation_deadline_ts", "grid_confirmation_remaining_seconds",
             "ordinary_response_deadline_ts",
+            "normal_continuity_deadline_ts",
             "readiness_deadline_ts",
             "peak_only_response", "response_policy", "peak_response_trigger_amps",
             "peak_response_active", "peak_response_deadline_ts", "ordinary_lower_offer_pending",
@@ -262,6 +263,13 @@ class OneFuseLoaderController:
         self._delivery = CommandDeliveryTracker()
         self._delivery_unsub = None
         self._current_observation_unsub = None
+        self._telemetry_unsub = None
+        self._native_telemetry_events: deque[dict[str, Any]] = deque(maxlen=128)
+        self._transport_events: deque[dict[str, Any]] = deque(maxlen=32)
+        self._pilot_zero_observations: deque[dict[str, Any]] = deque(maxlen=8)
+        self._last_pilot_output: tuple[int, float] | None = None
+        self._passive_journal_unsub = None
+        self._passive_journal_token = None
         self._current_quiet_unsub = None
         self._current_quiet_token: object | None = None
         self._current_publication_unsub = None
@@ -270,11 +278,17 @@ class OneFuseLoaderController:
         self._current_publication_key: tuple | None = None
         self._control_identity = None
         self._delivery_binding = None
+        self._applied_control_binding = None
+        self._applied_control_selection = None
         self._positive_retry_after = 0.0
+        self._local_retry_after = 0.0
+        self._local_retry_unsub = None
+        self._local_retry_token = None
         self._dispatch_task: asyncio.Task | None = None
         self._dispatch_input: RegulatorInput | None = None
         self._dispatch_decision: Any = None
         self._dispatch_positive = False
+        self._dispatch_started = False
         self._dispatch_superseded = False
         self._protective_zero_pending = False
         self._recent_stop_contexts: deque[dict[str, Any]] = deque(maxlen=8)
@@ -386,6 +400,13 @@ class OneFuseLoaderController:
                 # A display listener must not prevent a protective control action.
                 _LOGGER.warning("1FuseLoader listener failed (%s)", type(err).__name__)
 
+    def _electrical_selection(self) -> tuple:
+        """Semantic selection remains comparable when registry proof is None."""
+        data = self.entry.data or {}
+        return (data.get(CONF_DEVICE_ID), data.get(CONF_CONTROLLED_PHASE, "L1"),
+            data.get(CONF_L1_ENTITY), data.get(CONF_CHARGER_CURRENT_ENTITY),
+            data.get(CONF_STATUS_ENTITY), repr(self._l1_source_config))
+
     def _reload_settings_locked(self) -> bool:
         settings = _settings_from_entry(self.entry)
         if settings == self.settings:
@@ -396,8 +417,21 @@ class OneFuseLoaderController:
         return True
 
     async def async_set_option(self, key: str, value: Any) -> None:
+        # Invalid dependency changes must have no transport side effects.
+        # Revalidate under the lock as another valid update may precede us.
+        candidate = dict(self.entry.options or {})
+        candidate[key] = value
+        candidate = validate_options(candidate)
+        if (candidate == validate_options(self.entry.options or {})
+                and _settings_from_entry(self.entry) == self.settings
+                and self._electrical_selection() == self._applied_control_selection
+                and self._configured_control_identity() == self._applied_control_binding):
+            # No await separates this comparison from return. A repeated UI
+            # value grants no reason to cancel a live request or phase.
+            return
         self._generation += 1
         self._cancel_positive_dispatch()
+        self._cancel_local_retry()
         self._cancel_snapshot_refresh(cancel_request=True)
         async with self._lock:
             options = dict(self.entry.options or {})
@@ -409,23 +443,44 @@ class OneFuseLoaderController:
                 await self._async_tick_locked()
 
     async def async_set_switch(self, key: str, value: bool) -> None:
-        await self.async_set_option(key, bool(value))
+        if type(value) is not bool:
+            raise ValueError("Switch values must be booleans")
+        await self.async_set_option(key, value)
 
     async def async_reconfigure(self) -> None:
+        if (_settings_from_entry(self.entry) == self.settings
+                and self._electrical_selection() == self._applied_control_selection
+                and self._configured_control_identity() == self._applied_control_binding):
+            async with self._lock:
+                if (_settings_from_entry(self.entry) == self.settings
+                        and self._electrical_selection() == self._applied_control_selection
+                        and self._configured_control_identity() == self._applied_control_binding):
+                    # Advisory selection/subscriptions can refresh without
+                    # interrupting the unchanged electrical control contract.
+                    self._bmw_context = BMWContext(self.hass, self.entry.data.get(CONF_BMW_DEVICE_ID))
+                    if self.unsub_states is not None:
+                        self._subscribe_source_entities()
+                    return
+        electrical_changed = (self._electrical_selection() != self._applied_control_selection
+            or self._configured_control_identity() != self._applied_control_binding)
         self._generation += 1
         self._cancel_positive_dispatch()
+        self._cancel_local_retry()
         self._cancel_snapshot_refresh(cancel_request=True)
         async with self._lock:
             changed = self._reload_settings_locked()
             source_changed = await self._async_configure_l1_source_locked()
             if self.unsub_states is not None:
                 self._subscribe_source_entities()
-            if (changed or source_changed) and not self._stopped:
+            self._applied_control_binding = self._configured_control_identity()
+            self._applied_control_selection = self._electrical_selection()
+            if (changed or source_changed or electrical_changed) and not self._stopped:
                 await self._async_tick_locked()
 
     async def async_reset_state(self) -> None:
         self._generation += 1
         self._cancel_positive_dispatch()
+        self._cancel_local_retry()
         self._cancel_snapshot_refresh(cancel_request=True)
         async with self._lock:
             self.regulator.reset()
@@ -581,6 +636,13 @@ class OneFuseLoaderController:
                 if self._current_observation_unsub is not None:
                     self._current_observation_unsub()
                 self._current_observation_unsub = subscribe_current(lambda: self._handle_source_change(None))
+            subscribe_telemetry = getattr(self._adapter, "set_telemetry_callback", None)
+            if callable(subscribe_telemetry):
+                if self._telemetry_unsub is not None:
+                    self._telemetry_unsub()
+                self._telemetry_unsub = subscribe_telemetry(self._handle_passive_telemetry)
+            self._applied_control_binding = self._configured_control_identity()
+            self._applied_control_selection = self._electrical_selection()
             await self._async_tick_locked()
             # async_stop marks stopped before waiting for this lock. It may
             # already have removed listeners while any startup await yielded;
@@ -673,11 +735,93 @@ class OneFuseLoaderController:
             self._handle_source_change(None)
             self.notify()
 
+    @callback
+    def _handle_passive_telemetry(self, observations: Any) -> None:
+        """Journal selected events without waking/evaluating the regulator."""
+        if self._stopped or not isinstance(observations, tuple):
+            return
+        urgent = False
+        recorded = False
+        for event in observations[:64]:
+            if not isinstance(event, NativeTelemetryObservation):
+                continue
+            item = event.public()
+            self._native_telemetry_events.append(item)
+            recorded = True
+            if event.observation_id != 114 or event.error is not None or type(event.value) not in (int, float):
+                continue
+            previous = (self._last_pilot_output[1] if self._last_pilot_output is not None
+                and self._last_pilot_output[0] == event.receiver_generation else None)
+            self._last_pilot_output = (event.receiver_generation, float(event.value))
+            if event.value == 0 and previous != 0:
+                self._pilot_zero_observations.append({**item,
+                    "previous_output_amps": previous,
+                    "last_accepted_limit": _limit_receipt_summary(self.last_accepted_limit)
+                        if self.last_accepted_limit else None,
+                    "last_attempt": _limit_receipt_summary(self.last_command_attempt)
+                        if self.last_command_attempt else None,
+                    "last_mode": self.last_decision.mode if self.last_decision else None,
+                    "scope": "pilot_zero_observed_not_measured_EV_current_or_causal_command_proof"})
+                urgent = True
+        if not recorded:
+            return
+        if urgent and self._passive_journal_unsub is None:
+            self._queue_incident_journal()
+            # Normal telemetry stays in memory. One finite post-incident
+            # flush captures its immediate aftermath (including more pilot
+            # toggles) without extending the window or periodic I/O.
+            token = self._passive_journal_token = object()
+            generation = self._generation
+
+            async def flush(_now: datetime) -> None:
+                if token is not self._passive_journal_token:
+                    return
+                self._passive_journal_unsub = self._passive_journal_token = None
+                if self._stopped or generation != self._generation:
+                    return
+                self._queue_incident_journal()
+
+            self._passive_journal_unsub = async_call_later(self.hass, 5., flush)
+
+    def _cancel_passive_journal_flush(self) -> None:
+        if self._passive_journal_unsub is not None:
+            self._passive_journal_unsub()
+        self._passive_journal_unsub = self._passive_journal_token = None
+
     def _cancel_positive_dispatch(self) -> None:
         if self._dispatch_positive and self._dispatch_task is not None and not self._dispatch_task.done():
             self._dispatch_superseded = True
-            self._protective_zero_pending = True
+            # Cancellation before the adapter's actual SDK boundary cannot
+            # leave a remote command outstanding. After entry it is unknown.
+            if self._dispatch_started:
+                self._protective_zero_pending = True
             self._dispatch_task.cancel()
+
+    def _defer_local_submission(self, seconds: float) -> None:
+        """One bounded retry for a proven local refusal; zero remains urgent."""
+        delay = min(3600., max(1., float(seconds)))
+        due = self.hass.loop.time() + delay
+        if self._local_retry_unsub is not None:
+            self._local_retry_unsub()
+        self._local_retry_after = due
+        token = self._local_retry_token = object()
+        generation = self._generation
+
+        async def retry(_now: datetime) -> None:
+            if (self._stopped or generation != self._generation
+                    or token is not self._local_retry_token):
+                return
+            self._local_retry_unsub = self._local_retry_token = None
+            self._local_retry_after = 0.
+            self._handle_source_change(None)
+
+        self._local_retry_unsub = async_call_later(self.hass, delay, retry)
+
+    def _cancel_local_retry(self) -> None:
+        if self._local_retry_unsub is not None:
+            self._local_retry_unsub()
+        self._local_retry_unsub = self._local_retry_token = None
+        self._local_retry_after = 0.
 
     @callback
     def _handle_source_change(self, _event: Any) -> None:
@@ -737,6 +881,11 @@ class OneFuseLoaderController:
         if self._current_observation_unsub is not None:
             self._current_observation_unsub()
             self._current_observation_unsub = None
+        if self._telemetry_unsub is not None:
+            self._telemetry_unsub()
+            self._telemetry_unsub = None
+        self._cancel_passive_journal_flush()
+        self._cancel_local_retry()
         self._current_quiet_token = None
         if self._current_quiet_unsub is not None:
             self._current_quiet_unsub()
@@ -811,6 +960,7 @@ class OneFuseLoaderController:
                     ("native_terminal_receipt", getattr(native, "source_identity", None),
                      getattr(native, "observation_ids", ()), getattr(native, "error", None),
                      getattr(native, "observation_sequences", ()),
+                     getattr(native, "observation_evidence_credit", ()),
                      getattr(native, "native_publication_pending", False),
                      getattr(native, "publication_generation", 0),
                      getattr(native, "divergence_started_monotonic", None)))
@@ -1219,6 +1369,7 @@ class OneFuseLoaderController:
         event_source_ts = None
         observation_report_times = None
         observation_sequences = None
+        observation_evidence_credit = None
         if explicit_native_clock:
             native_maxima = maximum_ids(getattr(native_clock, "observation_ids", ()))
             native_clock_error = getattr(native_clock, "error", None)
@@ -1274,6 +1425,13 @@ class OneFuseLoaderController:
                 if type(key) is int and key in (182, 183, 184, 185)
                 and (stamp := self._utc_time(raw_stamp)) is not None)
             observation_sequences = getattr(native_clock, "observation_sequences", ())
+            raw_credit = getattr(native_clock, "observation_evidence_credit", ())
+            # An absent map belongs to older audited offline fixtures. A live
+            # explicit map is validated centrally and never made true by HA.
+            observation_evidence_credit = raw_credit or None
+            # Atomic publication readiness and measurement credit are separate.
+            # The core can prove a whole-RAW normal set_limit without using
+            # an ambiguous current event as measurement/response evidence.
             if native_clock_error and native_clock_error != "native_terminal_values_unavailable":
                 error = ("Easee native current publication is inconsistent: " + publication_error + "."
                     if publication_error else "Easee native current observation evidence is invalid.")
@@ -1377,6 +1535,7 @@ class OneFuseLoaderController:
                 if type(key) is int and key in (182, 183, 184, 185)
                 and (stamp := self._utc_time(raw_stamp)) is not None) if raw_times is not None else None)
             observation_sequences = None  # GET receipts are never native push events.
+            observation_evidence_credit = None
         elif snapshot is not None:
             self._charger_snapshot = None
             self._charger_snapshot_selection = None
@@ -1395,6 +1554,7 @@ class OneFuseLoaderController:
                     if type(key) is int and key in (182, 183, 184, 185)
                     and (stamp := self._utc_time(raw_stamp)) is not None) if raw_times is not None else None)
                 observation_sequences = None
+                observation_evidence_credit = None
             else:
                 current_clock_scope = "native_HA_receipt_with_invalid_matching_vendor_metadata"
         if not explicit_native_clock:
@@ -1408,6 +1568,7 @@ class OneFuseLoaderController:
             event_source_ts = None
             observation_report_times = None
             observation_sequences = None
+            observation_evidence_credit = None
         self.source_diagnostics.update({
             "charger_current_entity_reported_at_utc": (self._utc_time(getattr(current_state, "last_reported", None)).isoformat()
                 if self._utc_time(getattr(current_state, "last_reported", None)) else None),
@@ -1445,6 +1606,7 @@ class OneFuseLoaderController:
                 if event_source_ts is not None else None),
             "current_observation_report_times": observation_report_times,
             "current_observation_sequences": observation_sequences,
+            "current_observation_evidence_credit": observation_evidence_credit,
             "matching_get_metadata_association": "unassociated_with_native_event" if canonical_native and evidence else None,
             "charger_current_trusted": current_trusted,
             "retained_current_source_timestamp_utc": (
@@ -1490,6 +1652,7 @@ class OneFuseLoaderController:
             charger_event_source_ts=event_source_ts,
             charger_observation_report_times=observation_report_times,
             charger_observation_sequences=observation_sequences,
+            charger_observation_evidence_credit=observation_evidence_credit,
         )
 
     def _configured_control_identity(self) -> str | None:
@@ -1777,6 +1940,9 @@ class OneFuseLoaderController:
             return False
         r, s = self.regulator, self.settings
         inp = self._read_input()
+        if decision.mode.removeprefix("dry_run_") == "normal_continuity":
+            retained = self._committed_normal_retention(inp, decision)
+            return bool(retained is not None and retained.current_p1 == decision.current_p1)
         no_overload_authority = (not r.automatic_cycle_requires_checkpoint
             and not r._overload_hold_active and r._overload_transition_started is None)
         if (decision.mode.removeprefix("dry_run_") == "ordinary_response_hold"
@@ -1848,6 +2014,51 @@ class OneFuseLoaderController:
             and normal["response_failure"] is None
         )
 
+    def _committed_normal_retention(self, inp: RegulatorInput, proposed: Any = None) -> Any:
+        """Retain old actual normal authority, never an unfinished proposal."""
+        if (not self._budget_loaded or self._stopped
+                or self._budget_error not in {None, "overload_budget_save_pending"}
+                or self._protective_zero_pending
+                or self.hass.loop.time() < self._positive_retry_after
+                or self._delivery.unresolved_correlated_zero):
+            return None
+        receipt = self._delivery.latest
+        if (receipt and receipt.phases == (0, 0, 0)
+                and (receipt.http_status is not None or receipt.state in {
+                    "submission_failed_unverified", "superseded_unverified", "vendor_rejected"})
+                and not self._delivery.can_skip_zero(**self._zero_readback_evidence(
+                    inp, require_new_current=False))):
+            return None
+        return self.regulator.committed_normal_retention(inp, proposed)
+
+    async def _checkpoint_unsent_cleanup(self, decision: Any) -> None:
+        """Remove only a proven unsent intent, preserving all old exposure."""
+        if not self.regulator.reject_unsubmitted(decision, self.hass.loop.time()):
+            return
+        self._normal_control_checkpoint_pending = True
+        try:
+            await asyncio.wait_for(self._budget_store.async_save(
+                self.regulator.export_overload_state()), EXPOSURE_STORE_TIMEOUT_SECONDS)
+            if not self._budget_store.state_is_durable(self.regulator.export_overload_state()):
+                raise RuntimeError("Unsent intent cleanup is not yet verified")
+        except Exception as err:
+            pending = isinstance(err, TimeoutError) and self._budget_store.verification_pending
+            if self._budget_error != "overload_budget_restore_failed":
+                self._budget_error = ("overload_budget_save_pending" if pending
+                    else "overload_budget_save_failed")
+            self._budget_error_type = type(err).__name__
+            self._budget_retry_at = self.hass.loop.time() + EXPOSURE_STORE_RETRY_SECONDS
+            if pending:
+                self._watch_pending_checkpoint()
+            else:
+                # The protection is for a real durability failure, never the
+                # local refusal itself. Re-evaluate the independent fault.
+                self._handle_source_change(None)
+        else:
+            if self._budget_error == "overload_budget_save_pending":
+                self._budget_error = self._budget_error_type = None
+            self._budget_retry_at = 0.
+
     def _input_revision(self, inp: RegulatorInput) -> tuple:
         def age_class(report: float | None) -> tuple | None:
             if report is None or inp.wall_now_ts is None:
@@ -1864,7 +2075,7 @@ class OneFuseLoaderController:
                 inp.charger_publication_pending,
                 inp.charger_event_source_known, inp.charger_event_source_ts,
                 inp.charger_observation_report_times,
-                inp.charger_observation_sequences,
+                inp.charger_observation_sequences, inp.charger_observation_evidence_credit,
                 age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
     async def _async_tick_locked(self) -> None:
@@ -1882,6 +2093,16 @@ class OneFuseLoaderController:
             self.bmw_context = {}
         self._sync_command_identity()
         inp = self._read_input()
+        try:
+            same_settings = _settings_from_entry(self.entry) == self.settings
+        except (TypeError, ValueError):
+            same_settings = False
+        if inp.data_valid and same_settings:
+            # Registry/MQTT metadata can become verified after initial setup.
+            # Remember the binding this locked tick actually processes, so
+            # a later identical entry notification is not a policy change.
+            self._applied_control_binding = inp.control_source_id
+            self._applied_control_selection = self._electrical_selection()
         self._schedule_current_snapshot(inp)
         plan_source_diagnostics = dict(self.source_diagnostics)
         if (self._budget_error == "overload_budget_save_pending"
@@ -1926,11 +2147,11 @@ class OneFuseLoaderController:
         }
         decision = self.regulator.evaluate(inp)
         if self._protective_zero_pending and self.settings.active_control and not self.settings.dry_run:
-            self.regulator.reject_submission(decision, self.hass.loop.time())
+            self.regulator.reject_unsubmitted(decision, self.hass.loop.time())
             self.regulator.interrupt_positive_control("protective_zero_preempts_positive")
             decision = replace(decision, command="set_limit", current_p1=0, current_p2=0, current_p3=0,
                                should_call_service=True, mode="command_protection",
-                               reason="A positive request was superseded or could not be admitted; confirming 0 A before a new offer.")
+                               reason="A previous SDK request was superseded or has unverified delivery; confirming 0 A before a new offer.")
         if decision.current_refresh_required:
             self._request_current_snapshot()
         exposure = self.regulator.export_overload_state()
@@ -1978,6 +2199,16 @@ class OneFuseLoaderController:
                 self._budget_retry_at = 0.0
         if self._stopped or generation != self._generation:
             return
+        if (self._budget_error == "overload_budget_save_pending"
+                and self._budget_store.verification_pending and decision.current_p1 > 0):
+            retained = self._committed_normal_retention(self._read_input(), decision)
+            if retained is not None:
+                # Evaluation may have proposed a first lower cap. It is not
+                # accepted authority until an actual dispatch and ACK exist.
+                if self.regulator.reject_unsubmitted(decision, self.hass.loop.time()):
+                    self._normal_control_checkpoint_pending = True
+                    self._budget_retry_at = 0.
+                decision = retained
         previous_offer = self.regulator.last_target
         if (decision.mode == "normal" and decision.command == "set_limit"
                 and previous_offer is not None and 0 < previous_offer[0] < decision.current_p1):
@@ -2007,8 +2238,8 @@ class OneFuseLoaderController:
                      )))
             )
         ):
-            if self.regulator.reject_submission(decision, self.hass.loop.time()):
-                self._handle_source_change(None)
+            if self.regulator.reject_unsubmitted(decision, self.hass.loop.time()):
+                self._normal_control_checkpoint_pending = True
             if checkpoint_unverified:
                 self.regulator.interrupt_positive_control("checkpoint_unverified_before_positive")
             decision = replace(
@@ -2030,7 +2261,7 @@ class OneFuseLoaderController:
                 decision = replace(decision, command=None, service=None, should_call_service=False)
         if (decision.mode.removeprefix("dry_run_") in {
                 "normal_shedding_sync", "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait",
-                "ordinary_grid_wait", "ordinary_response_hold", "startup_grid_wait", "overload_peak_hold", "positive_ramp_hold", "readiness_wait"}
+                "ordinary_grid_wait", "ordinary_response_hold", "startup_grid_wait", "overload_peak_hold", "positive_ramp_hold", "readiness_wait", "normal_continuity", "waiting_for_current_cohort"}
                 and decision.current_p1 > 0):
             # Synchronization retains only an existing live offer. It cannot
             # write, renew a lease, or resume, even if a stale plan says so.
@@ -2050,8 +2281,7 @@ class OneFuseLoaderController:
         if self._adapter is not None:
             self.control_block_reason = self._adapter.control_block_reason
         if self.control_block_reason or self._adapter is None:
-            if self.regulator.reject_submission(decision, self.hass.loop.time()):
-                self._handle_source_change(None)
+            await self._checkpoint_unsent_cleanup(decision)
             self.last_service_result = "blocked"
             self.last_decision = replace(
                 decision, mode="control_blocked", reason=self.control_block_reason or "No verified command adapter.",
@@ -2061,12 +2291,23 @@ class OneFuseLoaderController:
             return
         positive_submission = decision.command == "resume" or (
             decision.command == "set_limit" and decision.current_p1 > 0)
+        if (positive_submission and self.hass.loop.time() < self._local_retry_after
+                and getattr(decision, "command_urgency", "normal") != "protective_reduction"):
+            retained = self._committed_normal_retention(self._read_input(), decision)
+            await self._checkpoint_unsent_cleanup(decision)
+            self.last_decision = retained if retained is not None else replace(decision,
+                mode="local_submission_deferred", command=None, service=None, should_call_service=False,
+                reason="Local admission is deferred; no remote command was attempted.")
+            self._schedule_overload_deadline(self.last_decision)
+            self.last_service_result = "not_sent_local_deferred"
+            self.notify()
+            return
         readiness_context = getattr(decision, "readiness_context", None)
         readiness_deadline = (_finite_current_number(getattr(readiness_context, "deadline", None))
             if decision.mode.removeprefix("dry_run_") in {"disconnected_ready", "connected_ready"} else None)
         if (positive_submission and readiness_deadline is not None
                 and self.hass.loop.time() >= readiness_deadline):
-            self.regulator.reject_submission(decision, self.hass.loop.time())
+            await self._checkpoint_unsent_cleanup(decision)
             self.last_service_result = "not_sent"
             self.last_decision = replace(decision, mode="waiting_for_latest_sources",
                 reason="The readiness proposal expired before dispatch; recalculating from current sources.",
@@ -2080,7 +2321,7 @@ class OneFuseLoaderController:
                 and self.hass.loop.time() >= raw_response_deadline):
             # This proposed rise has not been sent. Discard it without turning
             # a delayed checkpoint into either fresh authority or a new zero.
-            self.regulator.reject_submission(decision, self.hass.loop.time())
+            await self._checkpoint_unsent_cleanup(decision)
             self.last_service_result = "not_sent"
             self.last_decision = replace(decision, mode="waiting_for_latest_sources",
                 reason="The raw-grid proposal expired before dispatch; recalculating from current sources.",
@@ -2166,7 +2407,7 @@ class OneFuseLoaderController:
                 if problem or budget_fault:
                     latest = replace(latest, data_valid=False, data_error=budget_fault or problem)
             if self._input_revision(latest) != self._input_revision(inp):
-                self.regulator.reject_submission(decision, self.hass.loop.time())
+                await self._checkpoint_unsent_cleanup(decision)
                 self.last_service_result = "not_sent"
                 self.last_decision = replace(
                     decision, mode="waiting_for_latest_sources",
@@ -2199,93 +2440,118 @@ class OneFuseLoaderController:
                             and not ordered_zero)
         zero_barrier = zero_barrier or self._delivery.unresolved_correlated_zero
         if positive_submission and (zero_barrier or self.hass.loop.time() < self._positive_retry_after):
-            self.regulator.reject_submission(decision, self.hass.loop.time())
+            await self._checkpoint_unsent_cleanup(decision)
             self.last_decision = replace(decision, should_call_service=False, mode="waiting_for_zero_confirmation",
                 reason="Waiting for the preceding 0 A command and a fresh native zero transition before offering current.")
             self.last_service_result = "not_sent_waiting_for_zero_confirmation"
             self._request_current_snapshot()
             self.notify()
             return
-        attempt = {
-            "started_at_utc": datetime.now(timezone.utc).isoformat(),
-            "completed_at_utc": None, "command": decision.command,
-            "target_p1": decision.current_p1, "target_p2": decision.current_p2,
-            "target_p3": decision.current_p3, "ttl_seconds": decision.ttl_seconds,
-            "result": "pending", "error": None,
-        }
-        self.last_command_attempt = attempt
-        capture_stop = (decision.command == "pause" or (
-            decision.command == "set_limit" and decision.current_p1 == 0)) and self._stop_context_armed
-        if capture_stop:
-            def number(value: Any) -> float | None:
-                try:
-                    parsed = float(value)
-                    return parsed if not isinstance(value, bool) and isfinite(parsed) else None
-                except (TypeError, ValueError, OverflowError):
-                    return None
+        attempt = receipt_record = None
+        capture_stop = False
 
-            def report_utc(value: Any) -> str | None:
-                parsed = number(value)
-                try:
-                    return datetime.fromtimestamp(parsed, timezone.utc).isoformat() if parsed is not None else None
-                except (ValueError, OverflowError, OSError):
-                    return None
+        def actual_dispatch() -> bool:
+            # The adapter calls synchronously after local admission, directly
+            # before SDK entry. A proposal/checkpoint/queue is not a submission.
+            nonlocal attempt, receipt_record, capture_stop, inp, plan_source_diagnostics, exposure
+            if (self._dispatch_started or self._stopped or generation != self._generation
+                    or self._dispatch_superseded):
+                return False
+            latest = self._read_input()
+            if positive_submission and self._input_revision(latest) != self._input_revision(inp):
+                ready = decision.mode.removeprefix("dry_run_") == "disconnected_ready"
+                if not ready or not self.regulator.can_continue_readiness_dispatch(inp, latest, decision):
+                    return False
+            if not self.regulator.begin_submission(decision, self.hass.loop.time(), inp=latest):
+                return False
+            self._dispatch_started = True
+            inp = latest
+            self._dispatch_input = latest
+            plan_source_diagnostics = dict(self.source_diagnostics)
+            exposure = self.regulator.export_overload_state()
+            attempt = {
+                "started_at_utc": datetime.now(timezone.utc).isoformat(),
+                "completed_at_utc": None, "command": decision.command,
+                "target_p1": decision.current_p1, "target_p2": decision.current_p2,
+                "target_p3": decision.current_p3, "ttl_seconds": decision.ttl_seconds,
+                "result": "pending", "error": None,
+            }
+            self.last_command_attempt = attempt
+            capture_stop = (decision.command == "pause" or (
+                decision.command == "set_limit" and decision.current_p1 == 0)) and self._stop_context_armed
+            if capture_stop:
+                def number(value: Any) -> float | None:
+                    try:
+                        parsed = float(value)
+                        return parsed if not isinstance(value, bool) and isfinite(parsed) else None
+                    except (TypeError, ValueError, OverflowError):
+                        return None
 
-            # Keep the first request's cause through subsequent inconsistent
-            # feedback/retries. A newly accepted positive offer arms a new
-            # incident. These are diagnostic receipts, never physical proof.
-            preceding_receipts = [_limit_receipt_summary(item) for item in
-                [item for item in self._recent_commands if item.get("command") in {"set_limit", "resume"}
-                 and type(item.get("target_p1")) in (int, float) and item["target_p1"] > 0][-4:]]
-            delivery_by_sequence = {record.sequence: record.public() for record in self._delivery.records}
-            for item in preceding_receipts:
-                sequence = item.get("delivery", {}).get("sequence")
-                if sequence in delivery_by_sequence:
-                    item["delivery"] = _limit_receipt_summary({"delivery": delivery_by_sequence[sequence]})["delivery"]
-            self.last_stop_context = {
-                "plan_utc": report_utc(inp.wall_now_ts),
-                "reason": decision.reason, "mode": decision.mode,
-                "grid_l1": number(inp.grid_l1),
-                "charger_current": number(inp.charger_current), "status": inp.status,
-                "grid_report_utc": report_utc(inp.grid_report_ts),
-                "charger_report_utc": report_utc(inp.charger_report_ts),
-                "charger_report_family": inp.charger_report_family,
-                "charger_max_observation_ids": plan_source_diagnostics.get("effective_current_max_observation_ids"),
-                "source_error": inp.data_error,
-                "product_update_received_at_utc": plan_source_diagnostics.get("easee_stream_pulse_utc"),
-                "previous_submitted_limit_p1": (self.last_accepted_limit.get("target_p1")
-                                                if self.last_accepted_limit else None),
-                "preceding_positive_limit_receipts": preceding_receipts,
-                "overload_used_seconds": exposure["used_seconds"],
-                "overload_failure_reason": exposure["failure_reason"],
-                "overload_effective_used_seconds": self.regulator.effective_overload_used_seconds,
-                "overload_effective_failure_reason": self.regulator.effective_overload_failure_reason,
-                **{key: value for key, value in self.regulator.trial_diagnostics().items()
-                   if key in {"overload_trial_id", "overload_trial_state",
-                              "overload_trial_used_seconds", "overload_trial_remaining_seconds",
-                              "overload_trial_failure_reason", "overload_lifetime_used_seconds",
-                              "overload_historical_failure_reason"}},
-                "command_started_at_utc": attempt["started_at_utc"],
-                "command_completed_at_utc": None,
-                "command_result": "pending", "command_error": None,
-                "clock_scope": "validated_grid_sample_and_local_HA_receipts_not_physical_stop_proof",
-            }
-            self.last_stop_nominal_diagnostics = {
-                "plan_utc": self.last_stop_context["plan_utc"],
-                "nominal_rejection_code": decision.nominal_rejection_code,
-                "source_report_skew_seconds": decision.source_report_skew_seconds,
-                "grid_report_age_seconds": decision.grid_report_age_seconds,
-                "charger_report_age_seconds": decision.charger_report_age_seconds,
-                "source_alignment_window_seconds": decision.source_alignment_window_seconds,
-                "source_max_age_seconds": self.settings.max_sensor_age_seconds,
-            }
-            self._stop_context_armed = False
+                def report_utc(value: Any) -> str | None:
+                    parsed = number(value)
+                    try:
+                        return datetime.fromtimestamp(parsed, timezone.utc).isoformat() if parsed is not None else None
+                    except (ValueError, OverflowError, OSError):
+                        return None
+
+                # Keep the first request's cause through subsequent inconsistent
+                # feedback/retries. A newly accepted positive offer arms a new
+                # incident. These are diagnostic receipts, never physical proof.
+                preceding_receipts = [_limit_receipt_summary(item) for item in
+                    [item for item in self._recent_commands if item.get("command") in {"set_limit", "resume"}
+                     and type(item.get("target_p1")) in (int, float) and item["target_p1"] > 0][-4:]]
+                delivery_by_sequence = {record.sequence: record.public() for record in self._delivery.records}
+                for item in preceding_receipts:
+                    sequence = item.get("delivery", {}).get("sequence")
+                    if sequence in delivery_by_sequence:
+                        item["delivery"] = _limit_receipt_summary({"delivery": delivery_by_sequence[sequence]})["delivery"]
+                self.last_stop_context = {
+                    "plan_utc": report_utc(inp.wall_now_ts),
+                    "reason": decision.reason, "mode": decision.mode,
+                    "grid_l1": number(inp.grid_l1),
+                    "charger_current": number(inp.charger_current), "status": inp.status,
+                    "grid_report_utc": report_utc(inp.grid_report_ts),
+                    "charger_report_utc": report_utc(inp.charger_report_ts),
+                    "charger_report_family": inp.charger_report_family,
+                    "charger_max_observation_ids": plan_source_diagnostics.get("effective_current_max_observation_ids"),
+                    "source_error": inp.data_error,
+                    "product_update_received_at_utc": plan_source_diagnostics.get("easee_stream_pulse_utc"),
+                    "previous_submitted_limit_p1": (self.last_accepted_limit.get("target_p1")
+                                                    if self.last_accepted_limit else None),
+                    "preceding_positive_limit_receipts": preceding_receipts,
+                    "overload_used_seconds": exposure["used_seconds"],
+                    "overload_failure_reason": exposure["failure_reason"],
+                    "overload_effective_used_seconds": self.regulator.effective_overload_used_seconds,
+                    "overload_effective_failure_reason": self.regulator.effective_overload_failure_reason,
+                    **{key: value for key, value in self.regulator.trial_diagnostics().items()
+                       if key in {"overload_trial_id", "overload_trial_state",
+                                  "overload_trial_used_seconds", "overload_trial_remaining_seconds",
+                                  "overload_trial_failure_reason", "overload_lifetime_used_seconds",
+                                  "overload_historical_failure_reason"}},
+                    "command_started_at_utc": attempt["started_at_utc"],
+                    "command_completed_at_utc": None,
+                    "command_result": "pending", "command_error": None,
+                    "clock_scope": "validated_grid_sample_and_local_HA_receipts_not_physical_stop_proof",
+                }
+                self.last_stop_nominal_diagnostics = {
+                    "plan_utc": self.last_stop_context["plan_utc"],
+                    "nominal_rejection_code": decision.nominal_rejection_code,
+                    "source_report_skew_seconds": decision.source_report_skew_seconds,
+                    "grid_report_age_seconds": decision.grid_report_age_seconds,
+                    "charger_report_age_seconds": decision.charger_report_age_seconds,
+                    "source_alignment_window_seconds": decision.source_alignment_window_seconds,
+                    "source_max_age_seconds": self.settings.max_sensor_age_seconds,
+                }
+                self._stop_context_armed = False
+            receipt_record = self._delivery.begin(decision.command,
+                (decision.current_p1, decision.current_p2, decision.current_p3), self.hass.loop.time())
+            return True
+
         self.last_service_error = None
-        receipt_record = self._delivery.begin(decision.command,
-            (decision.current_p1, decision.current_p2, decision.current_p3), self.hass.loop.time())
         self._dispatch_input = inp
         self._dispatch_decision = decision
         self._dispatch_positive = positive_submission
+        self._dispatch_started = False
         self._dispatch_superseded = False
         try:
             action_timeout = ACTION_TIMEOUT_SECONDS
@@ -2295,48 +2561,89 @@ class OneFuseLoaderController:
                 action_timeout = min(action_timeout, max(0.001, response_deadline - self.hass.loop.time()))
             if positive_submission and raw_response_deadline is not None:
                 action_timeout = min(action_timeout, max(0.001, raw_response_deadline - self.hass.loop.time()))
-            if not self.regulator.begin_submission(decision, self.hass.loop.time()):
-                raise RuntimeError("invalid_command_submission_context")
-            self._dispatch_task = self.hass.async_create_task(self._adapter.async_execute(decision))
+            execute = getattr(self._adapter, "async_execute_with_dispatch", None)
+            if callable(execute):
+                coroutine = execute(decision, actual_dispatch)
+            else:
+                # Older offline adapters have no preflight queue. Keep their
+                # entry boundary explicit rather than inventing an early ACK.
+                if not actual_dispatch():
+                    raise CommandNotSent("dispatch_context_rejected", retry_after_seconds=1.)
+                coroutine = self._adapter.async_execute(decision)
+            self._dispatch_task = self.hass.async_create_task(coroutine)
             receipt = await asyncio.wait_for(self._dispatch_task, action_timeout)
+            if not self._dispatch_started or receipt_record is None:
+                raise RuntimeError("adapter_completed_without_dispatch_boundary")
             if self._dispatch_superseded or self._stopped or generation != self._generation:
                 raise RuntimeError("superseded_command_completion")
         except asyncio.CancelledError:
             if not self._dispatch_superseded:
                 raise
-            self._delivery.failed(receipt_record, superseded=True)
-            self.regulator.reject_submission(decision, self.hass.loop.time())
-            self.last_service_result = "superseded_unverified"
-            attempt.update(result="superseded_unverified", error="source_changed_during_dispatch")
-            self.last_service_error = "source_changed_during_dispatch"
+            if not self._dispatch_started:
+                await self._checkpoint_unsent_cleanup(decision)
+                self.last_service_result = "not_sent_superseded"
+            else:
+                self._delivery.failed(receipt_record, superseded=True)
+                self.regulator.reject_submission(decision, self.hass.loop.time())
+                self.last_service_result = "superseded_unverified"
+                attempt.update(result="superseded_unverified", error="source_changed_during_dispatch")
+                self.last_service_error = "source_changed_during_dispatch"
             self._handle_source_change(None)
         except Exception as err:
-            self._delivery.failed(receipt_record, superseded=self._dispatch_superseded)
-            if positive_submission:
-                self._protective_zero_pending = True
-            if decision.command == "set_limit" and decision.current_p1 == 0:
-                # A timed-out zero can still arrive at the device later.
-                # Confirm another zero before allowing a subsequent positive.
-                self._protective_zero_pending = True
-            rejected_retry = self.regulator.reject_submission(decision, self.hass.loop.time())
-            self.last_service_result = "error"
-            self.last_service_error = type(err).__name__
-            attempt.update(result="error", error=self.last_service_error)
-            self.last_decision = replace(
-                decision, reason=f"Command submission failed ({type(err).__name__}); charger state is unverified.",
-            )
-            _LOGGER.warning("1FuseLoader command submission failed (%s)", type(err).__name__)
-            if str(err) == "positive_rate_capacity_exhausted":
-                self._protective_zero_pending = True
-                self._positive_retry_after = self.hass.loop.time() + 5
-                self._handle_source_change(None)
-            if rejected_retry or self._dispatch_superseded or positive_submission:
-                # Cancellation cannot establish whether the cloud applied a
-                # request. Re-evaluate rather than waiting for another report.
-                self._handle_source_change(None)
+            if isinstance(err, CommandNotSent) and not self._dispatch_started:
+                # Only the typed pre-SDK contract proves no command escaped.
+                # Do not create delivery records, ACKs or retry attempts.
+                await self._checkpoint_unsent_cleanup(decision)
+                self.last_service_result = "not_sent_local"
+                self.last_service_error = None
+                self._transport_events.append({
+                    "received_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "kind": "known_not_sent", "code": err.code,
+                    "command": decision.command, "target_p1": decision.current_p1,
+                    "retry_after_seconds": err.retry_after_seconds,
+                    "scope": "local_pre_SDK_no_remote_submission_or_ACK",
+                })
+                self._defer_local_submission(err.retry_after_seconds)
+                latest = self._read_input()
+                retained = self._committed_normal_retention(latest, decision)
+                self.last_decision = retained if retained is not None else replace(decision,
+                    command=None, service=None, should_call_service=False,
+                    reason="Local preflight refused the request before SDK entry; recalculation is deferred.")
+                self._schedule_overload_deadline(self.last_decision)
+                self._queue_incident_journal()
+                if positive_submission and (not latest.data_valid or latest.data_error):
+                    # A proven local refusal removes transport ambiguity; it
+                    # does not postpone a separate source-fault zero.
+                    self._handle_source_change(None)
+            else:
+                # An adapter which fails without honoring the boundary, or
+                # fails after it, provides no proof of non-delivery.
+                if receipt_record is None:
+                    attempt = {"started_at_utc": datetime.now(timezone.utc).isoformat(),
+                        "completed_at_utc": None, "command": decision.command,
+                        "target_p1": decision.current_p1, "target_p2": decision.current_p2,
+                        "target_p3": decision.current_p3, "ttl_seconds": decision.ttl_seconds,
+                        "result": "pending", "error": None,
+                        "boundary_scope": "adapter_contract_unknown"}
+                    self.last_command_attempt = attempt
+                    receipt_record = self._delivery.begin(decision.command,
+                        (decision.current_p1, decision.current_p2, decision.current_p3), self.hass.loop.time())
+                self._delivery.failed(receipt_record, superseded=self._dispatch_superseded)
+                if positive_submission or decision.command == "set_limit" and decision.current_p1 == 0:
+                    self._protective_zero_pending = True
+                rejected_retry = self.regulator.reject_submission(decision, self.hass.loop.time())
+                self.last_service_result = "error"
+                self.last_service_error = type(err).__name__
+                attempt.update(result="error", error=self.last_service_error)
+                self.last_decision = replace(decision,
+                    reason=f"Command submission failed ({type(err).__name__}); charger state is unverified.")
+                _LOGGER.warning("1FuseLoader command submission failed (%s)", type(err).__name__)
+                if rejected_retry or self._dispatch_superseded or positive_submission:
+                    self._handle_source_change(None)
         else:
             self._delivery.accepted(receipt_record, receipt, self.hass.loop.time())
             self.regulator.acknowledge(decision, self.hass.loop.time())
+            self._cancel_local_retry()
             if decision.command == "set_limit" and decision.current_p1 == 0:
                 self._protective_zero_pending = False
             self.last_service_result = "submitted_unverified"
@@ -2346,6 +2653,10 @@ class OneFuseLoaderController:
             self._dispatch_input = None
             self._dispatch_decision = None
             self._dispatch_positive = False
+            self._dispatch_started = False
+        if attempt is None or receipt_record is None:
+            self.notify()
+            return
         attempt["delivery"] = receipt_record.public()
         attempt["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
         journal_record = {
@@ -2414,6 +2725,9 @@ class OneFuseLoaderController:
             "scope": "API_and_local_receipts_not_physical_acquisition_or_delivery_proof",
             "commands": [dict(item) for item in self._recent_commands],
             "stops": [dict(item) for item in self._recent_stop_contexts],
+            "native_events": [dict(item) for item in self._native_telemetry_events],
+            "transport_events": [dict(item) for item in self._transport_events],
+            "pilot_zero_observations": [dict(item) for item in self._pilot_zero_observations],
         }
         if self._incident_journal_task is not None and not self._incident_journal_task.done():
             return
@@ -2481,7 +2795,7 @@ class OneFuseLoaderController:
             # Separate, nonrenewable measurement synchronization; the original
             # high-load response allowance is never extended by this timer.
             delays.append(sync_deadline - self.hass.loop.time() + elapsed)
-        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts", "ordinary_response_deadline_ts", "positive_response_deadline_ts", "readiness_deadline_ts"):
+        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts", "ordinary_response_deadline_ts", "positive_response_deadline_ts", "readiness_deadline_ts", "normal_continuity_deadline_ts"):
             deadline = getattr(decision, name, None)
             if decision.current_p1 > 0 and deadline is not None:
                 # Fixed source/response clocks survive event churn and every
@@ -2508,7 +2822,8 @@ class OneFuseLoaderController:
         # expiry with another 50 ms on every update.
         minimum_delay = 0.0 if (
             getattr(decision, "grid_confirmation_deadline_ts", None) is not None
-            or getattr(decision, "ordinary_response_deadline_ts", None) is not None) else 0.05
+            or getattr(decision, "ordinary_response_deadline_ts", None) is not None
+            or getattr(decision, "normal_continuity_deadline_ts", None) is not None) else 0.05
         self._unsub_deadline = async_call_later(self.hass, max(minimum_delay, min(delays) - elapsed), deadline_tick)
 
 

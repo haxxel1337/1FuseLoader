@@ -111,7 +111,7 @@ class ReadyOwnerPriorityControllerTests(unittest.IsolatedAsyncioTestCase):
         deadline = self.controller.last_decision.positive_response_deadline_ts
         self.assertAlmostEqual(deadline, 160.1, places=6)
         self.adapter.calls.clear()
-        await self.finish_ramp(r, first=135.4, deadline=deadline, accepted=135.4)
+        await self.finish_ramp(r, first=135.4, deadline=deadline, accepted=135.)
 
     async def test_hard_peak_source_future_and_rebind_still_override_ramp_owner(self):
         for fault in ("peak", "native", "future", "binding"):

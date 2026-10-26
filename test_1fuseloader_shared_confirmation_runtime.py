@@ -69,8 +69,25 @@ class SharedConfirmationRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(self.controller.last_decision.should_call_service)
                 self.assertEqual(r.last_set_limit_ts, self.lower_ack)
 
+    async def test_current_cohort_mode_is_hard_no_write_even_for_forged_renew_or_resume(self):
+        r = await self.waiting()
+        original = self.controller.last_decision
+        for command in ("set_limit", "resume"):
+            with self.subTest(command=command):
+                with patch.object(r, "evaluate", return_value=replace(original,
+                        mode="waiting_for_current_cohort", command=command,
+                        should_call_service=True)):
+                    await self.controller.async_tick()
+                self.assertEqual(self.adapter.calls, [])
+                self.assertIsNone(self.controller.last_decision.command)
+                self.assertFalse(self.controller.last_decision.should_call_service)
+                self.assertEqual(r.last_set_limit_ts, self.lower_ack)
+
     async def test_low_grid_fixed_deadline_wakes_and_protects_at_expiry(self):
         await self.waiting()
+        # Keep a pre-response sample which cannot independently bound the
+        # old16 A authority. RAW2.4+16 would instead be a normal certificate.
+        self.grid(20., 202.5)
         deadline = self.controller.last_decision.grid_confirmation_deadline_ts
         timer = next(t for t in self.active_timers() if abs(t.due-deadline) < 1e-6)
         self.now = deadline
@@ -109,7 +126,7 @@ class SharedConfirmationRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.now = 211.
         self.grid(9.2)
         await self.controller.async_tick()
-        self.assertEqual(self.controller.last_decision.mode, "low_grid_alignment_complete")
+        self.assertEqual(self.controller.last_decision.mode, "normal_continuity")
         self.assertIsNone(r._minimum_confirmation)
 
     async def test_later_grid_above_the_normal_ceiling_still_stops(self):

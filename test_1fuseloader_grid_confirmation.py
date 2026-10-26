@@ -212,10 +212,14 @@ class GridConfirmationTests(unittest.TestCase):
         self.assertEqual((d.mode, d.current_p1),
                          ("normal_shedding_complete", 7))
 
-    def test_grid_at_response_clock_above_buffer_is_still_protective(self):
+    def test_equal_clock_cannot_order_high_grid_but_strictly_later_high_is_protective(self):
         r, _ = self.waiting()
         d = self.sample(r, 48, 30.2, 7.08, gt=46.5, et=46.5)
-        self.assertEqual(d.current_p1, 0)
+        self.assertEqual((d.mode, d.current_p1, d.command), ("normal_shedding_grid_wait", 7, None))
+        deadline = d.grid_confirmation_deadline_ts
+        later = self.sample(r, 48.1, 30.2, 7.08, gt=46.6, et=46.5)
+        self.assertEqual(later.current_p1, 0)
+        self.assertIsNotNone(deadline)
 
     def test_exact_buffer_boundary_can_confirm_nominal_response(self):
         r, _ = self.waiting()

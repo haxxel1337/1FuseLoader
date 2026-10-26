@@ -131,6 +131,12 @@ class RawBudgetRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.now += 5
         self.states["sensor.grid"].last_reported = self.wall()
         await self.controller.async_tick()
+        self.assertEqual(self.controller.last_decision.current_p1, 12)
+        self.assertIsNone(self.controller.last_decision.command)
+        self.assertEqual(self.adapter.calls[-1].current_p1, 12)
+        self.now += 5
+        self.states["sensor.grid"].last_reported = self.wall()
+        await self.controller.async_tick()
         self.assertEqual(self.adapter.calls[-1].current_p1, 16)
         self.assertTrue(all(call.current_p1 > 0 for call in self.adapter.calls))
 
@@ -173,6 +179,12 @@ class RawBudgetRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.states["sensor.grid"].state = "16.5"
         self.states["sensor.grid"].last_reported = self.wall()
         self.committed(12., received=self.now, sequence=1)
+        self.now += 5
+        self.states["sensor.grid"].last_reported = self.wall()
+        await self.controller.async_tick()
+        self.assertEqual(self.controller.last_decision.current_p1, 12)
+        self.assertIsNone(self.controller.last_decision.command)
+        self.assertEqual(self.adapter.calls[-1].current_p1, 12)
         self.now += 5
         self.states["sensor.grid"].last_reported = self.wall()
         await self.controller.async_tick()

@@ -50,6 +50,77 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Normal operation and command evidence (b36)
+
+An actual accepted command and a proposed command are separate records. A
+proposed lower offer cannot erase the still-live accepted cap or its normal
+house-load bound while metadata is being saved. One common normal-operating
+qualification governs retention across connected waiting labels and delayed
+reports. Independent normal-state retention requires the whole unresolved
+accepted authority to fit the normal buffered envelope, with the original
+source binding, native receiver and finite lease.
+Waiting retains only that cap; it sends no command, renewal, increase or resume.
+Independent fresh raw-grid headroom can still authorize an ordinary offer
+without subtracting uncertain EV current.
+
+Normal operation and command response answer different questions. A fresh
+trusted native current report and later coherent grid can qualify the existing
+normal offer without proving that a particular API call caused the current.
+This can retire a measurement-only observation owner. It cannot clear a real
+peak, an interrupted recovery barrier, an overload failure or spent exposure,
+or create another response window or overload cycle.
+
+Under the opt-in peak-triggered policy, a qualified, actually accepted normal
+decrease can also retain its lower cap through an incomplete native publication
+or short conductor cohort while raw grid current remains at most the nominal
+fuse rating. This uses the existing fixed processing fence of at most one
+second, capped by the original lower-response deadline and lease. It sends no
+API request, renewal or increase. Churn cannot refill the fence; source faults,
+electrical protections and an expired original bound still take precedence.
+A completed coherent pair is assessed independently against the full normal
+buffered authority, including while a healthy metadata checkpoint is pending.
+
+Response observation floors are pinned immediately before the SDK request,
+after local admission. HTTP acceptance commits the command; it does not start
+a fresh response clock. A genuinely advanced native observation received while
+that request is in flight can be considered after successful acceptance using
+its original receipt and the original deadline. Provider timestamps are
+checked within their own source domain rather than required to exceed the
+local HTTP acknowledgement time. [Easee's command example](https://developer.easee.com/docs/amqp-commands)
+shows why these times need not have that ordering.
+
+An ordered native value change can share a provider timestamp bucket with an
+earlier value. A bounded per-terminal history distinguishes a first unseen
+value from a duplicate or ambiguous return. Ambiguous reported state grants
+no new measurement, response or EV-based increase credit; independent whole-raw
+normal permission remains separate. GET replies cannot create bucket events.
+True timestamp regression, invalid clocks and source rebinding still reject
+the data.
+
+A proven local refusal before SDK dispatch records no attempted API command,
+acceptance, lease or retry debit. It defers through one bounded timer while
+valid committed normal authority may remain unchanged. Once the SDK starts,
+an unknown result remains a stronger protection. Normal requests use at most
+eight local circuit-limit slots per minute; genuine protective decreases can
+use three reserved slots while leaving a slot for zero inside the audited
+12-per-minute SDK circuit-limit quota. A resume uses one circuit-limit call
+plus a separate charger call; pause uses no circuit-limit call. The SDK's
+general request quota is separate. No local reservation guarantees shared
+network capacity or device delivery.
+
+Private incident diagnostics include a small allowlisted native-event ring so
+an offered-current zero can be distinguished from a later software zero.
+Diagnostic telemetry stays in memory during normal operation. It neither wakes the control loop nor
+creates periodic incident-journal writes.
+
+The 29 A allowance, 38 A peak ceiling, original at-most-10-second electrical
+response, selected at-most-30-second post-minimum grid confirmation and
+automatic qualification/accounting/re-arm policy below are unchanged. A
+planned HA restart still stops lease renewal: a one-minute lease can expire
+to the configured offline fallback before HA returns. That planned interruption
+is separate from an avoidable zero during ordinary operation. See
+[Easee's TTL and fallback description](https://developer.easee.com/docs/load-balancing).
+
 ### Normal recovery beside an unadmitted automatic cycle (b33)
 
 An automatic overload cycle that has not qualified grants no extra overload
@@ -90,7 +161,7 @@ policy. This observation phase cannot grant a 29 A allowance or restart an
 electrical response clock.
 
 An already accepted startup minimum of at most 7 A can use the configured
-shared grid-confirmation phase when a genuine native post-ACK response
+shared grid-confirmation phase when a genuine native post-dispatch response
 qualified within the original startup window. The first qualifying response
 owns its fixed grid deadline, capped by the existing lease. A copied GET,
 late response or same-cap renewal cannot create another window. This is the
@@ -192,6 +263,10 @@ profile grants extra overload permission only for a 25 A main fuse, an EV offer
 of at most 7 A and a sustained raw L1 ceiling of at most 29 A. Independently
 proven normal offers may still use the normal buffered capacity. An already accepted lower offer is
 never raised merely to enter this mode, and an idle vehicle is not started.
+Configuration also requires a 7 A startup offer and effective current bounds
+`6 <= minimum <= 7 <= maximum`. Invalid combinations are rejected before
+interrupting a live request; they are not silently clamped to another automatic
+profile current.
 The manual **Start New Overload Trial (7 A)** and **End Overload Trial** buttons
 are unavailable in automatic mode. Their availability updates when the mode
 changes; a direct call from an outdated UI is also rejected before any manual
@@ -248,7 +323,7 @@ missing native receipts and zero event sequences stay missing and zero;
 matching cloud reads cannot replace them with new measurement evidence.
 
 An accepted raw-budget increase has one original, sample-aged response window.
-Only genuine post-acceptance conductor observations and a later coherent grid
+Only genuine post-dispatch conductor observations and a later coherent grid
 sample can establish its response. Renewals, checkpoint/API latency and late
 replies cannot refill that window or revive a terminal stop.
 
@@ -307,10 +382,10 @@ not certified physical acquisition times.
 
 Provider timestamps remain separate. A matching value in an old GET response
 cannot retroactively identify or relabel a newer native event. A response owner
-pins its acknowledgement time and component baselines; metadata enrichment,
+pins its actual SDK dispatch and component baselines; metadata enrichment,
 clock-family switches and identical renewals cannot manufacture response,
 refill alignment time or permit another increase. Genuine replay and invalid
-metadata still fail the source checks. A first real post-acceptance component
+metadata still fail the source checks. A first real post-dispatch component
 event can complete bootstrap without requiring an artificial second value
 change from a steady vehicle.
 
@@ -428,7 +503,7 @@ A raw-budget rise has its own bounds and receives no minimum-response grace.
 If that unconfirmed rise expires, explicit import-only/bounded control may
 instead request a distinct minimum decrease when raw grid plus the entire
 minimum fits the normal buffered budget. The old higher authority remains
-accounted for while that decrease awaits its own post-acceptance response.
+accounted for while that decrease awaits its own post-dispatch response.
 Its source-aged response deadline is fixed once; retries do not renew it.
 
 An expired lease, invalid source/binding or terminal protection cannot use
@@ -460,7 +535,7 @@ While waiting, the controller retains only the already accepted live minimum
 offer: it sends no API command and does not renew its TTL. The wait is also
 bounded by that offer's existing lease expiry.
 
-For rejection of a high grid sample, a directly associated, valid post-ACK EV
+For rejection of a high grid sample, a directly associated, valid post-dispatch EV
 provider event supplies an additional conservative floor when available. A
 later local EV receipt must not disguise a grid sample already after that
 known event. This floor cannot prove successful confirmation or create EV
@@ -505,8 +580,8 @@ priority. Accepting or renewing an API request is not physical-response proof.
 
 When a lower offer has already been accepted, a subsequent coherent grid/EV
 pair can hand it to the remaining reduction guard. That handoff preserves
-the previous possible offer, post-acceptance EV floor and earliest deadline.
-It cannot count an EV event preceding acceptance as response to the reduction.
+the previous possible offer, post-dispatch EV floor and earliest deadline.
+It cannot count an EV event preceding actual SDK dispatch as response to the reduction.
 
 An expired alignment clock alone does not imply excessive load. With the
 verified import-only option, a fresh raw grid plus the **entire unresolved
@@ -516,7 +591,7 @@ new alignment time, increase, resume, EV subtraction or experimental allowance.
 Ordinary same-cap renewal requires that whole-authority bound and a live lease
 at every evaluation. Losing the bound or source/lease validity requests zero.
 The unresolved hold is checkpointed; restoring it cannot create another
-positive response attempt. A genuinely post-acceptance lower-current event
+positive response attempt. A genuinely post-dispatch lower-current event
 and later coherent grid observation can complete the held response.
 
 These nominal-control repairs did not change the experimental overload contract
@@ -613,7 +688,7 @@ still be verified under supervision after activation.
 From b21, a lower-current report received before the original response deadline
 can enter a separate, nonrenewable synchronization phase while waiting for the
 next meter report. This requires a live accepted lower offer, a trusted
-post-acceptance EV event at that offer and a post-command grid report below the
+post-dispatch EV event at that offer and a post-command grid report below the
 full normal buffered ceiling. The phase lasts at most five seconds from the
 first qualifying response, also bounded by the existing alignment window.
 It sends no command or lease renewal and permits no increase or resume.
@@ -643,7 +718,7 @@ The first qualifying grid sample anchors one fixed deadline, at most ten
 seconds and at most the configured response window. Its age, checkpoint
 verification and command dispatch consume that same window. API acceptance,
 cached readback, GET receipts, new load samples and setting changes cannot
-renew it. A newer post-acceptance EV observation at the lower current and a
+renew it. A newer post-dispatch EV observation at the lower current and a
 still later grid observation must establish buffered normal operation. The
 separate verified-import fallback can instead prove a conservative raw-grid
 envelope; it remains its own explicit opt-in.

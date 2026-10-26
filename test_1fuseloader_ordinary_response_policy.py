@@ -61,7 +61,12 @@ class OrdinaryResponsePolicyTests(unittest.TestCase):
                 self.assertIsNone(initial.nominal_response_deadline_ts)
                 for now in (121., 136., 159., 180.):
                     d = self.frame(r, now, grid, 16.2, et=102.)
-                    self.assertEqual((d.mode, d.current_p1), ("ordinary_lower_offer", 7))
+                    self.assertEqual(d.current_p1, 7)
+                    if now < ctx.observation_deadline:
+                        self.assertEqual((d.mode, d.command, d.should_call_service),
+                            ("ordinary_response_hold", None, False))
+                    else:
+                        self.assertEqual(d.mode, "ordinary_lower_offer")
                     self.assertIsNone(d.nominal_response_deadline_ts)
                     self.assertIsNone(d.grid_confirmation_deadline_ts)
                     self.assertIs(r._ordinary_lower, ctx)

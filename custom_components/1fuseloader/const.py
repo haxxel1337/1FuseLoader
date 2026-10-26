@@ -212,8 +212,9 @@ def validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("Automatic overload cycles require the peak-triggered response policy")
     if result[OPT_AUTOMATIC_OVERLOAD_CYCLES] and (
         result[OPT_MAIN_FUSE_AMPS] != 25 or result[OPT_STARTUP_CHARGE_AMPS] != 7
+        or not 6 <= result[OPT_MIN_CHARGE_AMPS] <= 7 <= result[OPT_MAX_CHARGE_AMPS]
     ):
-        raise ValueError("Automatic overload cycles require the 25 A main fuse / 7 A startup profile")
+        raise ValueError("Automatic overload cycles require the 25 A main fuse / 7 A startup profile with min/max bounds including 7 A")
     if result[OPT_OVERLOAD_ENABLED]:
         if not result[OPT_ENABLE_DYNAMIC_LIMIT]:
             raise ValueError("Experimental overload operation requires dynamic current control")

@@ -27,12 +27,14 @@ SUPPORTED_EASEE_VERSION = "0.9.74"
 SUPPORTED_PYEASEE_VERSION = "0.8.17"
 SUPPORTED_PYEASEE_VERSIONS = frozenset({"0.8.17", "0.8.19"})
 NONZERO_ADMISSION_LIMIT = 8
+PROTECTIVE_NONZERO_ADMISSION_LIMIT = 11
 ADMISSION_PERIOD_SECONDS = 60.01
 REQUEST_TIMEOUT_SECONDS = 10
 MAX_TELEMETRY_AGE_SECONDS = 120
 OBSERVATION_FUTURE_TOLERANCE_SECONDS = 2
 NATIVE_PUBLICATION_MAX_DIVERGENCE_SECONDS = 1.0
 SNAPSHOT_OBSERVATION_IDS = (109, 182, 183, 184, 185)
+PRIVATE_TELEMETRY_OBSERVATION_IDS = frozenset({48, 96, 100, 109, 111, 112, 113, 114, 182, 183, 184, 185})
 
 # Raw numeric modes in the audited pyeasee 0.8.17 operation-mode enum.
 # Keep terminal, fault and schedule states distinct from start-ready states.
@@ -68,6 +70,24 @@ class EaseeAdapterError(RuntimeError):
     """A safe, credential-free failure reported by the adapter."""
 
 
+class CommandNotSent(EaseeAdapterError):
+    """A local rejection before SDK dispatch; no remote command was attempted.
+
+    This is deliberately distinct from an SDK exception or HTTP timeout. Once
+    the SDK coroutine begins, its internal queue/HTTP side effects are unknown.
+    """
+
+    def __init__(self, code: str, *, retry_after_seconds: float = 0.) -> None:
+        if not isinstance(code, str) or re.fullmatch(r"[a-z0-9_]{1,80}", code) is None:
+            code = "local_preflight_rejected"
+        if (type(retry_after_seconds) not in (int, float)
+                or not isfinite(retry_after_seconds) or not 0 <= retry_after_seconds <= 3600):
+            retry_after_seconds = 0.
+        self.code = code
+        self.retry_after_seconds = float(retry_after_seconds)
+        super().__init__(code)
+
+
 @dataclass(frozen=True, slots=True)
 class CommandSubmission:
     """Cloud receipt only: neither delivery nor physical-current proof."""
@@ -96,6 +116,28 @@ class CommandDelivery:
     provider_timestamp: str | None
     delivered_at: str | None
     received_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class NativeTelemetryObservation:
+    """Small passive diagnostic event, never a current/control proof source."""
+
+    observation_id: int
+    value: float | str | None
+    source_at_utc: str | None
+    received_at_utc: str
+    received_monotonic: float
+    batch_sequence: int
+    receiver_generation: int
+    error: str | None = None
+
+    def public(self) -> dict[str, Any]:
+        # No mid, serial, site, account, headers or raw provider payload.
+        return {"observation_id": self.observation_id, "value": self.value,
+                "source_at_utc": self.source_at_utc, "received_at_utc": self.received_at_utc,
+                "received_monotonic": self.received_monotonic,
+                "batch_sequence": self.batch_sequence, "receiver_generation": self.receiver_generation,
+                "error": self.error, "scope": "native_event_receipt_not_physical_acquisition"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +173,7 @@ class NativeCurrentObservation:
     source_timestamps: tuple[tuple[int, datetime | None], ...] = ()
     observation_report_times: tuple[tuple[int, datetime], ...] = ()
     observation_sequences: tuple[tuple[int, int], ...] = ()
+    observation_evidence_credit: tuple[tuple[int, bool], ...] = ()
     source_metadata_highwaters: tuple[tuple[int, datetime], ...] = ()
     error: str | None = None
     last_tuple_change_monotonic: float | None = None
@@ -165,12 +208,16 @@ class EaseeCommandAdapter:
         self._limit_observed_values: list[float | None] = [None, None, None]
         self._limit_receipts: list[float | None] = [None, None, None]
         self._current_observation_callback: Any = None
+        self._telemetry_callback: Any = None
+        self._telemetry_batch_sequence = 0
         self._native_current_identity: tuple[int, ...] | None = None
         self._native_current_values: dict[int, float] = {}
         self._native_current_sequences = {key: 0 for key in (182, 183, 184, 185)}
         self._native_current_receipts: dict[int, datetime] = {}
         self._native_current_source_times: dict[int, datetime] = {}
         self._native_current_source_highwaters: dict[int, datetime] = {}
+        self._native_current_bucket_values: dict[int, set[float]] = {}
+        self._native_current_evidence_credit: dict[int, bool] = {}
         self._native_current_errors: dict[int, str] = {}
         self._native_current_changed_at: float | None = None
         self._native_current_seeded = False
@@ -282,6 +329,18 @@ class EaseeCommandAdapter:
                 self._current_observation_callback = None
         return unsubscribe
 
+    def set_telemetry_callback(self, callback: Any):
+        """Subscribe to a bounded scalar allowlist without changing control."""
+        if callback is not None and not callable(callback):
+            raise TypeError("telemetry_callback_must_be_callable")
+        self._telemetry_callback = callback
+        self._resolve_runtime()
+
+        def unsubscribe():
+            if self._telemetry_callback is callback:
+                self._telemetry_callback = None
+        return unsubscribe
+
     @property
     def delivery_listener_available(self) -> bool:
         return self._resolve_runtime() is None and self._hook_connection is not None
@@ -296,6 +355,8 @@ class EaseeCommandAdapter:
             self._native_current_receipts.clear()
             self._native_current_source_times.clear()
             self._native_current_source_highwaters.clear()
+            self._native_current_bucket_values.clear()
+            self._native_current_evidence_credit.clear()
             self._native_current_errors.clear()
             self._native_current_changed_at = None
             self._native_current_seeded = False
@@ -335,6 +396,7 @@ class EaseeCommandAdapter:
                 return
             owner._receive_limit_observation(payload, charger_id)
             owner._receive_current_observations(payload, charger_id)
+            owner._receive_telemetry_observations(payload, charger_id)
 
         try:
             connection.on("CommandResponse", received)
@@ -344,6 +406,49 @@ class EaseeCommandAdapter:
             return
         self._hook_connection = connection
         self._hook_identity = identity
+
+    def _receive_telemetry_observations(self, payload: Any, charger_id: str) -> None:
+        callback = self._telemetry_callback
+        if not callable(callback):
+            return
+        records = payload if type(payload) is list else [payload]
+        received = datetime.now(timezone.utc)
+        self._telemetry_batch_sequence += 1
+        events = []
+        for record in records[:64]:
+            if not isinstance(record, Mapping) or record.get("mid") != charger_id:
+                continue
+            key = record.get("id")
+            if type(key) is not int or key not in PRIVATE_TELEMETRY_OBSERVATION_IDS:
+                continue
+            value, error = None, None
+            if key == 100:
+                raw = record.get("value")
+                if isinstance(raw, str) and re.fullmatch(r"[A-Fa-f]", raw):
+                    value = raw.upper()
+                else:
+                    error = "invalid_diagnostic_pilot"
+            else:
+                try:
+                    value = self._snapshot_number(record.get("value"), "invalid_diagnostic_number",
+                        integer=key in {96, 109})
+                    if not 0 <= value <= (10000 if key in {96, 109} else 1000):
+                        raise EaseeAdapterError("invalid_diagnostic_number")
+                except EaseeAdapterError:
+                    value, error = None, "invalid_diagnostic_number"
+            source = None
+            if record.get("timestamp") is not None:
+                source, source_error = self._observation_timestamp(record["timestamp"], received)
+                error = error or source_error
+            events.append(NativeTelemetryObservation(key, value,
+                source.isoformat() if source is not None else None, received.isoformat(),
+                _monotonic(), self._telemetry_batch_sequence, self._hook_generation, error))
+        if events:
+            try:
+                callback(tuple(events))
+            except Exception:
+                # Diagnostics cannot interrupt raw current or native handlers.
+                pass
 
     def _receive_limit_observation(self, payload: Any, charger_id: str) -> None:
         """Retain only selected native phase events, never GET/cache reads.
@@ -420,8 +525,6 @@ class EaseeCommandAdapter:
                 if stamp is not None and previous_highwater is not None:
                     if stamp < previous_highwater:
                         error = "easee_observation_timestamp_regressed"
-                    elif stamp == previous_highwater and number != self._native_current_values.get(key):
-                        error = "easee_observation_timestamp_value_changed"
                 if error:
                     self._native_current_errors[key] = error
                     changed = True
@@ -431,6 +534,14 @@ class EaseeCommandAdapter:
             previous_receipt = self._native_current_receipts.get(key)
             value_changed = previous_number != number
             first_observation = previous_receipt is None
+            same_bucket = stamp is not None and stamp == previous_highwater
+            bucket = self._native_current_bucket_values.get(key, set())
+            # Provider timestamps are not unique event IDs. In one coarse
+            # bucket, an unseen numeric raw observation is ordered new input.
+            # A return to an already seen value (or overflow) is numeric state
+            # only: never relabel the intervening value's clock as new proof.
+            ambiguous = bool(same_bucket and value_changed
+                and (number in bucket or len(bucket) >= 64))
             # Timestamp-only cache replies cannot label an intervening new A
             # value as an older A event. A later raw observation can establish
             # a NEW event in an unbound value epoch only when its source UTC is
@@ -447,6 +558,7 @@ class EaseeCommandAdapter:
                 self._native_current_values[key] = number
                 self._native_current_receipts[key] = received
                 self._native_current_sequences[key] += 1
+                self._native_current_evidence_credit[key] = not ambiguous
                 # A genuinely new unchanged-value source event can also be
                 # one frame of a multi-conductor burst. Defer only new offer
                 # authority until that evidence burst has had time to settle.
@@ -458,6 +570,11 @@ class EaseeCommandAdapter:
                 self._native_current_source_times[key] = stamp
             if stamp is not None:
                 self._native_current_source_highwaters[key] = stamp
+                if not same_bucket:
+                    self._native_current_bucket_values[key] = {number}
+                elif len(bucket) < 64:
+                    bucket.add(number)
+                    self._native_current_bucket_values[key] = bucket
         # Only a complete valid raw publication can finish a divergence
         # episode. A poll briefly returning the old tuple cannot renew the
         # watchdog by making an intermediate getter appear coherent.
@@ -532,6 +649,8 @@ class EaseeCommandAdapter:
                 if self._native_current_values.get(key) == numbers[key]
                 and key in self._native_current_receipts and key not in self._native_current_errors),
             observation_sequences=tuple(sorted(self._native_current_sequences.items())),
+            observation_evidence_credit=tuple((key, self._native_current_evidence_credit.get(key, False))
+                for key in sorted(numbers)),
             source_metadata_highwaters=tuple(sorted(self._native_current_source_highwaters.items())),
             error=error, last_tuple_change_monotonic=self._native_current_changed_at,
             committed=True, sdk_current=max(sdk.values()) if sdk is not None else None,
@@ -602,6 +721,7 @@ class EaseeCommandAdapter:
         self._hook_connection = None
         self._delivery_callback = None
         self._current_observation_callback = None
+        self._telemetry_callback = None
         self._limit_observed_values = [None, None, None]
         self._limit_receipts = [None, None, None]
         self._native_current_values.clear()
@@ -896,7 +1016,13 @@ class EaseeCommandAdapter:
             return "easee_telemetry_invalid"
         return None
 
-    async def async_execute(self, decision: Any) -> CommandSubmission:
+    async def async_execute_with_dispatch(self, decision: Any, on_dispatch: Any) -> CommandSubmission:
+        """Expose the exact local admission/SDK boundary to the controller."""
+        if not callable(on_dispatch):
+            raise CommandNotSent("invalid_dispatch_callback")
+        return await self.async_execute(decision, on_dispatch=on_dispatch)
+
+    async def async_execute(self, decision: Any, *, on_dispatch: Any = None) -> CommandSubmission:
         """Submit a limit or pause/resume, raising unless the API accepted it.
 
         No deduplication: repeating the same circuit limit must renew the TTL.
@@ -904,12 +1030,12 @@ class EaseeCommandAdapter:
         """
         problem = self._resolve_runtime()
         if problem:
-            raise EaseeAdapterError(problem)
+            raise CommandNotSent(problem)
         command = decision.command
         if command in {"set_limit", "resume"}:
             currents = (decision.current_p1, decision.current_p2, decision.current_p3)
             if any(type(value) is not int or not 0 <= value <= 40 for value in currents):
-                raise EaseeAdapterError("invalid_phase_current")
+                raise CommandNotSent("invalid_phase_current")
             ttl = decision.ttl_seconds
             if (
                 isinstance(ttl, bool)
@@ -917,24 +1043,25 @@ class EaseeCommandAdapter:
                 or not isfinite(ttl)
                 or not 0 < ttl <= 1080 * 60
             ):
-                raise EaseeAdapterError("finite_ttl_required")
+                raise CommandNotSent("finite_ttl_required")
             ttl_minutes = ceil(ttl / 60)
             if command == "resume" and (currents[0] < 6 or currents[1:] != (0, 0)):
-                raise EaseeAdapterError("resume_requires_safe_l1_cap")
+                raise CommandNotSent("resume_requires_safe_l1_cap")
             if any(currents) or command == "resume":
                 health_problem = self.telemetry_block_reason
                 if health_problem:
-                    raise EaseeAdapterError(health_problem)
+                    raise CommandNotSent(health_problem)
         elif command != "pause":
-            raise EaseeAdapterError("unsupported_easee_command")
+            raise CommandNotSent("unsupported_easee_command")
 
         # A concurrent state read can resolve replacement objects while this
         # command awaits the cloud. Keep the whole sequence on its original
         # charger and never resume a replacement after capping the old circuit.
         identity = self._runtime_identity()
         charger, circuit = self._charger, self._circuit
-        started = _monotonic()
+        started = None
         self.last_submission_receipt = None
+        sdk_started = False
 
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
@@ -945,7 +1072,21 @@ class EaseeCommandAdapter:
                     self._require_same_runtime(identity, healthy=command == "resume" or
                                                (command == "set_limit" and any(currents)))
                     if command in {"set_limit", "resume"}:
-                        self._admit_limit(any(currents))
+                        previous = getattr(decision, "committed_current_p1", None)
+                        protective = bool(command == "set_limit"
+                            and getattr(decision, "command_urgency", "normal") == "protective_reduction"
+                            and type(previous) is int and 0 < currents[0] <= 7 and currents[0] < previous
+                            and currents[1:] == (0, 0))
+                        self._admit_limit(any(currents), protective=protective, record=False)
+                    if on_dispatch is not None and on_dispatch() is not True:
+                        raise CommandNotSent("dispatch_context_rejected")
+                    if command in {"set_limit", "resume"}:
+                        # No await separates admission from this record and
+                        # SDK entry. A rejected callback spends no rate slot.
+                        self._request_starts.append(_monotonic())
+                    started = _monotonic()
+                    sdk_started = True
+                    if command in {"set_limit", "resume"}:
                         result = await self._await_sdk(circuit.set_dynamic_current(*currents, ttl_minutes))
                         receipt = await self._read_submission(result, currents, started, 22)
                     if command in {"pause", "resume"}:
@@ -958,13 +1099,17 @@ class EaseeCommandAdapter:
                     self._require_same_runtime(identity, healthy=False)
                     self.last_submission_receipt = receipt
                     return receipt
-        except EaseeAdapterError:
+        except EaseeAdapterError as err:
+            if not sdk_started:
+                raise CommandNotSent(str(err), retry_after_seconds=getattr(err, "retry_after_seconds", 0.)) from None
             raise
         except Exception as err:
+            if not sdk_started:
+                raise CommandNotSent("local_dispatch_"+type(err).__name__.lower(), retry_after_seconds=1.) from None
             raise EaseeAdapterError(f"easee_request_failed:{type(err).__name__}") from None
 
-    def _admit_limit(self, nonzero: bool) -> None:
-        """Keep four of twelve SDK slots free from our nonzero writes.
+    def _admit_limit(self, nonzero: bool, *, protective: bool = False, record: bool = True) -> None:
+        """Reserve three SDK slots for a qualified decrease and one for zero.
 
         Native/manual users may share the SDK queue; this is admission for our
         own requests, not a guarantee of available cloud or device capacity.
@@ -974,9 +1119,15 @@ class EaseeCommandAdapter:
         now = _monotonic()
         while self._request_starts and now - self._request_starts[0] > ADMISSION_PERIOD_SECONDS:
             self._request_starts.popleft()
-        if nonzero and len(self._request_starts) >= NONZERO_ADMISSION_LIMIT:
-            raise EaseeAdapterError("positive_rate_capacity_exhausted")
-        self._request_starts.append(now)
+        limit = PROTECTIVE_NONZERO_ADMISSION_LIMIT if protective else NONZERO_ADMISSION_LIMIT
+        if nonzero and len(self._request_starts) >= limit:
+            # Enough preceding records must age out to fall strictly below
+            # this class's bound; a higher-priority burst can use reserve slots.
+            release = self._request_starts[len(self._request_starts)-limit]
+            delay = max(.001, release+ADMISSION_PERIOD_SECONDS-now+.001)
+            raise CommandNotSent("positive_rate_capacity_exhausted", retry_after_seconds=delay)
+        if record:
+            self._request_starts.append(now)
 
     async def _await_sdk(self, coroutine):
         task = asyncio.create_task(coroutine)
