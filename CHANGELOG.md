@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0b34
+
+- Keep an already accepted startup/rise response with its existing owner
+  before ordinary lower-offer routing can reinterpret an EV-first report.
+  A genuine partial vehicle ramp ahead of the meter can retain the accepted
+  cap within the original bounded observation phase, rather than triggering
+  an unnecessary decrease followed by a low-grid stop.
+- Preserve the same source binding, finite lease, household anchor and
+  original response deadline. This changes routing, not overload admission,
+  exposure accounting, source timestamp ordering or electrical peak limits.
+
 ## 0.4.0b33
 
 - Permit independently raw-bounded normal recovery while an automatic

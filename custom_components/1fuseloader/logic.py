@@ -5102,6 +5102,31 @@ class OneFuseRegulator:
             self._restart_required = True
             return decision("unavailable", "Accepted positive response source binding changed; requesting 0 A.",
                             "set_limit", emergency=True)
+        # An already accepted normal rise owns its mixed startup reports
+        # before an ordinary raw fallback may propose a different lower cap.
+        # The same original source, lease, anchor, clock and custom guards
+        # apply; this handler cannot create a new positive authority.
+        ramp = self._positive_ramp_plan(now, grid, current, status)
+        if ramp == "hold":
+            cap, house = self._positive_cap, self._positive_house
+            assert cap is not None and house is not None and self.last_target is not None
+            house_basis = "accepted_positive_ramp_owner"
+            available = int(floor(min(s.max_charge_amps, s.main_fuse_amps-s.buffer_amps-house)))
+            soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+            pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+            self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
+            if s.enable_pause_resume and pause:
+                return decision("pause", "Pause guard overrides the existing positive-current ramp owner.", "pause", emergency=True)
+            if s.enable_soft_guard and soft and s.soft_current_amps < cap:
+                soft_target = max(0, s.soft_current_amps)
+                if soft_target < s.min_charge_amps:
+                    soft_target = 0
+                    self._restart_required = True
+                return decision("soft_limit", "Soft guard overrides the existing positive-current ramp owner.",
+                                "set_limit", soft_target, s.soft_ttl_seconds, emergency=True)
+            refresh_required = True
+            return decision("positive_ramp_hold", "Preserving only the live accepted offer and prior normal house anchor through genuine partial startup reports inside the original measurement window; no command, increase, resume or lease renewal.",
+                            None, cap, self.last_target[3])
         ordinary_plan = self._ordinary_lower_offer_plan(inp, now, grid, current, status)
         if ordinary_plan is not None:
             mode, reason, command, cap, house = ordinary_plan
@@ -5297,32 +5322,14 @@ class OneFuseRegulator:
                 and grid <= s.main_fuse_amps - s.buffer_amps
                 and self._last_input_grid_ts > self._last_input_charger_ts):
             self._nominal_shedding_started = self._nominal_shedding_budget = None
-        ramp = self._positive_ramp_plan(now, grid, current, status)
+        # An expired rise gets no retained higher cap. Preserve the existing
+        # earlier opportunity to replace it with an independently raw-bounded
+        # lower offer; only an otherwise unhandled timeout is terminal here.
         if ramp == "timeout":
             self._clear_positive_alignment()
             self._restart_required = True
             return decision("unavailable", "Accepted positive-current ramp exhausted its original measurement window; requesting 0 A.",
                             "set_limit", emergency=True)
-        if ramp == "hold":
-            cap, house = self._positive_cap, self._positive_house
-            assert cap is not None and house is not None and self.last_target is not None
-            house_basis = "accepted_positive_ramp_owner"
-            available = int(floor(min(s.max_charge_amps, s.main_fuse_amps-s.buffer_amps-house)))
-            soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
-            pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
-            self._timer_reached(now, "below_resume_since", grid < s.resume_below_amps, s.resume_for_seconds)
-            if s.enable_pause_resume and pause:
-                return decision("pause", "Pause guard overrides the existing positive-current ramp owner.", "pause", emergency=True)
-            if s.enable_soft_guard and soft and s.soft_current_amps < cap:
-                soft_target = max(0, s.soft_current_amps)
-                if soft_target < s.min_charge_amps:
-                    soft_target = 0
-                    self._restart_required = True
-                return decision("soft_limit", "Soft guard overrides the existing positive-current ramp owner.",
-                                "set_limit", soft_target, s.soft_ttl_seconds, emergency=True)
-            refresh_required = True
-            return decision("positive_ramp_hold", "Preserving only the live accepted offer and prior normal house anchor through genuine partial startup reports inside the original measurement window; no command, increase, resume or lease renewal.",
-                            None, cap, self.last_target[3])
         if self._normal_grid_first_hold(now, grid, current, house, status):
             # The normal raw envelope is already below every experimental
             # ceiling. Observe custom guards before retaining the old offer.

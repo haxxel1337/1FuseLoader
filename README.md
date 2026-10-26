@@ -105,6 +105,13 @@ Fresh raw L1 and the entire offer beside its prior house anchor must both fit
 the normal buffer, with the same binding, live lease and valid source guards.
 The hold sends no write, renewal, increase or resume.
 
+From b34, this existing startup/rise owner is considered before the ordinary
+lower-offer fallback as well as the low-grid fallback. An EV-first partial
+report therefore cannot replace the same active response with a new lower
+offer merely because the meter still shows the pre-start household load.
+The original owner must qualify under its existing guards; it receives no
+new lease, observation time or authority from this routing precedence.
+
 The first qualifying mismatch fixes one source-aged observation deadline inside
 the existing configured alignment budget. Grid-first observations provide no
 EV response credit; later partial reports cannot restart the clock. A genuine
