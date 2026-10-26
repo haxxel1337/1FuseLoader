@@ -1828,7 +1828,7 @@ class OneFuseLoaderController:
                 should_call_service=self.settings.active_control,
             )
         if (decision.mode.removeprefix("dry_run_") in {
-                "normal_shedding_sync", "normal_shedding_grid_wait", "overload_grid_wait"}
+                "normal_shedding_sync", "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait"}
                 and decision.current_p1 > 0):
             # Synchronization retains only an existing live offer. It cannot
             # write, renew a lease, or resume, even if a stale plan says so.
@@ -1889,7 +1889,7 @@ class OneFuseLoaderController:
                 and decision.nominal_sync_deadline_ts is not None
                 and self.hass.loop.time() < decision.nominal_sync_deadline_ts)
             grid_hold = bool(decision.mode.removeprefix("dry_run_") in {
-                    "normal_shedding_grid_wait", "overload_grid_wait"}
+                    "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait"}
                 and decision.command is None and not decision.should_call_service
                 and decision.grid_confirmation_deadline_ts is not None
                 and self.hass.loop.time() < decision.grid_confirmation_deadline_ts
@@ -2054,6 +2054,8 @@ class OneFuseLoaderController:
                 action_timeout = min(action_timeout, max(0.001, response_deadline - self.hass.loop.time()))
             if positive_submission and raw_response_deadline is not None:
                 action_timeout = min(action_timeout, max(0.001, raw_response_deadline - self.hass.loop.time()))
+            if not self.regulator.begin_submission(decision, self.hass.loop.time()):
+                raise RuntimeError("invalid_command_submission_context")
             self._dispatch_task = self.hass.async_create_task(self._adapter.async_execute(decision))
             receipt = await asyncio.wait_for(self._dispatch_task, action_timeout)
             if self._dispatch_superseded or self._stopped or generation != self._generation:

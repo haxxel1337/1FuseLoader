@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0b29
+
+- Use one fixed post-minimum confirmation model for low-grid alignment,
+  bounded nominal shedding and an explicit overload transition when the
+  optional confirmation window is enabled. A qualifying response inside the
+  original at-most-10-second window can await a later grid report for the
+  selected time; another route cannot reinterpret it as an unobserved response.
+- Debit retry throttles only immediately before an actual adapter invocation.
+  A proposed 7 A request discarded during checkpoint/source verification no
+  longer consumes the action interval without ever reaching the adapter.
+- Retire a fully qualified raw-budget rise response before its unconfirmed
+  response-timeout branch. If an unconfirmed rise times out and explicit
+  import-only/bounded control prove that the complete minimum fits beside raw
+  grid, hand its existing authority to a distinct source-aged minimum decrease.
+  This grants neither more time to the rise nor new overload permission.
+- Preserve source provenance, leases, peak/ceiling protections, terminal zeros,
+  manual policy, recovery barriers and cumulative trial history. Download or
+  restart does not start a new trial or clear a spent budget. Observed report
+  order still does not prove synchronized physical sampling or timely cloud
+  delivery; the cause of every native charger interruption is not established.
+
 ## 0.4.0b28
 
 - Add a separate, default-off `grid_confirmation_seconds` setting (0–30 s)

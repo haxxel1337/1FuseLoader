@@ -190,7 +190,33 @@ interrupted, so a late write or restart cannot resume it automatically. A later
 period requires a new eligible, explicit start. No automatic cooling or rearm
 is inferred.
 
-### Optional grid confirmation after a timely response (b28)
+### Command and response phases (b29)
+
+A proposal, an actual adapter attempt, HTTP acceptance, reported EV response
+and grid confirmation are separate events. Only an actual adapter attempt
+starts the retry throttle. Discarding an unsent proposal after a checkpoint or
+source revision neither debits that throttle nor restarts its response clock.
+
+With the optional grid-confirmation setting enabled, low-grid alignment,
+bounded nominal shedding and explicit overload transitions use the same fixed
+minimum-response confirmation phase. Its first qualifying EV response owns
+the only deadline, capped by the existing lease. Waiting sends no command,
+increase, resume or TTL renewal. A completed response retires its old owner;
+a protective zero ends the observation phase rather than leaving it alive.
+
+A raw-budget rise has its own bounds and receives no minimum-response grace.
+If that unconfirmed rise expires, explicit import-only/bounded control may
+instead request a distinct minimum decrease when raw grid plus the entire
+minimum fits the normal buffered budget. The old higher authority remains
+accounted for while that decrease awaits its own post-acceptance response.
+Its source-aged response deadline is fixed once; retries do not renew it.
+
+An expired lease, invalid source/binding or terminal protection cannot use
+this handoff. It does not activate an overload period or clear history.
+Cloud acknowledgement and delayed telemetry remain best-effort evidence;
+offline tests do not establish the cause of every physical interruption.
+
+### Optional grid confirmation after a timely response (introduced in b28)
 
 **Grid Confirmation After Timely Minimum Response** is a separate setting,
 `grid_confirmation_seconds`, with **0** as its default. Zero keeps the existing
@@ -201,7 +227,8 @@ and as a Number entity.
 When explicitly selected, this window applies only after a qualifying reported
 minimum-current EV response inside the original response deadline, which remains
 at most **10 seconds**. It permits waiting for a later grid observation in the
-bounded nominal-reduction path or an explicit overload trial. For a setting of
+low-grid minimum alignment, bounded nominal reduction or an explicit overload
+trial. For a setting of
 30, the fixed grid deadline is anchored to the **first** qualifying response.
 Repeated current reports, HTTP receipts, GET requests and lease renewals cannot
 start another 30 seconds. It grants no time for a late EV response, current

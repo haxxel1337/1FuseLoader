@@ -168,9 +168,17 @@ class NormalSheddingTests(unittest.TestCase):
         self.assertEqual(self.sample(r, 43, 38.0001, 16.2, et=-10).current_p1, 0)
 
     def test_failed_proposal_retries_only_after_action_interval(self):
-        r = self.pending(accept=False)
+        r = self.running_sixteen()
+        failed = self.sample(r, 40, 26.1, 16.2, et=-10, accept=False)
+        self.assertEqual((failed.mode, failed.current_p1), ("normal_shedding", 7))
+        self.assertEqual(failed.nominal_response_deadline_ts, 50)
+        # A real failed API attempt, rather than an unsent proposal, spends
+        # the retry throttle without acknowledging a new accepted cap.
+        self.assertTrue(r.begin_submission(failed, 40))
         self.assertFalse(self.sample(r, 41, 26.1, 16.2, et=-10, accept=False).should_call_service)
-        self.assertTrue(self.sample(r, 45, 26.1, 16.2, et=-10, accept=False).should_call_service)
+        retry = self.sample(r, 45, 26.1, 16.2, et=-10, accept=False)
+        self.assertTrue(retry.should_call_service)
+        self.assertTrue(r.begin_submission(retry, 45))
         self.assertEqual(self.sample(r, 50, 26.1, 16.2, et=-10).current_p1, 0)
 
     def test_soft_pause_and_bound_changes_override_response(self):
