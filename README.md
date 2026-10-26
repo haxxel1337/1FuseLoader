@@ -50,6 +50,30 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Charging readiness while disconnected (b32, explicit opt-in)
+
+**Charging Readiness While Disconnected** (`disconnected_readiness`) is off by
+default. When enabled, an actually disconnected charger can receive and renew
+a finite normal circuit limit before the vehicle connects. The calculation
+uses fresh raw grid current without subtracting a cached vehicle reading:
+`floor(main fuse - buffer - raw L1)`, bounded by the configured startup and
+maximum current. Other phases remain zero. This grants no overload permission
+and sends no start, resume, authentication or scheduling commands.
+
+Only a successful adapter acknowledgement creates an in-memory readiness
+owner. Its original finite lease, source identity and normal headroom proof
+remain binding. A healthy connection can hand that accepted offer into the
+normal startup observation path without an artificial idle restart delay or
+an intervening zero. Old vehicle measurements do not count as a new response.
+Completed, paused and scheduled sessions are not disconnected readiness.
+Source, delivery, actual peak and durable protective guards remain active;
+readiness is not restored as an accepted offer across a Home Assistant restart.
+
+While a checkpoint is still being verified, a previously accepted normal
+offer may remain unchanged when independently safe, even if a higher normal
+offer is available. The higher proposal is withheld: retaining the old offer
+does not renew its lease or authorize another charger call.
+
 ### Accepted startup and rise responses (b31)
 
 With the peak-triggered policy selected, a partial vehicle ramp does not become

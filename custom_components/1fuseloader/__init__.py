@@ -165,9 +165,11 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             "overload_lifetime_used_seconds", "overload_trial_state", "overload_trial_used_seconds",
             "overload_trial_remaining_seconds", "overload_trial_failure_reason",
             "grid_confirmation_deadline_ts", "grid_confirmation_remaining_seconds",
+            "readiness_deadline_ts",
             "peak_only_response", "response_policy", "peak_response_trigger_amps",
             "peak_response_active", "peak_response_deadline_ts", "ordinary_lower_offer_pending",
             "automatic_overload_cycles", "automatic_cycle_state", "automatic_cycle_used_seconds",
+            "disconnected_readiness",
             "automatic_cycle_remaining_seconds", "automatic_cycle_failure_reason",
             "automatic_qualification_seconds", "automatic_cooling_seconds",
             "budget_storage_error", "budget_storage_error_type", "budget_verification_pending",
@@ -270,6 +272,7 @@ class OneFuseLoaderController:
         self._positive_retry_after = 0.0
         self._dispatch_task: asyncio.Task | None = None
         self._dispatch_input: RegulatorInput | None = None
+        self._dispatch_decision: Any = None
         self._dispatch_positive = False
         self._dispatch_superseded = False
         self._protective_zero_pending = False
@@ -690,8 +693,19 @@ class OneFuseLoaderController:
                 rising_load = grid > ceiling and grid > planned_grid
             except (TypeError, ValueError, OverflowError):
                 rising_load = True
-            if (not latest.data_valid or latest.status.strip().lower() not in START_ALLOWED_STATUSES
-                    or latest.control_source_id != self._dispatch_input.control_source_id or rising_load):
+            readiness_dispatch = (self._dispatch_decision is not None
+                and self._dispatch_decision.mode.removeprefix("dry_run_") == "disconnected_ready")
+            if readiness_dispatch:
+                # Only the exact normal-budget readiness proposal may finish
+                # across a benign unplugged/connected status transition. The
+                # regulator validates its source, fixed age and protective
+                # barriers; a disconnected status alone grants no exception.
+                rejected = not self.regulator.can_continue_readiness_dispatch(
+                    self._dispatch_input, latest, self._dispatch_decision)
+            else:
+                rejected = (not latest.data_valid or latest.status.strip().lower() not in START_ALLOWED_STATUSES
+                    or latest.control_source_id != self._dispatch_input.control_source_id or rising_load)
+            if rejected:
                 self._cancel_positive_dispatch()
         self._pending_refresh = True
         if self._refresh_task is None or self._refresh_task.done():
@@ -1682,10 +1696,13 @@ class OneFuseLoaderController:
             "peak_response_deadline_ts": self.regulator.peak_response_deadline(),
             "ordinary_lower_offer_pending": self.regulator._ordinary_lower is not None,
             "automatic_overload_cycles": self.regulator.settings.automatic_overload_cycles,
+            "disconnected_readiness": self.regulator.settings.disconnected_readiness,
             **self.regulator.automatic_cycle_diagnostics(),
             **({"mode": self.last_decision.mode, "reason": self.last_decision.reason,
                 "current_p1": self.last_decision.current_p1, "current_p2": self.last_decision.current_p2,
-                "current_p3": self.last_decision.current_p3} if self.last_decision is not None else {}),
+                "current_p3": self.last_decision.current_p3,
+                "readiness_deadline_ts": getattr(self.last_decision, "readiness_deadline_ts", None)}
+                if self.last_decision is not None else {}),
             "zero_confirmation_scope": "native_ProductUpdate_receipt_and_correlated_delivery_not_physical_response",
             "last_command_attempt": dict(self.last_command_attempt) if self.last_command_attempt else None,
             "last_accepted_command": dict(self.last_accepted_command) if self.last_accepted_command else None,
@@ -1761,6 +1778,28 @@ class OneFuseLoaderController:
         inp = self._read_input()
         no_overload_authority = (not r.automatic_cycle_requires_checkpoint
             and not r._overload_hold_active and r._overload_transition_started is None)
+        if (decision.mode.removeprefix("dry_run_") == "readiness_wait"
+                and self._budget_loaded and no_overload_authority):
+            # This connected waiting phase can retain only the old accepted
+            # Ready lease. It grants neither a write nor additional lifetime.
+            return r.can_retain_readiness_wait(inp, decision)
+        if (decision.mode.removeprefix("dry_run_") == "disconnected_ready"
+                and self._budget_loaded and no_overload_authority
+                and not self._protective_zero_pending
+                and self.hass.loop.time() >= self._positive_retry_after
+                and not self._delivery.unresolved_correlated_zero):
+            receipt = self._delivery.latest
+            ordered_zero = self._delivery.can_skip_zero(**self._zero_readback_evidence(
+                inp, require_new_current=False))
+            zero_barrier = bool(receipt and receipt.phases == (0, 0, 0)
+                and (receipt.http_status is not None or receipt.state in {
+                    "submission_failed_unverified", "superseded_unverified", "vendor_rejected"})
+                and not ordered_zero)
+            if not zero_barrier and r.can_dispatch_pending_readiness(inp, decision):
+                # A loaded ledger with an unfinished verification is not a new
+                # overload allowance. Only an independent whole-raw normal
+                # offer while genuinely disconnected may use this path.
+                return True
         if (decision.mode.removeprefix("dry_run_") == "positive_ramp_hold"
                 and no_overload_authority):
             # A centrally qualified existing owner grants NO action or lease.
@@ -1898,6 +1937,14 @@ class OneFuseLoaderController:
                 self._budget_retry_at = 0.0
         if self._stopped or generation != self._generation:
             return
+        previous_offer = self.regulator.last_target
+        if (decision.mode == "normal" and decision.command == "set_limit"
+                and previous_offer is not None and 0 < previous_offer[0] < decision.current_p1):
+            retained = replace(decision, current_p1=previous_offer[0], current_p2=0, current_p3=0,
+                command=None, service=None, should_call_service=False,
+                reason="Exposure verification is pending; retaining the existing normal offer without the proposed increase.")
+            if self._pending_checkpoint_allows_normal(retained, inp):
+                decision = retained
         pending_normal = self._pending_checkpoint_allows_normal(decision, inp)
         checkpoint_unverified = bool(self._budget_error and not pending_normal or (
             self.settings.automatic_overload_cycles
@@ -1931,13 +1978,18 @@ class OneFuseLoaderController:
             )
         elif pending_normal:
             decision = replace(decision, reason=decision.reason +
-                " Exposure verification is pending; only this independently raw-bounded normal offer is permitted.")
-            if decision.current_p1 == self.regulator.last_target[0]:
+                " Exposure verification is pending; only this independently validated normal offer is permitted.")
+            retaining_ready = (decision.mode.removeprefix("dry_run_") == "disconnected_ready")
+            retain_without_renewal = (
+                self.regulator.can_retain_readiness_offer(self._read_input(), decision) if retaining_ready
+                else self.regulator.last_target is not None
+                    and decision.current_p1 == self.regulator.last_target[0])
+            if retain_without_renewal:
                 # Retention may not extend an old lease while verification waits.
                 decision = replace(decision, command=None, service=None, should_call_service=False)
         if (decision.mode.removeprefix("dry_run_") in {
                 "normal_shedding_sync", "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait",
-                "ordinary_grid_wait", "overload_peak_hold", "positive_ramp_hold"}
+                "ordinary_grid_wait", "overload_peak_hold", "positive_ramp_hold", "readiness_wait"}
                 and decision.current_p1 > 0):
             # Synchronization retains only an existing live offer. It cannot
             # write, renew a lease, or resume, even if a stale plan says so.
@@ -1968,6 +2020,19 @@ class OneFuseLoaderController:
             return
         positive_submission = decision.command == "resume" or (
             decision.command == "set_limit" and decision.current_p1 > 0)
+        readiness_context = getattr(decision, "readiness_context", None)
+        readiness_deadline = (_finite_current_number(getattr(readiness_context, "deadline", None))
+            if decision.mode.removeprefix("dry_run_") in {"disconnected_ready", "connected_ready"} else None)
+        if (positive_submission and readiness_deadline is not None
+                and self.hass.loop.time() >= readiness_deadline):
+            self.regulator.reject_submission(decision, self.hass.loop.time())
+            self.last_service_result = "not_sent"
+            self.last_decision = replace(decision, mode="waiting_for_latest_sources",
+                reason="The readiness proposal expired before dispatch; recalculating from current sources.",
+                should_call_service=False)
+            self._handle_source_change(None)
+            self.notify()
+            return
         raw_response_deadline = getattr(decision, "raw_budget_response_deadline_ts", None)
         if (positive_submission and decision.raw_budget_rise_context is not None
                 and raw_response_deadline is not None
@@ -2172,10 +2237,13 @@ class OneFuseLoaderController:
         receipt_record = self._delivery.begin(decision.command,
             (decision.current_p1, decision.current_p2, decision.current_p3), self.hass.loop.time())
         self._dispatch_input = inp
+        self._dispatch_decision = decision
         self._dispatch_positive = positive_submission
         self._dispatch_superseded = False
         try:
             action_timeout = ACTION_TIMEOUT_SECONDS
+            if positive_submission and readiness_deadline is not None:
+                action_timeout = min(action_timeout, max(0.001, readiness_deadline - self.hass.loop.time()))
             if positive_submission and response_deadline is not None:
                 action_timeout = min(action_timeout, max(0.001, response_deadline - self.hass.loop.time()))
             if positive_submission and raw_response_deadline is not None:
@@ -2229,6 +2297,7 @@ class OneFuseLoaderController:
         finally:
             self._dispatch_task = None
             self._dispatch_input = None
+            self._dispatch_decision = None
             self._dispatch_positive = False
         attempt["delivery"] = receipt_record.public()
         attempt["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
@@ -2353,7 +2422,7 @@ class OneFuseLoaderController:
             # Separate, nonrenewable measurement synchronization; the original
             # high-load response allowance is never extended by this timer.
             delays.append(sync_deadline - self.hass.loop.time() + elapsed)
-        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts", "positive_response_deadline_ts"):
+        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts", "positive_response_deadline_ts", "readiness_deadline_ts"):
             deadline = getattr(decision, name, None)
             if decision.current_p1 > 0 and deadline is not None:
                 # Fixed source/response clocks survive event churn and every

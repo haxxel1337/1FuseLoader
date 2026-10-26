@@ -91,7 +91,11 @@
           "bounded_nominal_shedding": "Bounded lower-current trial after overload lockout (explicit opt-in)",
           "peak_only_response": "Peak-triggered response policy (10-second emergency only above 28 A; explicit opt-in)",
           "grid_confirmation_seconds": "Grid confirmation after timely minimum-current response (seconds; 0 = off, maximum 30)",
-          "automatic_overload_cycles": "Automatic Overload Cycles (explicit opt-in; requires peak-triggered response policy)"
+          "automatic_overload_cycles": "Automatic Overload Cycles (explicit opt-in; requires peak-triggered response policy)",
+          "disconnected_readiness": "Charging Readiness While Disconnected (explicit opt-in)"
+        },
+        "data_description": {
+          "disconnected_readiness": "Off by default. While disconnected, keep a normal L1 offer ready only when fresh raw grid current plus the entire offer fits the ordinary buffer. L2 and L3 stay at 0 A. This uses no EV-current subtraction or overload allowance and sends no start or resume command. A fresh connection may adopt the same live, accepted offer without a new restart delay; the vehicle response clock starts only after connection. Source, command-delivery, storage, lease and stronger protective guards still apply. Manual pauses, authorization and schedules are not overridden."
         }
       }
     },

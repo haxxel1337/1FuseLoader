@@ -58,6 +58,7 @@ class RegulatorSettings:
     # Existing installations keep their older response contract until selected.
     peak_only_response: bool = False
     automatic_overload_cycles: bool = False
+    disconnected_readiness: bool = False
     minimum_reserve_amps: float = 0.5
     increase_stable_seconds: int = 30
     increase_interval_seconds: int = 15
@@ -163,6 +164,24 @@ class PeakResponseOwner:
     grid_source_ts: Optional[float]
     previous_authority: int
     interrupted: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyOfferContext:
+    source_id: str | tuple
+    cap: int
+    house: float
+    grid_ts: float
+    generation: int
+    deadline: float
+    proposed_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class ReadyOwner:
+    context: ReadyOfferContext
+    accepted_at: float
+    lease_expires: float
 
 
 @dataclass(slots=True)
@@ -298,6 +317,8 @@ class RegulatorDecision:
     raw_budget_rise_context: Optional[RawBudgetRiseContext] = None
     raw_budget_response_deadline_ts: Optional[float] = None
     positive_response_deadline_ts: Optional[float] = None
+    readiness_context: Optional[ReadyOfferContext] = None
+    readiness_deadline_ts: Optional[float] = None
     source_processing_deadline_ts: Optional[float] = None
     grid_confirmation_deadline_ts: Optional[float] = None
     grid_confirmation_remaining_seconds: Optional[float] = None
@@ -339,6 +360,11 @@ class OneFuseRegulator:
         self._peak_last_grid_value: Optional[float] = None
         self._peak_last_current_value: Optional[float] = None
         self._ordinary_lower: Optional[OrdinaryLowerOffer] = None
+        self._ready_owner: Optional[ReadyOwner] = None
+        self._readiness_observation: Optional[tuple] = None
+        self._readiness_generation = 0
+        self._readiness_protective_stop = False
+        self._readiness_wait_deadline: Optional[float] = None
         self._automatic_cycle: Optional[dict] = None
         self._automatic_qualification_gt: Optional[float] = None
         self._automatic_qualification_since: Optional[float] = None
@@ -796,6 +822,168 @@ class OneFuseRegulator:
                 and not self._ev_clock_explicit):
             return ("legacy_peak_source",)
         return identity
+
+    def invalidate_readiness(self, reason: str = "invalidated") -> None:
+        """Forget memory-only unplugged authority; never alter stored budgets."""
+        self._ready_owner = None
+        self._readiness_observation = None
+        self._readiness_wait_deadline = None
+        self._readiness_generation += 1
+
+    def _readiness_barrier(self) -> bool:
+        return bool(self._readiness_protective_stop or self.paused_by_us
+            or self._uncertainty_ceiling is not None or self._uncertainty_stops
+            or self._uncertainty_retry_submission_pending or self._uncertainty_restart
+            or self._low_grid_pending or self._low_grid_failure is not None
+            or self._normal_shed_deadline is not None or self._normal_shed_failure is not None
+            or self._overload_transition_started is not None or self._overload_hold_active
+            or self._peak_response is not None or self._minimum_confirmation is not None)
+
+    def _readiness_source(self, inp: RegulatorInput) -> bool:
+        shadow = deepcopy(self)
+        shadow._observe_ev_clock(inp)
+        now, wall, gt, grid = (None if isinstance(v, bool) else _valid_number(v)
+            for v in (inp.now_ts, inp.wall_now_ts, inp.grid_report_ts, inp.grid_l1))
+        identity = self._trial_identity(inp.control_source_id)
+        return bool(self.settings.disconnected_readiness and self.settings.active_control
+            and not self.settings.dry_run and self.settings.enable_dynamic_limit
+            and inp.data_valid and not inp.data_error and inp.charger_current_trusted is True
+            and shadow._ev_clock_error is None and identity is not None
+            and (not shadow._ev_event_source_known or shadow._ev_event_source_ts is not None
+                 and wall is not None and shadow._ev_event_source_ts <= wall+5)
+            and now is not None and wall is not None and gt is not None and grid is not None
+            and grid >= 0 and 0 <= wall-gt <= self.settings.max_sensor_age_seconds)
+
+    def can_continue_readiness_dispatch(self, original: RegulatorInput, latest: RegulatorInput,
+                                       decision: RegulatorDecision) -> bool:
+        """Only the original already-started finite ready request may continue."""
+        ctx = decision.readiness_context
+        now = None if isinstance(latest.now_ts, bool) else _valid_number(latest.now_ts)
+        return bool(isinstance(ctx, ReadyOfferContext)
+            and decision.mode.removeprefix("dry_run_") == "disconnected_ready"
+            and original.status.strip().lower() == "disconnected"
+            and ctx.generation == self._readiness_generation and ctx.cap == decision.current_p1
+            and original.control_source_id == ctx.source_id == latest.control_source_id
+            and self._readiness_source(latest) and not self._readiness_barrier()
+            and latest.status.strip().lower() in START_ALLOWED_STATUSES | {"disconnected"}
+            and now is not None and now < ctx.deadline
+            and _valid_number(latest.grid_l1) <= self.settings.main_fuse_amps-self.settings.buffer_amps
+            and (latest.status.strip().lower() != "disconnected" or
+                 _valid_number(latest.grid_l1)+ctx.cap <= self.settings.main_fuse_amps-self.settings.buffer_amps)
+            and ctx.house+ctx.cap <= self.settings.main_fuse_amps-self.settings.buffer_amps
+            and _valid_number(latest.grid_report_ts) >= ctx.grid_ts)
+
+    def _disconnected_ready_plan(self, inp: RegulatorInput):
+        if not self._readiness_source(inp) or self._readiness_barrier():
+            return None
+        s = self.settings
+        identity = self._trial_identity(inp.control_source_id)
+        grid, now, gt, wall = (_valid_number(v) for v in
+                              (inp.grid_l1, inp.now_ts, inp.grid_report_ts, inp.wall_now_ts))
+        cap = int(floor(min(s.max_charge_amps, s.main_fuse_amps-s.buffer_amps-grid)))
+        if cap < self.startup_current:
+            return None
+        if inp.status.strip().lower() == "disconnected":
+            self._readiness_observation = (identity, now, gt, self._readiness_generation)
+        window = min(s.measurement_settle_seconds, s.max_sensor_age_seconds)
+        origin = now-(wall-gt)
+        if window <= 0 or origin+window <= now:
+            return None
+        return ReadyOfferContext(identity, cap, grid, gt,
+                                 self._readiness_generation, origin+window, now)
+
+    def _adopt_readiness(self, inp: RegulatorInput) -> bool:
+        owner = self._ready_owner
+        if owner is None:
+            return False
+        ctx = owner.context
+        if (not self._readiness_source(inp) or self._readiness_barrier()
+                or inp.status.strip().lower() not in START_ALLOWED_STATUSES
+                or inp.control_source_id != ctx.source_id or self.last_target is None
+                or self.last_target[0] != ctx.cap or self.last_set_limit_ts != ctx.proposed_at
+                or not owner.accepted_at <= _valid_number(inp.now_ts) < owner.lease_expires
+                or _valid_number(inp.grid_report_ts) < ctx.grid_ts):
+            self.invalidate_readiness("ready_owner_invalid")
+            return False
+        grid, current = _valid_number(inp.grid_l1), _valid_number(inp.charger_current)
+        if (inp.status.strip().lower() != "charging"
+                and grid+ctx.cap > self.settings.main_fuse_amps-self.settings.buffer_amps):
+            return False  # Keep the real Ready lease; waiting is not house-load proof.
+        if grid > self.settings.main_fuse_amps-self.settings.buffer_amps:
+            if not self._meaningfully_charging(inp.status.strip().lower(), current):
+                self.invalidate_readiness("connected_load_unconfirmed")
+                return False
+            # The accepted lease is real; an actual charging reconnection is
+            # ordinary control, not an idle-restart zero. Peak/load guards below
+            # still decide any required decrease, without a normal anchor hold.
+            self._clear_positive_alignment()
+        else:
+            self._clear_positive_alignment()
+            self._positive_cap, self._positive_house = ctx.cap, ctx.house
+            self._positive_readiness_session = True
+            self._positive_grid_ts, self._positive_ev_ts = ctx.grid_ts, self._last_input_charger_ts
+            self._positive_before_current = current if self._meaningfully_charging(inp.status.strip().lower(), current) else 0.
+            self._pin_ev_owner("_positive_ev_ts", wall_floor=self._last_input_wall_now_ts)
+            if self._readiness_wait_deadline is not None:
+                self._positive_ramp_deadline = self._readiness_wait_deadline
+                self._positive_skew_since = self._readiness_wait_deadline-min(
+                    self.settings.measurement_settle_seconds, self.settings.max_sensor_age_seconds)
+        self._restart_required = False  # Only the separately accepted fresh-session owner.
+        self._restart_ready_since = None
+        self._ready_owner = None
+        self._readiness_observation = None
+        self._readiness_wait_deadline = None
+        return True
+
+    def can_dispatch_pending_readiness(self, inp: RegulatorInput, decision: RegulatorDecision) -> bool:
+        ctx = decision.readiness_context
+        return bool(inp.status.strip().lower() == "disconnected"
+            and isinstance(ctx, ReadyOfferContext) and not decision.dry_run
+            and decision.command == "set_limit" and decision.current_p2 == decision.current_p3 == 0
+            and self.can_continue_readiness_dispatch(inp, inp, decision))
+
+    def can_retain_readiness_offer(self, inp: RegulatorInput, decision: RegulatorDecision) -> bool:
+        owner = self._ready_owner
+        now = None if isinstance(inp.now_ts, bool) else _valid_number(inp.now_ts)
+        return bool(owner is not None and self._readiness_source(inp) and not self._readiness_barrier()
+            and inp.status.strip().lower() == "disconnected" and now is not None
+            and owner.accepted_at <= now < owner.lease_expires
+            and owner.context.source_id == inp.control_source_id
+            and owner.context.generation == self._readiness_generation
+            and self.last_target is not None and self.last_target[0] == owner.context.cap == decision.current_p1
+            and self.last_set_limit_ts == owner.context.proposed_at
+            and _valid_number(inp.grid_l1)+owner.context.cap <= self.settings.main_fuse_amps-self.settings.buffer_amps)
+
+    def can_retain_readiness_wait(self, inp: RegulatorInput, decision: RegulatorDecision) -> bool:
+        owner = self._ready_owner
+        now = None if isinstance(inp.now_ts, bool) else _valid_number(inp.now_ts)
+        shadow = deepcopy(self)
+        shadow._observe_ev_clock(inp)
+        grid, wall = _valid_number(inp.grid_l1), _valid_number(inp.wall_now_ts)
+        if (shadow._ev_clock_error is not None or grid is None or wall is None or now is None
+                or shadow._ev_event_source_known and (shadow._ev_event_source_ts is None
+                    or shadow._ev_event_source_ts > wall+5)):
+            return False
+        soft = shadow._timer_reached(now, "above_soft_since", grid > self.settings.soft_limit_amps,
+                                     self.settings.soft_for_seconds)
+        pause = shadow._timer_reached(now, "above_pause_since", grid > self.settings.pause_limit_amps,
+                                      self.settings.pause_for_seconds)
+        if owner is not None and (self.settings.enable_pause_resume and pause
+                or self.settings.enable_soft_guard and soft and self.settings.soft_current_amps < owner.context.cap):
+            return False
+        return bool(owner is not None and self._readiness_wait_deadline is not None
+            and decision.mode.removeprefix("dry_run_") == "readiness_wait"
+            and decision.command is None and not decision.should_call_service
+            and decision.readiness_deadline_ts == self._readiness_wait_deadline
+            and self._readiness_source(inp) and not self._readiness_barrier()
+            and inp.status.strip().lower() in START_ALLOWED_STATUSES
+            and now is not None and owner.accepted_at <= now < min(owner.lease_expires, self._readiness_wait_deadline)
+            and owner.context.source_id == inp.control_source_id
+            and owner.context.generation == self._readiness_generation
+            and self.last_target is not None and self.last_target[0] == owner.context.cap == decision.current_p1
+            and self.last_set_limit_ts == owner.context.proposed_at
+            and _valid_number(inp.grid_l1) <= self.settings.main_fuse_amps-self.settings.buffer_amps
+            and owner.context.house+owner.context.cap <= self.settings.main_fuse_amps-self.settings.buffer_amps)
 
     def _peak_whole_authority(self) -> int:
         values = [self.last_target[0] if self.last_target else 0,
@@ -1472,6 +1660,8 @@ class OneFuseRegulator:
             raise ValueError("Peak-only electrical response policy must be a boolean")
         if type(settings.automatic_overload_cycles) is not bool:
             raise ValueError("Automatic overload cycles must be a boolean")
+        if type(settings.disconnected_readiness) is not bool:
+            raise ValueError("Disconnected readiness must be a boolean")
         if settings.automatic_overload_cycles and (not settings.peak_only_response
                 or settings.main_fuse_amps != 25 or settings.startup_charge_amps != 7):
             raise ValueError("Automatic cycles require the peak-only 25 A / 7 A overload policy")
@@ -1499,6 +1689,7 @@ class OneFuseRegulator:
         if settings.automatic_overload_cycles:
             self._ensure_automatic_cycle()
         if previous_settings != settings:
+            self.invalidate_readiness("settings_changed")
             self._break_automatic_continuity()
             if self._automatic_cycle is not None and self._automatic_cycle["state"] == "active":
                 self._automatic_cycle["state"] = "ready"
@@ -1534,6 +1725,7 @@ class OneFuseRegulator:
     def reset(self) -> None:
         # Routine controller resets must not grant another overload budget.
         self._break_automatic_continuity()
+        self.invalidate_readiness("controller_reset")
         self._terminate_trial("interrupted", "controller_reset")
         self._ordinary_lower = None
         self._clear_minimum_confirmation("ordinary")
@@ -2588,6 +2780,7 @@ class OneFuseRegulator:
         self._positive_raw_recovery = False
         self._positive_raw_window_seconds: Optional[float] = None
         self._positive_ramp_deadline: Optional[float] = None
+        self._positive_readiness_session = False
 
     def _positive_ramp_plan(self, now: float, grid: float, current: float, status: str):
         """One existing accepted rise owns its partial startup reports.
@@ -2601,7 +2794,8 @@ class OneFuseRegulator:
         wall, gt, et = self._last_input_wall_now_ts, self._last_input_grid_ts, self._last_input_charger_ts
         rejection = self._numeric_source_rejection()
         native_cache = self._last_input_native_committed and not self._last_input_snapshot_verified
-        if (not s.peak_only_response or not s.enable_dynamic_limit or self._positive_raw_recovery
+        if (not (s.peak_only_response or s.disconnected_readiness and self._positive_readiness_session)
+                or not s.enable_dynamic_limit or self._positive_raw_recovery
                 or self._restart_required or self.paused_by_us or status not in START_ALLOWED_STATUSES
                 or cap is None or anchor is None or self.last_target is None or self.last_target[0] != cap
                 or not s.min_charge_amps <= cap <= s.max_charge_amps
@@ -2733,7 +2927,7 @@ class OneFuseRegulator:
         now = None if isinstance(inp.now_ts, bool) else _valid_number(inp.now_ts)
         cap = decision.current_p1
         return bool(fresh.mode.removeprefix("dry_run_") == "normal"
-            and fresh.current_p1 == cap and fresh.command in {None, "set_limit"}
+            and fresh.current_p1 >= cap and fresh.command in {None, "set_limit"}
             and now is not None and shadow.last_set_limit_ts is not None
             and 0 <= now-shadow.last_set_limit_ts < shadow.last_target[3]
             and inp.status.strip().lower() == "charging" and inp.charger_current_trusted is True
@@ -3538,6 +3732,7 @@ class OneFuseRegulator:
             comparable_policy["settings"].setdefault("grid_confirmation_seconds", 0)
             comparable_policy["settings"].setdefault("peak_only_response", False)
             comparable_policy["settings"].setdefault("automatic_overload_cycles", False)
+            comparable_policy["settings"].setdefault("disconnected_readiness", False)
             valid = bool(type(epoch.get("version")) is int and epoch["version"] == 1
                 and isinstance(epoch.get("trial_id"), str) and epoch["trial_id"].strip()
                 and len(epoch["trial_id"]) <= 128 and identity is not None
@@ -3566,6 +3761,7 @@ class OneFuseRegulator:
         pending response is therefore latched as interrupted, never renewed.
         Invalid persisted state fails closed instead of refunding exposure.
         """
+        self.invalidate_readiness("exposure_state_import")
         previous_trial = deepcopy(self._trial_epoch)
         peak_valid = self._restore_peak_response(state)
         previous_used, previous_failure = self._overload_used_seconds, self._overload_failure_reason
@@ -3953,6 +4149,8 @@ class OneFuseRegulator:
         """
         if not isinstance(reason, str) or not reason:
             reason = "controller_protective_zero"
+        self.invalidate_readiness(reason)
+        self._readiness_protective_stop = True
         if (self._overload_transition_started is not None or self._overload_hold_active
                 or self.automatic_cycle_requires_checkpoint):
             self._fail_overload(reason)
@@ -4002,6 +4200,36 @@ class OneFuseRegulator:
     def acknowledge(self, decision: RegulatorDecision, now_ts: float) -> None:
         """Commit bookkeeping after API submission succeeds, never before it."""
         if not decision.should_call_service or decision.dry_run or decision.command is None:
+            return
+        if decision.mode.removeprefix("dry_run_") in {"disconnected_ready", "connected_ready"}:
+            ctx = decision.readiness_context
+            valid = bool(isinstance(ctx, ReadyOfferContext) and self.settings.disconnected_readiness
+                and ctx.generation == self._readiness_generation
+                and type(now_ts) in (int, float) and isfinite(now_ts) and now_ts < ctx.deadline
+                and now_ts < ctx.proposed_at+decision.ttl_seconds
+                and decision.current_p1 == ctx.cap and decision.current_p2 == decision.current_p3 == 0
+                and self._last_input_control_source_id == ctx.source_id
+                and self._last_input_current_trusted and self._ev_clock_error is None
+                and self._last_input_status in START_ALLOWED_STATUSES | {"disconnected"}
+                and not self._readiness_barrier())
+            self.last_action_ts = self.last_set_limit_ts = now_ts
+            self.last_command = "set_limit"
+            self.last_target = (decision.current_p1, 0, 0, decision.ttl_seconds)
+            if not valid:
+                self.invalidate_readiness("obsolete_ready_ack")
+                self._readiness_protective_stop = self._restart_required = True
+                return
+            self._accepted_control_source_id = ctx.source_id
+            self.last_set_limit_ts = ctx.proposed_at
+            self._last_limit_change_ts = now_ts
+            self._accepted_control_ev_ts = self._last_input_charger_ts
+            self._pin_ev_owner("_accepted_control_ev_ts", wall_floor=self._ack_wall(now_ts))
+            self._clear_positive_alignment()
+            self._awaiting_reduction_target = self._house_before_reduction = self._settle_started = None
+            self._clear_partial_reduction_alignment()
+            self._restart_required = self._readiness_protective_stop = False
+            self._restart_ready_since = None
+            self._ready_owner = ReadyOwner(ctx, now_ts, ctx.proposed_at+decision.ttl_seconds)
             return
         if (decision.command == "set_limit" and decision.current_p1 > 0
                 and decision.recovery_submission_ts is not None
@@ -4279,6 +4507,7 @@ class OneFuseRegulator:
                 # It is a new nominal attempt, not a TTL refund of the old one.
                 self._nominal_shedding_started = self._nominal_shedding_budget = None
                 self._restart_required = False
+                self._readiness_protective_stop = False
                 self._restart_ready_since = None
             if target > 0 and self._uncertainty_restart:
                 # Only actual acceptance of the qualified, capped restart
@@ -4543,6 +4772,7 @@ class OneFuseRegulator:
         refresh_required = False
         house_basis = "grid_minus_reported_ev"
         source_processing_deadline = None
+        readiness_context = None
         if self.last_target is None and not current_fresh:
             # Initial takeover cannot be seeded from an old retained EV value.
             available, house = self.calculate_available_l1(grid, 0.0)
@@ -4558,6 +4788,9 @@ class OneFuseRegulator:
         def decision(mode: str, reason: str, command: str | None = None,
                      target: int = 0, ttl: int | None = None, emergency: bool = False) -> RegulatorDecision:
             if command == "pause" or command == "set_limit" and target == 0:
+                self.invalidate_readiness(mode)
+                if status != "disconnected" and self.last_target is not None and self.last_target[0] > 0:
+                    self._readiness_protective_stop = True
                 # A terminal protection has one outcome. An old observation
                 # phase must not survive zero as diagnostic or future authority.
                 self._minimum_confirmation = None
@@ -4678,6 +4911,8 @@ class OneFuseRegulator:
                 positive_response_deadline_ts=(self._positive_ramp_deadline
                     if target > 0 and self._positive_ramp_deadline is not None
                     and now < self._positive_ramp_deadline else None),
+                readiness_context=readiness_context,
+                readiness_deadline_ts=(self._readiness_wait_deadline if mode == "readiness_wait" else None),
                 source_processing_deadline_ts=source_processing_deadline,
                 grid_confirmation_deadline_ts=grid_confirmation_deadline,
                 grid_confirmation_remaining_seconds=(max(0.0, grid_confirmation_deadline - now)
@@ -4731,11 +4966,18 @@ class OneFuseRegulator:
             error = f"Charger status '{status}' is unavailable, unsupported or a fault."
         if not self._observe_overload_time(observed_now, grid, not bool(error)):
             error = "Controller time is invalid or moved backwards."
+        if not error and status in START_ALLOWED_STATUSES and self._ready_owner is not None:
+            self._adopt_readiness(inp)
+        elif status not in START_ALLOWED_STATUSES | {"disconnected"} and self._ready_owner is not None:
+            self.invalidate_readiness("status_not_ready")
         self.observe_automatic_cycle(inp, source_valid=not bool(error))
         trial_error = self._trial_continuity_error(inp)
         if trial_error is not None:
             error = error or trial_error
         if error:
+            self.invalidate_readiness("source_invalid")
+            if inp.charger_current_trusted is not True or self._ev_clock_error is not None:
+                self._readiness_protective_stop = True
             if self._low_grid_pending:
                 self._low_grid_failure = "source_invalid"
                 self._low_grid_pending = False
@@ -4757,7 +4999,30 @@ class OneFuseRegulator:
             return decision("unavailable", f"{error} Requesting 0 A; cloud control is best effort.",
                             "set_limit", emergency=True)
 
+        if status == "disconnected" and s.disconnected_readiness:
+            first = self._readiness_observation is None
+            if self._ready_owner is not None and now >= self._ready_owner.lease_expires:
+                self.invalidate_readiness("ready_lease_expired")
+                first = True
+            readiness_context = self._disconnected_ready_plan(inp)
+            if readiness_context is None:
+                self.invalidate_readiness("disconnected_guard")
+                self._restart_required = True
+                return decision("disconnected_protected", "Disconnected readiness is withheld by source, normal headroom or an existing protective barrier.", "set_limit", 0)
+            self._clear_positive_alignment()
+            self._awaiting_reduction_target = self._house_before_reduction = self._settle_started = None
+            self._clear_partial_reduction_alignment()
+            self._waiting_for_vehicle_since = None
+            self._restart_required = True  # Fresh session only; actual ready ACK releases it.
+            house, available = grid, readiness_context.cap
+            house_basis = "disconnected_raw_whole_offer"
+            result = decision("disconnected_ready", "Preparing a finite ordinary current limit while physically disconnected; raw L1 plus the entire offer fits the normal buffer, without EV subtraction or a start/resume command.",
+                "set_limit", readiness_context.cap, s.normal_ttl_seconds)
+            if first and s.active_control and not s.dry_run:
+                result.should_call_service = True
+            return result
         if status in IDLE_STATUSES:
+            self.invalidate_readiness("idle_status")
             self.clear_peak_response_session()
             self._ordinary_lower = None
             self._clear_minimum_confirmation("ordinary")
@@ -4780,6 +5045,40 @@ class OneFuseRegulator:
             self._clear_bounded_nominal_shedding()
             self._clear_low_grid_alignment()
             return decision("idle", f"Status '{status}' does not require charge control.")
+
+        if self._ready_owner is not None and status in START_ALLOWED_STATUSES:
+            owner = self._ready_owner
+            if self._readiness_wait_deadline is None:
+                origin = now-(self._last_input_wall_now_ts-self._last_input_grid_ts)
+                self._readiness_wait_deadline = min(owner.lease_expires,
+                    origin+min(s.measurement_settle_seconds, s.max_sensor_age_seconds))
+            house, available = owner.context.house, owner.context.cap
+            house_basis = "accepted_ready_owner_waiting_for_vehicle"
+            waiting = decision("readiness_wait", "The existing Ready limit remains accepted while connected status/current reports align; no command, lease renewal, start or resume.", None, owner.context.cap)
+            if self.can_retain_readiness_wait(inp, waiting):
+                soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
+                pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
+                if s.enable_pause_resume and pause or s.enable_soft_guard and soft and s.soft_current_amps < owner.context.cap:
+                    self.invalidate_readiness("custom_guard")
+                    self._readiness_protective_stop = self._restart_required = True
+                    return decision("unavailable", "Custom load guard overrides readiness waiting.", "set_limit", 0)
+                return waiting
+            self.invalidate_readiness("ready_wait_expired_or_invalid")
+            self._readiness_protective_stop = self._restart_required = True
+            return decision("unavailable", "The existing Ready lease or fixed observation window is no longer valid.", "set_limit", 0)
+
+        observation = self._readiness_observation
+        if (self._ready_owner is None and observation is not None and s.disconnected_readiness
+                and status in START_ALLOWED_STATUSES and not self._readiness_barrier()
+                and self._readiness_source(inp) and observation[0] == self._last_input_control_source_id
+                and observation[3] == self._readiness_generation
+                and 0 <= now-observation[1] <= s.max_sensor_age_seconds):
+            readiness_context = self._disconnected_ready_plan(inp)
+            if readiness_context is not None:
+                house, available = grid, readiness_context.cap
+                house_basis = "fresh_connection_raw_whole_offer"
+                return decision("connected_ready", "Fresh connection has a newly raw-bounded ordinary offer; setting a limit only, without inventing an ACK, response, start or resume.",
+                    "set_limit", readiness_context.cap, s.normal_ttl_seconds)
 
         assert grid is not None
         assert current is not None

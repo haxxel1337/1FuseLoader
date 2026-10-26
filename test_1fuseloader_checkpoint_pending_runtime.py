@@ -380,6 +380,33 @@ class CheckpointPendingRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(.05)
         self.assertEqual(self.adapter.calls, [])
 
+    async def test_pending_normal_increase_retains_lower_live_offer_without_renewing_it(self):
+        regulator, store, original = await self.delayed_store()
+        self.publish(170., 13., 8., receipt=169.7)
+        planned = regulator.evaluate(self.controller._read_input())
+        self.assertEqual((planned.mode, planned.current_p1), ("normal", 16))
+        self.assertEqual(regulator.last_target[0], 14)
+        accepted_at = regulator.last_set_limit_ts
+        with self.assertLogs(fixtures.runtime._LOGGER, level="WARNING"):
+            await self.controller.async_tick()
+        self.assertTrue(store.verification_pending)
+        self.assertEqual(self.adapter.calls, [])
+        retained = self.controller.last_decision
+        self.assertEqual((retained.mode, retained.current_p1), ("normal", 14))
+        self.assertEqual((retained.command, retained.service, retained.should_call_service),
+                         (None, None, False))
+        self.assertEqual(regulator.last_target[0], 14)
+        self.assertEqual(regulator.last_set_limit_ts, accepted_at)
+        self.assertFalse(regulator._restart_required)
+        # The late verification cannot replay the withheld 16 A plan. Only a
+        # later evaluation from current sources may consider that increase.
+        self.controller._stopped = True
+        store.store.async_save = original
+        await store.async_wait_pending()
+        await asyncio.sleep(.05)
+        self.assertEqual(self.adapter.calls, [])
+        self.assertEqual(regulator.last_set_limit_ts, accepted_at)
+
     def test_storage_failure_and_pending_state_survive_recorder_compaction(self):
         actual = dict(budget_storage_error="overload_budget_save_pending",
             budget_storage_error_type="TimeoutError", budget_verification_pending=True,
