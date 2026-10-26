@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.4.0b29
+
+- Add default-off **Automatic Overload Cycles**, requiring the peak-triggered
+  response policy. Advancing raw L1 observations above 25 A for 30 seconds
+  qualify an automatic period; extra overload permission during qualification
+  already requires an at-most-7 A EV offer, sustained ceiling of at most 29 A
+  and the same 1800-second cumulative budget above 25 A. Independently proven
+  normal buffered offers remain allowed. A reading at or below 25 A clears unfinished qualification
+  without refunding time. Re-arm requires fresh, advancing raw L1 strictly
+  below 23 A for 1800 continuous seconds, including for a partially used cycle.
+  Gaps, restarts and rebinding break that observation. Lifetime exposure and
+  historical faults remain; current guards are not cleared. This is an
+  operational test rule, not verified fuse cooling. Default/manual behavior
+  remains unchanged.
+- Add the explicit, default-off `peak_only_response` installation policy.
+  Only a validated raw L1 sample above 28 A and within the configured hard
+  peak limit creates its electrical response countdown. Ordinary observation
+  work cannot create that countdown from a house estimate or numeric mismatch.
+  Existing installations retain their prior policy until deliberately selected.
+- Under that policy, keep an independently raw-bounded lower offer while
+  trustworthy observations align. Its entire minimum must fit beside raw import
+  inside the normal buffer, with zero EV subtraction; no increase or resume is
+  authorized by this fallback. A genuine post-ACK minimum response may enter
+  the fixed grid-confirmation phase without a fictitious electrical deadline.
+- Keep a single source-aged peak owner across repeated frames and threshold
+  oscillation. Pending peak state is interrupted on restore/reset; neither
+  loading the update nor selecting the policy refills the exposure budget.
+- Use one fixed post-minimum confirmation model for low-grid alignment,
+  bounded nominal shedding and an explicit overload transition when the
+  optional confirmation window is enabled. The new policy separates ordinary
+  response admission from the at-most-10-second electrical peak interval;
+  another route cannot reinterpret the active observation phase as a fresh
+  unobserved electrical response.
+- Debit retry throttles only immediately before an actual adapter invocation.
+  A proposed 7 A request discarded during checkpoint/source verification no
+  longer consumes the action interval without ever reaching the adapter.
+- Reject a known post-response high grid sample using its directly associated
+  EV provider-event floor even when the local EV receipt arrives later. This
+  stricter rejection floor cannot create response credit, shorten the original
+  response interval or prove successful confirmation from an earlier sample.
+- Retire a fully qualified raw-budget rise response before its unconfirmed
+  response-timeout branch. If an unconfirmed rise times out and explicit
+  import-only/bounded control prove that the complete minimum fits beside raw
+  grid, hand its existing authority to a distinct source-aged minimum decrease.
+  This grants neither more time to the rise nor new overload permission.
+- Preserve source provenance, leases, peak/ceiling protections, terminal zeros,
+  manual policy, recovery barriers and cumulative trial history. Download or
+  restart does not start a new trial or clear a spent budget. Observed report
+  order still does not prove synchronized physical sampling or timely cloud
+  delivery; the cause of every native charger interruption is not established.
+
 ## 0.4.0b28
 
 - Add a separate, default-off `grid_confirmation_seconds` setting (0–30 s)

@@ -49,6 +49,8 @@ OPT_DRY_RUN = "dry_run"
 OPT_FAST_RECOVERY = "fast_recovery"
 OPT_NOMINAL_IMPORT_ONLY_FALLBACK = "nominal_import_only_fallback"
 OPT_BOUNDED_NOMINAL_SHEDDING = "bounded_nominal_shedding"
+OPT_PEAK_ONLY_RESPONSE = "peak_only_response"
+OPT_AUTOMATIC_OVERLOAD_CYCLES = "automatic_overload_cycles"
 OPT_ENABLE_DYNAMIC_LIMIT = "enable_dynamic_limit"
 OPT_ENABLE_SOFT_GUARD = "enable_soft_guard"
 OPT_ENABLE_PAUSE_RESUME = "enable_pause_resume"
@@ -93,6 +95,10 @@ DEFAULT_OPTIONS = {
     OPT_NOMINAL_IMPORT_ONLY_FALLBACK: False,
     # Explicit local response trial, never a replenished overload allowance.
     OPT_BOUNDED_NOMINAL_SHEDDING: False,
+    # Installation-specific response policy; upgrades do not select it silently.
+    OPT_PEAK_ONLY_RESPONSE: False,
+    # Separate automatic lifecycle; the default/manual exposure policy stays unchanged.
+    OPT_AUTOMATIC_OVERLOAD_CYCLES: False,
     OPT_ENABLE_DYNAMIC_LIMIT: True,
     OPT_ENABLE_SOFT_GUARD: True,
     OPT_ENABLE_PAUSE_RESUME: True,
@@ -199,6 +205,12 @@ def validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("Soft current must not exceed maximum charge current")
     if result[OPT_MINIMUM_RESERVE_AMPS] > result[OPT_BUFFER_AMPS]:
         raise ValueError("Minimum reserve must not exceed the normal buffer")
+    if result[OPT_AUTOMATIC_OVERLOAD_CYCLES] and not result[OPT_PEAK_ONLY_RESPONSE]:
+        raise ValueError("Automatic overload cycles require the peak-triggered response policy")
+    if result[OPT_AUTOMATIC_OVERLOAD_CYCLES] and (
+        result[OPT_MAIN_FUSE_AMPS] != 25 or result[OPT_STARTUP_CHARGE_AMPS] != 7
+    ):
+        raise ValueError("Automatic overload cycles require the 25 A main fuse / 7 A startup profile")
     if result[OPT_OVERLOAD_ENABLED]:
         if not result[OPT_ENABLE_DYNAMIC_LIMIT]:
             raise ValueError("Experimental overload operation requires dynamic current control")

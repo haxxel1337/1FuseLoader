@@ -143,7 +143,19 @@ class OverloadBudgetStore:
                 or type(state.get("transition_pending")) is not bool):
             raise ValueError("Invalid exposure accounting")
         if state["exposure_active"]:
-            state["used_seconds"] = used + max(0.0, now - saved_at)
+            gap = max(0.0, now - saved_at)
+            state["used_seconds"] = used + gap
+            cycle = state.get("automatic_cycle")
+            if cycle is not None:
+                cycle_used = cycle.get("used_seconds") if isinstance(cycle, dict) else None
+                if (isinstance(cycle_used, bool) or not isinstance(cycle_used, (int, float))
+                        or not isfinite(cycle_used) or cycle_used < 0):
+                    raise ValueError("Invalid automatic cycle exposure accounting")
+                # Production import receives this already charged snapshot.
+                # Detach the nested state so the durable fingerprint below
+                # still describes the ORIGINAL on-disk checkpoint. A later
+                # verified save must commit both conservative counters.
+                state["automatic_cycle"] = {**cycle, "used_seconds": cycle_used + gap}
         self._gate.highest_used_seconds = max(self._gate.highest_used_seconds, state["used_seconds"])
         self._gate.durable_hash = self.fingerprint(payload["regulator"])
         self._gate.revision = payload.get("checkpoint_revision")

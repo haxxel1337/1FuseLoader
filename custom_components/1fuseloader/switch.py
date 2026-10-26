@@ -21,6 +21,8 @@ SWITCH_DESCRIPTIONS = [
     OneFuseSwitchDescription(key="active_control", option_key="active_control", name="Active Control", icon="mdi:power"),
     OneFuseSwitchDescription(key="dry_run", option_key="dry_run", name="Dry Run", icon="mdi:test-tube"),
     OneFuseSwitchDescription(key="fast_recovery", option_key="fast_recovery", name="Fast Headroom Recovery", icon="mdi:ev-station"),
+    OneFuseSwitchDescription(key="peak_only_response", option_key="peak_only_response", name="Peak-triggered Response Policy", icon="mdi:pulse"),
+    OneFuseSwitchDescription(key="automatic_overload_cycles", option_key="automatic_overload_cycles", name="Automatic Overload Cycles", icon="mdi:autorenew"),
     OneFuseSwitchDescription(key="enable_dynamic_limit", option_key="enable_dynamic_limit", name="Enable Dynamic Limit", icon="mdi:ev-station"),
     OneFuseSwitchDescription(key="enable_soft_guard", option_key="enable_soft_guard", name="Enable Soft Guard", icon="mdi:shield-half-full"),
     OneFuseSwitchDescription(key="enable_pause_resume", option_key="enable_pause_resume", name="Enable Pause Resume", icon="mdi:pause-play"),
