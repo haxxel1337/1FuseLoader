@@ -221,7 +221,11 @@ class LowGridAlignmentTests(unittest.TestCase):
         d = self.sample(r, 10, 2.4, 16.2, et=0)
         legacy = self.running(nominal_import_only_fallback=False)
         old = self.sample(legacy, 10, 2.4, 16.2, et=0, identity=None)
-        self.assertEqual((d.mode, d.current_p1), (old.mode, old.current_p1))
+        self.assertEqual((d.mode, d.current_p1), ("settling", 16))
+        # A missing binding is now a protective source change for ANY live
+        # positive offer, not only one with an unfinished rise owner.
+        self.assertEqual(old.current_p1, 0)
+        self.assertIn("source binding changed", old.reason)
         self.assertNotEqual(d.mode, "low_grid_alignment")
 
     def test_manual_pause_schedule_and_auth_cannot_use_new_path(self):

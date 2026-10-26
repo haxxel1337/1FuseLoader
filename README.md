@@ -50,6 +50,57 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Automatic overload cycles (b29, explicit opt-in)
+
+**Automatic Overload Cycles** (`automatic_overload_cycles`) is off by default.
+It requires **Peak-triggered Response Policy**; **Experimental Timed Overload**
+remains the separate gate for allowing overload operation. Existing entries keep
+the manual policy unless this option is deliberately enabled. The automatic
+profile grants extra overload permission only for a 25 A main fuse, an EV offer
+of at most 7 A and a sustained raw L1 ceiling of at most 29 A. Independently
+proven normal offers may still use the normal buffered capacity. An already accepted lower offer is
+never raised merely to enter this mode, and an idle vehicle is not started.
+
+| Phase | Observation and effect |
+| --- | --- |
+| Qualification | Fresh, advancing raw L1 observations must remain above 25 A for 30 seconds. Extra overload permission is already restricted to an EV offer of at most 7 A and sustained L1 of at most 29 A. Independently proven normal offers remain allowed. |
+| Active cycle | At most 1800 cumulative observed seconds above 25 A are available, including qualification and peak-response time. This is not a fresh 30 minutes after qualification. |
+| Re-arm observation | Fresh, advancing raw L1 must remain strictly below 23 A for 1800 continuous seconds. A completed observation can re-arm an exhausted or partially used cycle without a manual trial button. |
+
+A reading at or below 25 A clears unfinished qualification without refunding
+consumed time. During an active cycle, short dips pause exposure accounting;
+they do not create a new allowance. Re-arm requires the complete below-23 A
+observation: 23 A itself, a data gap, invalid or stale measurements, source
+rebinding and HA restart break that observation. Cached high or low frames
+cannot establish either continuous interval. Toggling options or restarting
+does not manufacture a fresh budget.
+
+For example, a fresh 26.6 A reading while the EV still reports 16.1 A may
+permit an independently verified reduction to 12 A inside the normal 23 A
+buffered ceiling. Qualification alone does not force that safe normal offer
+down to 7 A. Any extra permission to remain above the normal envelope still
+requires the bounded lower offer and the separate peak protections.
+
+The initial 30-second qualification, electrical peak response and post-EV grid
+confirmation are separate phases. A validated raw peak above 28 A and up to
+the configured hard limit of at most 38 A retains its original, sample-aged
+response bound of at most 10 seconds. A selected grid-confirmation window of
+at most 30 seconds can follow a qualifying genuine minimum-current response;
+waiting sends no API command or TTL renewal. Qualification and re-arm cannot
+renew either deadline. A known later grid sample above the applicable ceiling,
+excess peak, source fault, expired lease or stronger guard can stop earlier.
+
+When time is exhausted, the extra 29 A permission ends. Charging may continue
+only under independently proven normal limits; otherwise zero is requested.
+Cycle accounting and interrupted state are persisted. Re-arming retains the
+lifetime exposure and historical failure record, and does not clear a current
+protective fault. Restarts and source gaps cannot count as observed recovery.
+
+The below-23 A/1800-second rule is an operational test setting. It is **not a
+verified fuse-cooling model**, a measured fuse temperature or a guarantee of
+safe electrical overload. Cloud control and minimum-minute positive leases
+also cannot guarantee an exact physical reduction or stop deadline.
+
 ### Raw-budget recovery and pending-reduction cohorts (b27)
 
 With the verified import-only option enabled, unchanged EV telemetry need not
@@ -159,6 +210,9 @@ a controller fault merely because a later protective zero is recorded.
 
 ### Explicit experimental trial periods (b23)
 
+This is the default/manual lifecycle. The separately selected automatic policy
+above does not require these manual start/reset actions.
+
 **Start New Overload Trial (7 A)** starts a separately recorded software
 allowance. It sends no charger command and cannot start an idle vehicle. It
 requires an already charging vehicle, a live accepted positive offer, verified
@@ -169,8 +223,10 @@ Storage, command, source and normal-recovery barriers must be clear.
 Each period freezes this policy: reduce to 7 A at high load, require at most
 29 A total after the observed response, and count at most 1800 cumulative
 seconds above 25 A, including the bounded response phase. The existing peak
-ceiling of 38 A still applies. The minimum-current EV response must qualify
-inside the original fixed response window of at most 10 seconds. A separately
+ceiling of 38 A still applies. Under the default response policy, the
+minimum-current EV response must qualify inside the original fixed response
+window of at most 10 seconds. With the peak-triggered policy selected, that
+electrical window applies to an actual raw peak, as described below. A separately
 selected grid-confirmation window may follow only after that timely response.
 An infeasible 7 A offer, missing or invalid measurements, failed response or
 other protective condition may request zero earlier. This is not a fuse
@@ -187,10 +243,38 @@ It does not send a charger command itself; the next ordinary evaluation applies
 the remaining normal protections. Restart, reset, source or policy changes and
 source faults interrupt the period. Every restored pending or active period is
 interrupted, so a late write or restart cannot resume it automatically. A later
-period requires a new eligible, explicit start. No automatic cooling or rearm
-is inferred.
+manual period requires a new eligible, explicit start. This manual lifecycle
+does not infer cooling or automatic re-arm.
 
 ### Command and response phases (b29)
+
+**Peak-triggered Response Policy** (`peak_only_response`) is an explicit
+installation option, available in Configure and as a Switch. It defaults to
+off so upgrading an existing installation does not silently change its policy.
+
+When selected, only a valid raw L1 observation **above 28 A** arms the electrical
+response interval of at most **10 seconds**, within the configured hard peak
+limit of at most **38 A**. No A/s derivative is invented. A house-load estimate,
+cached EV observation or numeric mismatch at low grid load cannot arm it.
+Repeated frames, dips and cap changes do not reset an unresolved peak's first
+clock. A genuine completed response or an independent full-authority raw bound
+must retire that event; restored/reset pending events remain interrupted.
+
+Ordinary lower-current observation is a different phase. With explicit import-
+only and bounded control selected, the entire lower offer may be retained when
+it fits beside fresh raw import inside the normal buffer, with zero EV current
+subtraction. Previous higher authority remains recorded; this grants no rise
+or resume. A low-load mismatch or observation expiry alone does not create the
+electrical ten-second countdown. Source faults, binding/control loss, lease
+expiry and unavailable safe authority remain separate protective conditions.
+
+An active overload period may hold its minimum at 26–28 A total
+without inventing that peak countdown. Its 29 A ceiling and cumulative time
+above 25 A remain unchanged. The peak-response option alone does not start a
+period, clear history or turn a spent legacy budget into a new allowance. The
+separate automatic policy applies only under its qualification and re-arm rules.
+An existing stricter
+accepted limit (for example 6 A) is never raised to 7 A during a peak.
 
 A proposal, an actual adapter attempt, HTTP acceptance, reported EV response
 and grid confirmation are separate events. Only an actual adapter attempt
@@ -225,13 +309,16 @@ The setting accepts whole seconds up to **30** and is available in Configure
 and as a Number entity.
 
 When explicitly selected, this window applies only after a qualifying reported
-minimum-current EV response inside the original response deadline, which remains
-at most **10 seconds**. It permits waiting for a later grid observation in the
+minimum-current EV response. Under the peak-triggered policy, an actual peak
+requires that response inside its original at-most-**10-second** interval;
+ordinary lower-offer observation has no invented ten-second admission gate.
+With the peak-triggered policy off, the earlier response contract is retained.
+The window permits waiting for a later grid observation in the
 low-grid minimum alignment, bounded nominal reduction or an explicit overload
-trial. For a setting of
+period, including an automatic cycle. For a setting of
 30, the fixed grid deadline is anchored to the **first** qualifying response.
 Repeated current reports, HTTP receipts, GET requests and lease renewals cannot
-start another 30 seconds. It grants no time for a late EV response, current
+start another 30 seconds. It grants no extra electrical peak-response time, current
 increase, resume, new exposure budget or bypass of source/current protections.
 While waiting, the controller retains only the already accepted live minimum
 offer: it sends no API command and does not renew its TTL. The wait is also
@@ -265,8 +352,9 @@ measurements or guarantee delivery within either software window.
 
 The three **Overload Trial** sensors show state, used seconds and remaining
 seconds. Their attributes distinguish period failure from historical failure
-and lifetime exposure. An installation without a recorded trial retains the
-legacy experimental behavior described below. Upgrading does not clear a spent
+and lifetime exposure. An installation without a recorded trial or selected
+automatic policy retains the legacy experimental behavior described below.
+Upgrading does not clear a spent
 legacy budget, start a period or start charging. Normal minimum current remains
 separately configurable; the explicit period minimum is 7 A.
 
@@ -298,7 +386,7 @@ and later coherent grid observation can complete the held response.
 These nominal-control repairs did not change the experimental overload contract
 below. An enabled experimental switch with exhausted time or a saved failure
 does not grant another 30-minute period. B23 adds the separate explicit start
-described above; it adds no automatic reset.
+described above; it adds no automatic reset to the default/manual policy.
 
 ### Command delivery and low-grid alignment (b19)
 
@@ -430,7 +518,8 @@ window. Neither the prior experimental failure nor consumed time is erased.
 This deadline bounds local decisions. Easee rounds positive TTL to at least
 one minute and the cloud command is best effort; physical reduction or stop
 within ten seconds is not guaranteed. Do not use a blown fuse to calibrate a
-cooling model. This version introduces no automatic thermal-budget reset.
+cooling model. Automatic cycle re-arm uses the separately documented raw-load
+observation rule; it is not a verified thermal-budget reset.
 
 Same base formula as the old `sensor.easee_max_available_l1_v2`:
 
@@ -652,9 +741,12 @@ draw. Updating or restarting does not clear an existing safety latch.
 Exposure is cumulative rather than a thermal cooling estimate. The controller
 persists its budget and unresolved exposure across unload/restart and setting
 changes; a short dip below the fuse rating, toggling the switch or restarting HA
-does not grant another 30 minutes. B23's explicit-period start records a new
+does not grant another 30 minutes. Under the default/manual policy, B23's
+explicit-period start records a new
 baseline without resetting the lifetime counter; it is not a budget-reset
-button. Unknown elapsed exposure is handled conservatively. Diagnostic sensors
+button. Automatic cycles have a separate, explicit qualification/re-arm policy
+described above; they also retain lifetime exposure and historical faults.
+Unknown elapsed exposure is handled conservatively. Diagnostic sensors
 show used/remaining time, the response window and any latched failure.
 
 A blocked timed-overload profile does not by itself forbid a proven normal

@@ -30,7 +30,7 @@ from .const import (
 from .easee_adapter import EaseeCommandAdapter
 from .command_delivery import CommandDeliveryTracker
 from .bmw_context import BMWContext
-from .logic import ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, START_ALLOWED_STATUSES, OneFuseRegulator, RegulatorInput, RegulatorSettings
+from .logic import ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, START_ALLOWED_STATUSES, PEAK_RESPONSE_TRIGGER_AMPS, OneFuseRegulator, RegulatorInput, RegulatorSettings
 from .overload_persistence import OverloadBudgetStore
 from .mqtt_freshness import MqttL1Config, MqttL1Source
 
@@ -165,6 +165,11 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             "overload_lifetime_used_seconds", "overload_trial_state", "overload_trial_used_seconds",
             "overload_trial_remaining_seconds", "overload_trial_failure_reason",
             "grid_confirmation_deadline_ts", "grid_confirmation_remaining_seconds",
+            "peak_only_response", "response_policy", "peak_response_trigger_amps",
+            "peak_response_active", "peak_response_deadline_ts", "ordinary_lower_offer_pending",
+            "automatic_overload_cycles", "automatic_cycle_state", "automatic_cycle_used_seconds",
+            "automatic_cycle_remaining_seconds", "automatic_cycle_failure_reason",
+            "automatic_qualification_seconds", "automatic_cooling_seconds",
             "recent_command_journal_count", "recent_stop_contexts_count", "recent_command_deliveries_count",
             "last_command_attempt", "last_accepted_command", "last_accepted_limit",
             "diagnostics_scope", "diagnostics_truncated",
@@ -1670,6 +1675,14 @@ class OneFuseLoaderController:
         return self.compact_state_attributes({
             **self.source_diagnostics,
             **delivery,
+            "peak_only_response": self.regulator.settings.peak_only_response,
+            "response_policy": ("raw_peak_over_28_only" if self.regulator.settings.peak_only_response else "legacy"),
+            "peak_response_trigger_amps": PEAK_RESPONSE_TRIGGER_AMPS,
+            "peak_response_active": self.regulator.peak_response_active,
+            "peak_response_deadline_ts": self.regulator.peak_response_deadline(),
+            "ordinary_lower_offer_pending": self.regulator._ordinary_lower is not None,
+            "automatic_overload_cycles": self.regulator.settings.automatic_overload_cycles,
+            **self.regulator.automatic_cycle_diagnostics(),
             **({"mode": self.last_decision.mode, "reason": self.last_decision.reason,
                 "current_p1": self.last_decision.current_p1, "current_p2": self.last_decision.current_p2,
                 "current_p3": self.last_decision.current_p3} if self.last_decision is not None else {}),
@@ -1779,6 +1792,7 @@ class OneFuseLoaderController:
         if (self._budget_error != "overload_budget_restore_failed"
                 and (self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"]
                      or exposure.get("trial_epoch") is not None
+                     or exposure.get("automatic_cycle") is not None
                      or self._normal_control_checkpoint_pending)
                 and self.hass.loop.time() >= self._budget_retry_at):
             try:
@@ -1806,6 +1820,10 @@ class OneFuseLoaderController:
             return
         if decision.current_p1 > 0 and (
             self._budget_error or (
+                self.settings.automatic_overload_cycles
+                and self.regulator.automatic_cycle_requires_checkpoint
+                and not self._budget_store.state_is_durable(self.regulator.export_overload_state())
+            ) or (
                 self.settings.overload_enabled and decision.mode.removeprefix("dry_run_").startswith("overload")
                 and (decision.overload_remaining_seconds < OVERLOAD_LEASE_RESERVE_SECONDS
                      or (self._overload_restore_receipt_floor is not None and (
@@ -1828,7 +1846,8 @@ class OneFuseLoaderController:
                 should_call_service=self.settings.active_control,
             )
         if (decision.mode.removeprefix("dry_run_") in {
-                "normal_shedding_sync", "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait"}
+                "normal_shedding_sync", "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait",
+                "ordinary_grid_wait", "overload_peak_hold"}
                 and decision.current_p1 > 0):
             # Synchronization retains only an existing live offer. It cannot
             # write, renew a lease, or resume, even if a stale plan says so.
@@ -1889,7 +1908,7 @@ class OneFuseLoaderController:
                 and decision.nominal_sync_deadline_ts is not None
                 and self.hass.loop.time() < decision.nominal_sync_deadline_ts)
             grid_hold = bool(decision.mode.removeprefix("dry_run_") in {
-                    "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait"}
+                    "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait", "ordinary_grid_wait"}
                 and decision.command is None and not decision.should_call_service
                 and decision.grid_confirmation_deadline_ts is not None
                 and self.hass.loop.time() < decision.grid_confirmation_deadline_ts
@@ -1900,10 +1919,25 @@ class OneFuseLoaderController:
                 and decision.nominal_response_deadline_ts is None
                 and self.regulator.last_target is not None
                 and decision.current_p1 == self.regulator.last_target[0] > 0)
+            ordinary_replan = bool(decision.mode.removeprefix("dry_run_") in {
+                    "ordinary_lower_offer", "ordinary_lower_complete"}
+                and latest.data_valid and not latest.data_error
+                and decision.house_load_basis == "raw_bounded_ordinary_observation"
+                and decision.grid_l1 is not None and decision.grid_l1 <= PEAK_RESPONSE_TRIGGER_AMPS
+                and decision.grid_l1+decision.current_p1
+                    <= self.settings.main_fuse_amps-self.settings.buffer_amps
+                and decision.current_p1 > 0 and decision.nominal_response_deadline_ts is None)
+            if ordinary_replan:
+                # Discard the OLD expired electrical plan. The freshly bounded
+                # ordinary decrease is evaluated again before a later actual
+                # dispatch; it neither reopens the peak timer nor needs a zero.
+                decision = replace(decision, command=None, service=None,
+                    should_call_service=False,
+                    reason="The old peak dispatch expired; recalculating the independently raw-bounded ordinary decrease without an electrical countdown.")
             # The re-evaluation can retire the old response deadline using a
             # fresh, whole-authority raw bound. Retain that existing offer
             # without dispatching the old request or manufacturing a zero.
-            if (decision.current_p1 > 0 or decision.command == "resume") and not (sync_hold or raw_hold or grid_hold):
+            if (decision.current_p1 > 0 or decision.command == "resume") and not (sync_hold or raw_hold or grid_hold or ordinary_replan):
                 decision = replace(
                     decision, mode="normal_shedding_stop",
                     reason="The fixed nominal response deadline expired before dispatch; requesting 0 A.",
