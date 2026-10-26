@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0b31
+
+- Preserve an already accepted startup/rise offer through partial vehicle
+  reports before evaluating a conflicting overload estimate. The prior house
+  anchor plus the entire accepted offer and fresh raw L1 must both fit the
+  normal buffer. One fixed observation deadline, source binding and live
+  lease apply; the hold sends no write, renewal, increase or resume.
+- Treat an automatic period that has not qualified as an admission condition,
+  rather than manufacturing a failed electrical episode. Repair only the
+  narrow, unused false admission marker under fresh normal-source conditions;
+  exposure, historical failures and actual protective barriers remain.
+- Distinguish a still-running shielded checkpoint from a completed storage
+  failure. Independently raw-bounded normal decreases may remain possible
+  during pending verification; new overload, increase and retry permissions
+  still require a verified durable checkpoint.
+
 ## 0.4.0b30
 
 - Remove unused internal state and the unused controller name property, while

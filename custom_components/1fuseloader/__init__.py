@@ -170,6 +170,8 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             "automatic_overload_cycles", "automatic_cycle_state", "automatic_cycle_used_seconds",
             "automatic_cycle_remaining_seconds", "automatic_cycle_failure_reason",
             "automatic_qualification_seconds", "automatic_cooling_seconds",
+            "budget_storage_error", "budget_storage_error_type", "budget_verification_pending",
+            "budget_latest_state_durable", "budget_checkpoint_verified_at_utc",
             "recent_command_journal_count", "recent_stop_contexts_count", "recent_command_deliveries_count",
             "last_command_attempt", "last_accepted_command", "last_accepted_limit",
             "diagnostics_scope", "diagnostics_truncated",
@@ -351,6 +353,7 @@ class OneFuseLoaderController:
         self._budget_error: str | None = None
         self._budget_error_type: str | None = None
         self._budget_retry_at = 0.0
+        self._budget_pending_token: object | None = None
         self._overload_restore_receipt_floor: float | None = None
         self._trial_action_result = "not_requested"
         self._trial_action_error: str | None = None
@@ -710,6 +713,7 @@ class OneFuseLoaderController:
         # Mark stopped before waiting for a currently running request. Poll ticks
         # coalesce instead of queuing; none can submit after this method returns.
         self._stopped = True
+        self._budget_pending_token = None
         self._generation += 1
         self._cancel_positive_dispatch()
         if self._delivery_unsub is not None:
@@ -1704,6 +1708,7 @@ class OneFuseLoaderController:
             "physical_current_verified": False,
             "device_ttl_verified": False,
             "budget_storage_error": self._budget_error,
+            "budget_verification_pending": self._budget_store.verification_pending,
             "overload_failure_reason": self.regulator.effective_overload_failure_reason,
             "overload_historical_failure_reason": self.regulator.export_overload_state()["failure_reason"],
             **self.regulator.trial_diagnostics(),
@@ -1727,6 +1732,70 @@ class OneFuseLoaderController:
             if self._stopped or generation != self._generation:
                 return
             await self._async_tick_locked()
+
+    def _watch_pending_checkpoint(self) -> None:
+        if self._budget_pending_token is not None:
+            return
+        token = self._budget_pending_token = object()
+
+        def finished(_task: asyncio.Task) -> None:
+            if self._budget_pending_token is not token:
+                return
+            self._budget_pending_token = None
+            if not self._stopped:
+                # Completion alone grants nothing. Re-evaluate fresh inputs
+                # and verify the LATEST conservative state before permission.
+                self._budget_retry_at = 0.0
+                self._handle_source_change(None)
+
+        if not self._budget_store.add_pending_callback(finished):
+            self._budget_pending_token = None
+
+    def _pending_checkpoint_allows_normal(self, decision: Any, inp: RegulatorInput) -> bool:
+        """No new durability-dependent authority, EV credit, rise or restart."""
+        if (self._budget_error != "overload_budget_save_pending"
+                or not self._budget_store.verification_pending
+                or not inp.data_valid or inp.data_error):
+            return False
+        r, s = self.regulator, self.settings
+        inp = self._read_input()
+        no_overload_authority = (not r.automatic_cycle_requires_checkpoint
+            and not r._overload_hold_active and r._overload_transition_started is None)
+        if (decision.mode.removeprefix("dry_run_") == "positive_ramp_hold"
+                and no_overload_authority):
+            # A centrally qualified existing owner grants NO action or lease.
+            # Check fresh sources and the original deadline after the await;
+            # a forged mode string cannot create this proof or another owner.
+            return r.can_retain_positive_ramp(inp, decision)
+        if no_overload_authority and r.can_retain_normal_offer(inp, decision):
+            # A genuine coherent normal pair can retain only the old live
+            # upper bound. The caller strips its proposed TTL renewal below.
+            return True
+        cap, grid = (_finite_current_number(value) for value in (decision.current_p1, inp.grid_l1))
+        now, wall, gt = (_finite_current_number(value) for value in
+                         (self.hass.loop.time(), inp.wall_now_ts, inp.grid_report_ts))
+        normal = r.export_overload_state()["normal_control"]
+        return bool(
+            inp.data_valid and not inp.data_error and inp.charger_current_trusted
+            and decision.command in {None, "set_limit"} and not decision.dry_run
+            and s.active_control and not s.dry_run and s.enable_dynamic_limit
+            and cap is not None and s.min_charge_amps <= cap <= s.max_charge_amps
+            and grid is not None and grid >= 0 and grid + cap <= s.main_fuse_amps-s.buffer_amps
+            and now is not None and wall is not None and gt is not None
+            and 0 <= wall-gt <= s.max_sensor_age_seconds
+            and inp.status.strip().lower() in START_ALLOWED_STATUSES
+            and r.last_target is not None and 0 < cap <= r.last_target[0]
+            and r.last_set_limit_ts is not None and 0 <= now-r.last_set_limit_ts < r.last_target[3]
+            and inp.control_source_id is not None and inp.control_source_id == r._accepted_control_source_id
+            and not r._restart_required and not r.paused_by_us and not r.peak_response_active
+            and not r.automatic_cycle_requires_checkpoint and not r._overload_hold_active
+            and r._overload_transition_started is None
+            and not decision.mode.removeprefix("dry_run_").startswith("overload")
+            and normal["cap"] is None and not normal["response_pending"]
+            and not normal.get("alignment_pending") and not normal["stops"]
+            and not normal["restart"] and not normal["retry_submission_pending"]
+            and normal["response_failure"] is None
+        )
 
     def _input_revision(self, inp: RegulatorInput) -> tuple:
         def age_class(report: float | None) -> tuple | None:
@@ -1764,13 +1833,21 @@ class OneFuseLoaderController:
         inp = self._read_input()
         self._schedule_current_snapshot(inp)
         plan_source_diagnostics = dict(self.source_diagnostics)
+        if (self._budget_error == "overload_budget_save_pending"
+                and not self._budget_store.verification_pending
+                and self._budget_store.last_error_type):
+            self._budget_error = "overload_budget_save_failed"
+            self._budget_error_type = self._budget_store.last_error_type
+            self._budget_retry_at = self.hass.loop.time() + EXPOSURE_STORE_RETRY_SECONDS
         if self.settings.overload_enabled:
             offline_problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
-            if offline_problem or self._budget_error:
-                inp = replace(inp, data_valid=False, data_error=self._budget_error or offline_problem)
+            budget_fault = self._budget_error if self._budget_error != "overload_budget_save_pending" else None
+            if offline_problem or budget_fault:
+                inp = replace(inp, data_valid=False, data_error=budget_fault or offline_problem)
         decision = self.regulator.evaluate(inp)
         if self._protective_zero_pending and self.settings.active_control and not self.settings.dry_run:
             self.regulator.reject_submission(decision, self.hass.loop.time())
+            self.regulator.interrupt_positive_control("protective_zero_preempts_positive")
             decision = replace(decision, command="set_limit", current_p1=0, current_p2=0, current_p3=0,
                                should_call_service=True, mode="command_protection",
                                reason="A positive request was superseded or could not be admitted; confirming 0 A before a new offer.")
@@ -1796,15 +1873,22 @@ class OneFuseLoaderController:
                 if not self._budget_store.state_is_durable(self.regulator.export_overload_state()):
                     raise RuntimeError("Latest conservative exposure checkpoint is not verified")
             except Exception as err:
-                if self._budget_error != "overload_budget_restore_failed":
+                pending = isinstance(err, TimeoutError) and self._budget_store.verification_pending
+                if pending and self._budget_error in {None, "overload_budget_save_pending"}:
+                    self._budget_error = "overload_budget_save_pending"
+                elif self._budget_error != "overload_budget_restore_failed":
                     self._budget_error = "overload_budget_save_failed"
                 self._budget_error_type = type(err).__name__
                 self._budget_retry_at = self.hass.loop.time() + EXPOSURE_STORE_RETRY_SECONDS
-                _LOGGER.warning("1FuseLoader exposure save failed (%s); timed overload remains blocked",
-                                self._budget_error_type, exc_info=True)
+                if pending:
+                    self._watch_pending_checkpoint()
+                    _LOGGER.warning("1FuseLoader exposure verification is still pending; timed overload remains blocked")
+                else:
+                    _LOGGER.warning("1FuseLoader exposure save failed (%s); timed overload remains blocked",
+                                    self._budget_error_type, exc_info=True)
             else:
                 self._normal_control_checkpoint_pending = normal_active
-                if self._budget_error == "overload_budget_save_failed":
+                if self._budget_error in {"overload_budget_save_failed", "overload_budget_save_pending"}:
                     # This tick was already evaluated conservatively with the
                     # storage fault. Only a subsequent fresh evaluation can
                     # offer current; no timers, exposure or safety latch reset.
@@ -1814,12 +1898,14 @@ class OneFuseLoaderController:
                 self._budget_retry_at = 0.0
         if self._stopped or generation != self._generation:
             return
+        pending_normal = self._pending_checkpoint_allows_normal(decision, inp)
+        checkpoint_unverified = bool(self._budget_error and not pending_normal or (
+            self.settings.automatic_overload_cycles
+            and self.regulator.automatic_cycle_requires_checkpoint
+            and not self._budget_store.state_is_durable(self.regulator.export_overload_state())
+        ))
         if decision.current_p1 > 0 and (
-            self._budget_error or (
-                self.settings.automatic_overload_cycles
-                and self.regulator.automatic_cycle_requires_checkpoint
-                and not self._budget_store.state_is_durable(self.regulator.export_overload_state())
-            ) or (
+            checkpoint_unverified or (
                 self.settings.overload_enabled and decision.mode.removeprefix("dry_run_").startswith("overload")
                 and (decision.overload_remaining_seconds < OVERLOAD_LEASE_RESERVE_SECONDS
                      or (self._overload_restore_receipt_floor is not None and (
@@ -1835,15 +1921,23 @@ class OneFuseLoaderController:
         ):
             if self.regulator.reject_submission(decision, self.hass.loop.time()):
                 self._handle_source_change(None)
+            if checkpoint_unverified:
+                self.regulator.interrupt_positive_control("checkpoint_unverified_before_positive")
             decision = replace(
                 decision, mode="overload_control_blocked",
                 reason=self._budget_error or "Overload requires a complete lease reserve and fresh post-restart reports.",
                 command="set_limit", current_p1=0, current_p2=0, current_p3=0,
                 should_call_service=self.settings.active_control,
             )
+        elif pending_normal:
+            decision = replace(decision, reason=decision.reason +
+                " Exposure verification is pending; only this independently raw-bounded normal offer is permitted.")
+            if decision.current_p1 == self.regulator.last_target[0]:
+                # Retention may not extend an old lease while verification waits.
+                decision = replace(decision, command=None, service=None, should_call_service=False)
         if (decision.mode.removeprefix("dry_run_") in {
                 "normal_shedding_sync", "normal_shedding_grid_wait", "overload_grid_wait", "low_grid_grid_wait",
-                "ordinary_grid_wait", "overload_peak_hold"}
+                "ordinary_grid_wait", "overload_peak_hold", "positive_ramp_hold"}
                 and decision.current_p1 > 0):
             # Synchronization retains only an existing live offer. It cannot
             # write, renew a lease, or resume, even if a stale plan says so.
@@ -1955,8 +2049,10 @@ class OneFuseLoaderController:
             latest = self._read_input()
             if self.settings.overload_enabled:
                 problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
-                if problem or self._budget_error:
-                    latest = replace(latest, data_valid=False, data_error=self._budget_error or problem)
+                pending_safe = self._pending_checkpoint_allows_normal(decision, latest)
+                budget_fault = self._budget_error if not pending_safe else None
+                if problem or budget_fault:
+                    latest = replace(latest, data_valid=False, data_error=budget_fault or problem)
             if self._input_revision(latest) != self._input_revision(inp):
                 self.regulator.reject_submission(decision, self.hass.loop.time())
                 self.last_service_result = "not_sent"
@@ -2160,8 +2256,10 @@ class OneFuseLoaderController:
                 latest = self._read_input()
                 if self.settings.overload_enabled:
                     problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
-                    if problem or self._budget_error:
-                        latest = replace(latest, data_valid=False, data_error=self._budget_error or problem)
+                    budget_fault = (self._budget_error
+                        if self._budget_error != "overload_budget_save_pending" else None)
+                    if problem or budget_fault:
+                        latest = replace(latest, data_valid=False, data_error=budget_fault or problem)
                 if (self._input_revision(latest) != self._input_revision(inp)
                         or response_deadline is not None or raw_response_deadline is not None):
                     self._handle_source_change(None)
@@ -2255,7 +2353,7 @@ class OneFuseLoaderController:
             # Separate, nonrenewable measurement synchronization; the original
             # high-load response allowance is never extended by this timer.
             delays.append(sync_deadline - self.hass.loop.time() + elapsed)
-        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts"):
+        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts", "positive_response_deadline_ts"):
             deadline = getattr(decision, name, None)
             if decision.current_p1 > 0 and deadline is not None:
                 # Fixed source/response clocks survive event churn and every

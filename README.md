@@ -50,6 +50,40 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Accepted startup and rise responses (b31)
+
+With the peak-triggered policy selected, a partial vehicle ramp does not become
+a new household-load anchor before the accepted startup/rise has responded.
+For example, an accepted 14 A offer beside a previously qualified 8.4 A house
+load fits the 23 A normal buffer. A later 22.6 A grid report paired with a
+partial 1.8 A EV report can retain that same offer while the reports catch up.
+Fresh raw L1 and the entire offer beside its prior house anchor must both fit
+the normal buffer, with the same binding, live lease and valid source guards.
+The hold sends no write, renewal, increase or resume.
+
+The first qualifying mismatch fixes one source-aged observation deadline inside
+the existing configured alignment budget. Grid-first observations provide no
+EV response credit; later partial reports cannot restart the clock. A genuine
+timely vehicle report and a strictly later coherent grid report complete the
+owner when the derived house load plus the entire offer fits the normal buffer.
+An offered limit is an upper bound: a vehicle drawing 7 or 8 A may legitimately
+keep a 16 A offer. It is not required to draw 16 A to complete this check.
+Source faults, an expired owner/lease, actual peaks and stronger configured
+guards still take priority. A validated peak above 28 A may attempt a strict
+decrease to the existing permitted minimum before a delayed EV estimate alone
+rejects its projected household load. It retains the original electrical
+deadline and requires the later actual minimum/grid ceiling checks.
+
+A two-second foreground checkpoint timeout can leave the serialized atomic
+write and independent readback running. B31 distinguishes that pending state
+from a completed storage failure. It grants no new overload, increase or retry
+permission. A separately proved normal decrease can still fit its entire offer
+beside raw grid current. A qualified startup owner or a fresh coherent normal
+offer can retain only the same already accepted live cap without renewing its
+lease. Source/peak/deadline checks remain active;
+late storage completion schedules a fresh evaluation and cannot revive a
+protected zero. Completed write failures remain visible and protective.
+
 ### Automatic overload cycles (b29, explicit opt-in)
 
 **Automatic Overload Cycles** (`automatic_overload_cycles`) is off by default.
