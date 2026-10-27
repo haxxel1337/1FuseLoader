@@ -30,7 +30,11 @@ from .const import (
 from .easee_adapter import CommandNotSent, EaseeCommandAdapter, NativeTelemetryObservation
 from .command_delivery import CommandDeliveryTracker
 from .bmw_context import BMWContext
-from .logic import ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, START_ALLOWED_STATUSES, PEAK_RESPONSE_TRIGGER_AMPS, OneFuseRegulator, RegulatorInput, RegulatorSettings
+from .logic import (
+    ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, START_ALLOWED_STATUSES,
+    PEAK_RESPONSE_TRIGGER_AMPS, ElectricalStopCause, OneFuseRegulator,
+    RegulatorInput, RegulatorSettings, SourceHealth,
+)
 from .overload_persistence import OverloadBudgetStore
 from .mqtt_freshness import MqttL1Config, MqttL1Source
 
@@ -74,6 +78,9 @@ _SOURCE_METADATA_FIELDS = frozenset({
     "charger_current_reported_at_utc", "effective_charger_reported_at_utc",
     "charger_status_reported_at_utc", "easee_stream_pulse_utc",
     "reported_circuit_reported_at_utc", "easee_source_health",
+    "meter_envelope_control", "meter_control_health", "meter_estimate_quality",
+    "meter_grid_valid", "meter_actuator_valid", "meter_ev_valid",
+    "meter_state", "meter_zero_cause",
 })
 
 
@@ -883,7 +890,11 @@ class OneFuseLoaderController:
                 rising_load = True
             readiness_dispatch = (self._dispatch_decision is not None
                 and self._dispatch_decision.mode.removeprefix("dry_run_") == "disconnected_ready")
-            if readiness_dispatch:
+            if self.settings.meter_envelope_control and self._dispatch_decision is not None:
+                rejected = not self.regulator.can_continue_meter_dispatch(
+                    self._dispatch_input, latest, self._dispatch_decision,
+                    dispatched=self._dispatch_started)
+            elif readiness_dispatch:
                 # Only the exact normal-budget readiness proposal may finish
                 # across a benign unplugged/connected status transition. The
                 # regulator validates its source, fixed age and protective
@@ -1295,6 +1306,12 @@ class OneFuseLoaderController:
     def _read_input(self) -> RegulatorInput:
         data = self.entry.data
         errors: list[str] = []
+        # Keep the legacy error contract unchanged. The separate opt-in policy
+        # receives source classes from the checks which generated each error;
+        # it never guesses electrical authority by matching diagnostic text.
+        grid_errors: list[str] = []
+        actuator_errors: list[str] = []
+        ev_errors: list[str] = []
         grid_state = self.hass.states.get(data.get(CONF_L1_ENTITY))
         status_state = self.hass.states.get(data.get(CONF_STATUS_ENTITY))
         current_state = self.hass.states.get(data.get(CONF_CHARGER_CURRENT_ENTITY))
@@ -1307,39 +1324,49 @@ class OneFuseLoaderController:
             grid_report_ts = mqtt_snapshot.report_ts
             if mqtt_snapshot.error:
                 errors.append(mqtt_snapshot.error)
+                grid_errors.append(mqtt_snapshot.error)
         elif self._l1_source_error:
             grid_value = None
             grid_report_ts = None
             errors.append(self._l1_source_error)
+            grid_errors.append(self._l1_source_error)
         for label, state, requires_amps in (
             ("L1", grid_state, True), ("Charger status", status_state, False),
             ("Charger current", current_state, True),
         ):
+            classified = grid_errors if label == "L1" else actuator_errors if label == "Charger status" else ev_errors
             if state is None:
                 errors.append(f"{label} telemetry is missing.")
+                classified.append(f"{label} telemetry is missing.")
                 continue
             attributes = getattr(state, "attributes", {})
             if attributes.get("restored"):
                 errors.append(f"{label} telemetry is restored and has not been verified live.")
+                classified.append(f"{label} telemetry is restored and has not been verified live.")
             if requires_amps and attributes.get("unit_of_measurement") != "A":
                 errors.append(f"{label} telemetry must have unit A.")
+                classified.append(f"{label} telemetry must have unit A.")
         if grid_state is not None and self._l1_source is None and not self._l1_source_error:
             reported = getattr(grid_state, "last_reported", None) or getattr(grid_state, "last_updated", None)
             if not isinstance(reported, datetime) or reported.tzinfo is None:
                 errors.append("L1 telemetry has no trustworthy report timestamp.")
+                grid_errors.append("L1 telemetry has no trustworthy report timestamp.")
             else:
                 age = (datetime.now(timezone.utc) - reported).total_seconds()
                 if age < -5 or age > self.settings.max_sensor_age_seconds:
                     errors.append("L1 telemetry is stale or has an invalid timestamp.")
+                    grid_errors.append("L1 telemetry is stale or has an invalid timestamp.")
         # Easee states are event-driven: a stable value may be hours old. Its
         # adapter verifies source heartbeat/online health instead of entity age.
         health_error = "easee_source_unverified"
         if self._adapter is None:
             errors.append("Easee source health has not been verified.")
+            actuator_errors.append("Easee source health has not been verified.")
         else:
             health_error = self._adapter.telemetry_block_reason
             if health_error:
                 errors.append(str(health_error))
+                actuator_errors.append(str(health_error))
         self._read_source_diagnostics(
             grid_state, current_state, status_state, health_error, errors,
             grid_value=grid_value, grid_report_ts=grid_report_ts,
@@ -1435,6 +1462,7 @@ class OneFuseLoaderController:
                 current_value = native_number = source_number
             if native_clock is not None and not binding_matches:
                 native_clock_error = "native_terminal_source_mismatch"
+                actuator_errors.append("The selected native current source binding changed.")
             current_report_ts = native_receipt.timestamp() if native_receipt else None
             current_report_family = "native_terminal_receipt"
             current_report_provenance = (*clock_owner, "max_terminals", *native_maxima)
@@ -1479,6 +1507,7 @@ class OneFuseLoaderController:
                 error = ("Easee native current publication is inconsistent: " + publication_error + "."
                     if publication_error else "Easee native current observation evidence is invalid.")
                 errors.append(error)
+                ev_errors.append(error)
                 source_errors = [*self.source_diagnostics.get("source_errors", ()), error]
                 self.source_diagnostics.update(source_health="unhealthy", source_errors=source_errors,
                     source_health_reason=" ".join(source_errors))
@@ -1668,6 +1697,46 @@ class OneFuseLoaderController:
         })
         if self._l1_source_config or self._l1_source_error:
             self.source_diagnostics["report_time_scope"] = "grid_validated_mqtt_sample_and_receipt;easee_ha_receipt_not_physical_acquisition"
+        source_id = self._configured_control_identity()
+        grid_health = actuator_health = ev_health = None
+        if self.settings.meter_envelope_control:
+            wall_now = datetime.now(timezone.utc).timestamp()
+            grid_number = _finite_current_number(grid_value)
+            if grid_number is None or grid_number < 0:
+                grid_errors.append("L1 telemetry must be a finite, non-negative current.")
+            if (grid_report_ts is None or not -5 <= wall_now - grid_report_ts <= self.settings.max_sensor_age_seconds):
+                grid_errors.append("L1 telemetry has no fresh validated report clock.")
+            if status_value.strip().lower() not in ALLOWED_ACTIVE_STATUSES | IDLE_STATUSES:
+                actuator_errors.append("Charger status is unavailable, unsupported or a fault.")
+            if source_id is None:
+                actuator_errors.append("The configured meter/charger control binding is unverified.")
+            ev_number = _finite_current_number(current_value)
+            if ev_number is None or ev_number < 0:
+                ev_errors.append("Charger current must be a finite, non-negative estimate.")
+            if not current_trusted:
+                ev_errors.append("Charger current provenance is untrusted.")
+            if publication_pending or not increase_ready:
+                ev_errors.append("Charger current publication is incomplete.")
+            if (current_report_ts is None or not -5 <= wall_now - current_report_ts <= self.settings.max_sensor_age_seconds):
+                ev_errors.append("Charger current has no fresh observation clock.")
+            if event_source_known and (event_source_ts is None
+                    or not -2 <= wall_now - event_source_ts <= self.settings.max_sensor_age_seconds):
+                ev_errors.append("Charger current provider event is old or invalid.")
+            grid_health = SourceHealth(not grid_errors, " ".join(dict.fromkeys(grid_errors)) or None)
+            actuator_health = SourceHealth(not actuator_errors, " ".join(dict.fromkeys(actuator_errors)) or None)
+            ev_health = SourceHealth(not ev_errors, " ".join(dict.fromkeys(ev_errors)) or None)
+            self.source_diagnostics.update({
+                "meter_grid_health": asdict(grid_health),
+                "meter_actuator_health": asdict(actuator_health),
+                "meter_ev_health": asdict(ev_health),
+                "meter_envelope_control": True,
+                "meter_grid_valid": grid_health.valid,
+                "meter_actuator_valid": actuator_health.valid,
+                "meter_ev_valid": ev_health.valid,
+                "meter_control_health": "healthy" if grid_health.valid and actuator_health.valid else "unhealthy",
+                "meter_estimate_quality": "usable" if ev_health.valid else "unavailable_for_increase",
+                "meter_source_scope": "validated_RAW_and_actuator_faults_are_critical;EV_estimate_quality_controls_increase_credit",
+            })
         return RegulatorInput(
             now_ts=self.hass.loop.time(),
             status=status_value,
@@ -1686,7 +1755,7 @@ class OneFuseLoaderController:
             # raw-grid recovery path. A matching cloud GET is not that tuple.
             charger_native_committed=(canonical_native and not snapshot_used
                 and committed_native_tuple and not publication_pending),
-            control_source_id=self._configured_control_identity(),
+            control_source_id=source_id,
             charger_report_family=current_report_family,
             charger_report_provenance=current_report_provenance,
             charger_increase_ready=increase_ready,
@@ -1696,6 +1765,9 @@ class OneFuseLoaderController:
             charger_observation_report_times=observation_report_times,
             charger_observation_sequences=observation_sequences,
             charger_observation_evidence_credit=observation_evidence_credit,
+            meter_grid_health=grid_health,
+            meter_actuator_health=actuator_health,
+            meter_ev_health=ev_health,
         )
 
     def _configured_control_identity(self) -> str | None:
@@ -1893,8 +1965,15 @@ class OneFuseLoaderController:
         if stop is not None and isinstance(stop.get("preceding_positive_limit_receipts"), list):
             stop["preceding_positive_limit_receipts"] = [
                 _limit_receipt_summary(item) for item in stop["preceding_positive_limit_receipts"][-4:]]
+        meter_control = {}
+        if self.settings.meter_envelope_control:
+            meter_control["meter_control_health"] = (
+                "blocked" if self.last_decision is not None
+                and getattr(self.last_decision, "meter_zero_cause", None) is not None
+                else self.source_diagnostics.get("meter_control_health", "unverified"))
         return self.compact_state_attributes({
             **self.source_diagnostics,
+            **meter_control,
             **delivery,
             "peak_only_response": self.regulator.settings.peak_only_response,
             "response_policy": ("raw_peak_over_28_only" if self.regulator.settings.peak_only_response else "legacy"),
@@ -1908,6 +1987,8 @@ class OneFuseLoaderController:
             **({"mode": self.last_decision.mode, "reason": self.last_decision.reason,
                 "current_p1": self.last_decision.current_p1, "current_p2": self.last_decision.current_p2,
                 "current_p3": self.last_decision.current_p3,
+                "meter_state": getattr(self.last_decision, "meter_state", None),
+                "meter_zero_cause": getattr(self.last_decision, "meter_zero_cause", None),
                 "readiness_deadline_ts": getattr(self.last_decision, "readiness_deadline_ts", None)}
                 if self.last_decision is not None else {}),
             "zero_confirmation_scope": "native_ProductUpdate_receipt_and_correlated_delivery_not_physical_response",
@@ -1978,11 +2059,20 @@ class OneFuseLoaderController:
     def _pending_checkpoint_allows_normal(self, decision: Any, inp: RegulatorInput) -> bool:
         """No new durability-dependent authority, EV credit, rise or restart."""
         if (self._budget_error != "overload_budget_save_pending"
-                or not self._budget_store.verification_pending
-                or not inp.data_valid or inp.data_error):
+                or not self._budget_store.verification_pending):
             return False
         r, s = self.regulator, self.settings
         inp = self._read_input()
+        if s.meter_envelope_control:
+            # Only the supervisor may retain a real old normal lease. EV
+            # publication quality is not a persistence or RAW fault. A genuine
+            # overload PRE still needs its exact durable checkpoint.
+            if not self._budget_loaded or decision.meter_overload_authority:
+                return False
+            retained = self._committed_normal_retention(inp, decision)
+            return bool(retained is not None and retained.current_p1 == decision.current_p1)
+        if not inp.data_valid or inp.data_error:
+            return False
         if decision.mode.removeprefix("dry_run_") == "normal_continuity":
             retained = self._committed_normal_retention(inp, decision)
             return bool(retained is not None and retained.current_p1 == decision.current_p1)
@@ -2072,7 +2162,16 @@ class OneFuseLoaderController:
                 and not self._delivery.can_skip_zero(**self._zero_readback_evidence(
                     inp, require_new_current=False))):
             return None
+        if self.settings.meter_envelope_control:
+            return self.regulator.meter_envelope_retention(inp, proposed)
         return self.regulator.committed_normal_retention(inp, proposed)
+
+    def _critical_runtime_input(self, inp: RegulatorInput, reason: str) -> RegulatorInput:
+        """Propagate actual runtime faults without reclassifying EV estimates."""
+        if self.settings.meter_envelope_control:
+            return replace(inp, data_valid=False, data_error=reason,
+                           meter_actuator_health=SourceHealth(False, reason))
+        return replace(inp, data_valid=False, data_error=reason)
 
     async def _checkpoint_unsent_cleanup(self, decision: Any) -> None:
         """Remove only a proven unsent intent, preserving all old exposure."""
@@ -2119,6 +2218,7 @@ class OneFuseLoaderController:
                 inp.charger_event_source_known, inp.charger_event_source_ts,
                 inp.charger_observation_report_times,
                 inp.charger_observation_sequences, inp.charger_observation_evidence_credit,
+                inp.meter_grid_health, inp.meter_actuator_health, inp.meter_ev_health,
                 age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
     async def _async_tick_locked(self) -> None:
@@ -2158,7 +2258,7 @@ class OneFuseLoaderController:
             offline_problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
             budget_fault = self._budget_error if self._budget_error != "overload_budget_save_pending" else None
             if offline_problem or budget_fault:
-                inp = replace(inp, data_valid=False, data_error=budget_fault or offline_problem)
+                inp = self._critical_runtime_input(inp, budget_fault or offline_problem)
         # A protective evaluation may clear the owner that explains its cause.
         # Keep only bounded scalar diagnostics for the private incident journal;
         # these snapshots have no control authority or public entity attribute.
@@ -2191,10 +2291,13 @@ class OneFuseLoaderController:
         decision = self.regulator.evaluate(inp)
         if self._protective_zero_pending and self.settings.active_control and not self.settings.dry_run:
             self.regulator.reject_unsubmitted(decision, self.hass.loop.time())
-            self.regulator.interrupt_positive_control("protective_zero_preempts_positive")
-            decision = replace(decision, command="set_limit", current_p1=0, current_p2=0, current_p3=0,
-                               should_call_service=True, mode="command_protection",
-                               reason="A previous SDK request was superseded or has unverified delivery; confirming 0 A before a new offer.")
+            if self.settings.meter_envelope_control:
+                decision = self.regulator.meter_envelope_fault(inp, ElectricalStopCause.UNKNOWN_DELIVERY)
+            else:
+                self.regulator.interrupt_positive_control("protective_zero_preempts_positive")
+                decision = replace(decision, command="set_limit", current_p1=0, current_p2=0, current_p3=0,
+                                   should_call_service=True, mode="command_protection",
+                                   reason="A previous SDK request was superseded or has unverified delivery; confirming 0 A before a new offer.")
         if decision.current_refresh_required:
             self._request_current_snapshot()
         exposure = self.regulator.export_overload_state()
@@ -2252,6 +2355,25 @@ class OneFuseLoaderController:
                     self._normal_control_checkpoint_pending = True
                     self._budget_retry_at = 0.
                 decision = retained
+            elif (self.settings.meter_envelope_control and not decision.meter_overload_authority
+                    and (self.regulator.last_target is None or self.regulator.last_target[0] <= 0)):
+                # A cold normal proposal has not acquired a lease. Waiting for
+                # ordinary metadata I/O grants no positive permission and does
+                # not justify sending an otherwise unnecessary zero either.
+                latest = self._read_input()
+                latest_plan = self.regulator.evaluate(latest)
+                if latest_plan.meter_zero_cause is None and not latest_plan.meter_overload_authority:
+                    self.regulator.reject_unsubmitted(decision, self.hass.loop.time())
+                    self.last_decision = replace(latest_plan, mode="meter_wait_storage",
+                        meter_state="meter_wait_storage", current_p1=0, current_p2=0, current_p3=0,
+                        command=None, service=None, should_call_service=False,
+                        meter_normal_retention=False,
+                        reason="Waiting for normal metadata verification before the first positive offer; no command or lease has been issued.")
+                    self.last_service_result = "not_sent_storage_pending"
+                    self._schedule_overload_deadline(self.last_decision)
+                    self.notify()
+                    return
+                decision, inp = latest_plan, latest
         previous_offer = self.regulator.last_target
         if (decision.mode == "normal" and decision.command == "set_limit"
                 and previous_offer is not None and 0 < previous_offer[0] < decision.current_p1):
@@ -2265,10 +2387,14 @@ class OneFuseLoaderController:
             self.settings.automatic_overload_cycles
             and self.regulator.automatic_cycle_requires_checkpoint
             and not self._budget_store.state_is_durable(self.regulator.export_overload_state())
+            and not (self.settings.meter_envelope_control and pending_normal
+                     and not decision.meter_overload_authority)
         ))
         if decision.current_p1 > 0 and (
             checkpoint_unverified or (
-                self.settings.overload_enabled and decision.mode.removeprefix("dry_run_").startswith("overload")
+                self.settings.overload_enabled and (
+                    decision.meter_overload_authority if self.settings.meter_envelope_control
+                    else decision.mode.removeprefix("dry_run_").startswith("overload"))
                 and (decision.overload_remaining_seconds < OVERLOAD_LEASE_RESERVE_SECONDS
                      or (self._overload_restore_receipt_floor is not None and (
                          inp.grid_report_ts is None or inp.charger_report_ts is None
@@ -2284,13 +2410,21 @@ class OneFuseLoaderController:
             if self.regulator.reject_unsubmitted(decision, self.hass.loop.time()):
                 self._normal_control_checkpoint_pending = True
             if checkpoint_unverified:
-                self.regulator.interrupt_positive_control("checkpoint_unverified_before_positive")
-            decision = replace(
-                decision, mode="overload_control_blocked",
-                reason=self._budget_error or "Overload requires a complete lease reserve and fresh post-restart reports.",
-                command="set_limit", current_p1=0, current_p2=0, current_p3=0,
-                should_call_service=self.settings.active_control,
-            )
+                if not self.settings.meter_envelope_control:
+                    self.regulator.interrupt_positive_control("checkpoint_unverified_before_positive")
+            if self.settings.meter_envelope_control:
+                cause = (ElectricalStopCause.PERSISTENCE if checkpoint_unverified
+                    else ElectricalStopCause.OVERLOAD_LEASE_RESERVE
+                    if decision.overload_remaining_seconds < OVERLOAD_LEASE_RESERVE_SECONDS
+                    else ElectricalStopCause.ACTUATOR_INVALID)
+                decision = self.regulator.meter_envelope_fault(inp, cause)
+            else:
+                decision = replace(
+                    decision, mode="overload_control_blocked",
+                    reason=self._budget_error or "Overload requires a complete lease reserve and fresh post-restart reports.",
+                    command="set_limit", current_p1=0, current_p2=0, current_p3=0,
+                    should_call_service=self.settings.active_control,
+                )
         elif pending_normal:
             decision = replace(decision, reason=decision.reason +
                 " Exposure verification is pending; only this independently validated normal offer is permitted.")
@@ -2383,6 +2517,18 @@ class OneFuseLoaderController:
             inp = latest
             plan_source_diagnostics = dict(self.source_diagnostics)
             exposure = self.regulator.export_overload_state()
+            if self.settings.meter_envelope_control and (decision.current_p1 > 0 or decision.command == "resume"):
+                # Only the electrical supervisor can request a zero. Expiry
+                # invalidates this old dispatch plan, not a newly evaluated
+                # meter-safe offer. Recalculate it outside the expired request.
+                self.last_decision = replace(decision, command=None, service=None,
+                    should_call_service=False,
+                    reason="The previous electrical dispatch deadline passed; recalculating from the current electrical supervisor.")
+                self.last_service_result = "not_sent"
+                self._schedule_overload_deadline(self.last_decision)
+                self._handle_source_change(None)
+                self.notify()
+                return
             sync_hold = bool(decision.mode.removeprefix("dry_run_") == "normal_shedding_sync"
                 and decision.command is None and not decision.should_call_service
                 and decision.nominal_sync_deadline_ts is not None
@@ -2448,18 +2594,23 @@ class OneFuseLoaderController:
                 pending_safe = self._pending_checkpoint_allows_normal(decision, latest)
                 budget_fault = self._budget_error if not pending_safe else None
                 if problem or budget_fault:
-                    latest = replace(latest, data_valid=False, data_error=budget_fault or problem)
+                    latest = self._critical_runtime_input(latest, budget_fault or problem)
             if self._input_revision(latest) != self._input_revision(inp):
-                await self._checkpoint_unsent_cleanup(decision)
-                self.last_service_result = "not_sent"
-                self.last_decision = replace(
-                    decision, mode="waiting_for_latest_sources",
-                    reason="New telemetry arrived during checkpoint verification; recalculating before a positive offer.",
-                    should_call_service=False,
-                )
-                self._handle_source_change(None)
-                self.notify()
-                return
+                if (self.settings.meter_envelope_control
+                        and self.regulator.can_continue_meter_dispatch(inp, latest, decision)):
+                    inp = latest
+                    plan_source_diagnostics = dict(self.source_diagnostics)
+                else:
+                    await self._checkpoint_unsent_cleanup(decision)
+                    self.last_service_result = "not_sent"
+                    self.last_decision = replace(
+                        decision, mode="waiting_for_latest_sources",
+                        reason="New telemetry arrived during checkpoint verification; recalculating before a positive offer.",
+                        should_call_service=False,
+                    )
+                    self._handle_source_change(None)
+                    self.notify()
+                    return
         evidence = self._zero_readback_evidence(inp)
         self._delivery.observe(evidence["phases"], evidence["after_submission"])
         latest_receipt = self._delivery.latest
@@ -2503,7 +2654,10 @@ class OneFuseLoaderController:
             latest = self._read_input()
             if positive_submission and self._input_revision(latest) != self._input_revision(inp):
                 ready = decision.mode.removeprefix("dry_run_") == "disconnected_ready"
-                if not ready or not self.regulator.can_continue_readiness_dispatch(inp, latest, decision):
+                if self.settings.meter_envelope_control:
+                    if not self.regulator.can_continue_meter_dispatch(inp, latest, decision):
+                        return False
+                elif not ready or not self.regulator.can_continue_readiness_dispatch(inp, latest, decision):
                     return False
             if not self.regulator.begin_submission(decision, self.hass.loop.time(), inp=latest):
                 return False
@@ -2729,7 +2883,7 @@ class OneFuseLoaderController:
                     budget_fault = (self._budget_error
                         if self._budget_error != "overload_budget_save_pending" else None)
                     if problem or budget_fault:
-                        latest = replace(latest, data_valid=False, data_error=budget_fault or problem)
+                        latest = self._critical_runtime_input(latest, budget_fault or problem)
                 if (self._input_revision(latest) != self._input_revision(inp)
                         or response_deadline is not None or raw_response_deadline is not None):
                     self._handle_source_change(None)
@@ -2844,7 +2998,9 @@ class OneFuseLoaderController:
                 # Fixed source/response clocks survive event churn and every
                 # await; neither timer renews a limit or adds electrical time.
                 delays.append(deadline - self.hass.loop.time() + elapsed)
-        if (self.settings.overload_enabled and decision.mode.removeprefix("dry_run_").startswith("overload")
+        if (self.settings.overload_enabled and (
+                decision.meter_overload_authority if self.settings.meter_envelope_control
+                else decision.mode.removeprefix("dry_run_").startswith("overload"))
                 and decision.current_p1 > 0):
             delays.append(decision.overload_remaining_seconds - OVERLOAD_LEASE_RESERVE_SECONDS)
         if not delays:

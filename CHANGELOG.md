@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.4.0b39
+
+- Add an explicit, separate meter-envelope control policy for the existing
+  import-only automatic overload profile. Upgrades leave this option off.
+  Fresh grid measurements and actuator health govern continued operation;
+  uncertain vehicle estimates can withhold an increase but cannot independently
+  order an ordinary charging stop.
+- Give every stop in this policy a typed electrical or control fault owner.
+  Legacy startup, partial-ramp and ordinary decrease observation deadlines do
+  not participate in its decisions. Accepted commands, unresolved authority,
+  finite leases and genuine electrical response deadlines remain distinct.
+- Separate critical grid/control health from vehicle estimate quality, and
+  retain real command admission, delivery and overload durability checks.
+  A pending ordinary metadata checkpoint may retain only the genuinely live
+  accepted normal offer; it grants no extra overload authority.
+- Preserve the configured peak response, minimum current, grid confirmation,
+  cumulative overload budget, automatic low-load recovery and offline limits.
+  Enabling the new policy does not reset exposure or historical faults.
+- Keep a separately qualified ordinary current decrease available below the
+  peak trigger when it restores the normal budget without granting new
+  overload permission. Continued measured overload remains protected.
+- Add independent controller and physical-plant regressions for asynchronous
+  observations, partial ramps, lease renewal, storage/HTTP delays and genuine
+  protection faults. Physical verification is still required after activation.
+
 ## 0.4.0b38
 
 - Under the existing peak-triggered policy, assess independent normal operating

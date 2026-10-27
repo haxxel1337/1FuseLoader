@@ -92,9 +92,11 @@
           "peak_only_response": "Peak-triggered response policy (10-second emergency only above 28 A; explicit opt-in)",
           "grid_confirmation_seconds": "Grid confirmation after timely minimum-current response (seconds; 0 = off, maximum 30)",
           "automatic_overload_cycles": "Automatic Overload Cycles (explicit opt-in; requires peak-triggered response policy)",
-          "disconnected_readiness": "Charging Readiness While Disconnected (explicit opt-in)"
+          "disconnected_readiness": "Charging Readiness While Disconnected (explicit opt-in)",
+          "meter_envelope_control": "Meter Envelope Control (explicit opt-in)"
         },
         "data_description": {
+          "meter_envelope_control": "Off by default. Requires the verified import-only, peak-triggered automatic overload profile, a car maximum of at most 16 A and a 60 second normal TTL. Uses fresh main-meter load for electrical protection; delayed or inconsistent EV current removes increase credit without by itself stopping an accepted live offer. Genuine source, delivery, lease, peak and cumulative overload protections remain. Enabling this does not reset exposure or start a new overload allowance, resume a manual pause, or establish a fuse cooling guarantee.",
           "disconnected_readiness": "Off by default. While disconnected, keep a normal L1 offer ready only when fresh raw grid current plus the entire offer fits the ordinary buffer. L2 and L3 stay at 0 A. This uses no EV-current subtraction or overload allowance and sends no start or resume command. A fresh connection may adopt the same live, accepted offer without a new restart delay; the vehicle response clock starts only after connection. Source, command-delivery, storage, lease and stronger protective guards still apply. Manual pauses, authorization and schedules are not overridden."
         }
       }

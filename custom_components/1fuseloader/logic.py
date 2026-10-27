@@ -95,6 +95,31 @@ class RegulatorSettings:
     overload_response_seconds: int = 10
     # Explicit post-response observation tolerance; zero preserves legacy timing.
     grid_confirmation_seconds: int = 0
+    meter_envelope_control: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SourceHealth:
+    valid: bool
+    reason: Optional[str] = None
+
+
+class ElectricalStopCause(str, Enum):
+    CONFIGURATION = "configuration"
+    GRID_INVALID = "grid_invalid"
+    ACTUATOR_INVALID = "actuator_invalid"
+    CONTROL_SOURCE_CHANGED = "control_source_changed"
+    LEASE_EXPIRED = "lease_expired"
+    UNKNOWN_DELIVERY = "unknown_delivery"
+    PERSISTENCE = "persistence"
+    PEAK_RESPONSE_TIMEOUT = "peak_response_timeout"
+    GRID_CONFIRMATION_TIMEOUT = "grid_confirmation_timeout"
+    GRID_CEILING = "grid_ceiling"
+    HARD_LIMIT = "hard_limit"
+    OVERLOAD_BUDGET = "overload_budget"
+    OVERLOAD_LEASE_RESERVE = "overload_lease_reserve"
+    OVERLOAD_NOT_ADMITTED = "overload_not_admitted"
+    CLOCK_INVALID = "clock_invalid"
 
 
 @dataclass(slots=True)
@@ -142,6 +167,9 @@ class RegulatorInput:
     # A repeated value in one quantized provider bucket is a real reported
     # state, but may not be a new measurement of that value (A -> B -> A).
     charger_observation_evidence_credit: Optional[tuple[tuple[int, bool], ...]] = None
+    meter_grid_health: Optional[SourceHealth] = None
+    meter_actuator_health: Optional[SourceHealth] = None
+    meter_ev_health: Optional[SourceHealth] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +419,13 @@ class RegulatorDecision:
     command_urgency: str = "normal"
     committed_current_p1: Optional[int] = None
     normal_continuity_deadline_ts: Optional[float] = None
+    meter_envelope: bool = False
+    meter_zero_cause: Optional[str] = None
+    meter_state: Optional[str] = None
+    meter_normal_retention: bool = False
+    meter_overload_authority: bool = False
+    meter_ordinary_decrease: bool = False
+    meter_basis_grid_ts: Optional[float] = None
 
 
 class OneFuseRegulator:
@@ -402,6 +437,7 @@ class OneFuseRegulator:
 
     def __init__(self, settings: RegulatorSettings | None = None) -> None:
         self.settings = settings or RegulatorSettings()
+        self._meter_envelope_policy = None
         self._ev_clock_watermarks: dict[tuple, float] = {}
         self._ev_clock_key = None
         self._ev_clock_baseline: Optional[float] = None
@@ -1818,6 +1854,14 @@ class OneFuseRegulator:
 
     def update_settings(self, settings: RegulatorSettings) -> None:
         previous_settings = self.settings
+        if type(settings.meter_envelope_control) is not bool:
+            raise ValueError("Meter envelope control must be a boolean")
+        if settings.meter_envelope_control and not (
+                settings.nominal_import_only_fallback and settings.peak_only_response
+                and settings.automatic_overload_cycles and settings.overload_enabled
+                and settings.enable_dynamic_limit and settings.max_charge_amps <= 16
+                and settings.normal_ttl_seconds == 60):
+            raise ValueError("Meter envelope requires the import-only automatic peak profile and 60 s TTL")
         if settings.controlled_phase != "L1" or settings.unused_phase_current != 0:
             raise ValueError("Only L1 with unused phase currents of 0 A is supported")
         if type(settings.startup_charge_amps) is not int or not 6 <= settings.startup_charge_amps <= 16:
@@ -1858,6 +1902,14 @@ class OneFuseRegulator:
         if previous_settings == settings:
             if settings.automatic_overload_cycles:
                 self._ensure_automatic_cycle()
+            return
+        if replace(previous_settings, meter_envelope_control=settings.meter_envelope_control) == settings:
+            # An explicit policy handoff is not a new session, electrical
+            # epoch, lease or protective zero. Actual authority and all budget
+            # history stay intact; ordinary legacy owners leave its path.
+            self.settings = settings
+            if settings.meter_envelope_control and self._meter_envelope_policy is not None:
+                self._meter_envelope_policy.prepare_handoff()
             return
         self._control_generation += 1
         self._retire_active_dispatches()
@@ -4586,6 +4638,7 @@ class OneFuseRegulator:
             comparable_policy["settings"].setdefault("peak_only_response", False)
             comparable_policy["settings"].setdefault("automatic_overload_cycles", False)
             comparable_policy["settings"].setdefault("disconnected_readiness", False)
+            comparable_policy["settings"].setdefault("meter_envelope_control", False)
             valid = bool(type(epoch.get("version")) is int and epoch["version"] == 1
                 and isinstance(epoch.get("trial_id"), str) and epoch["trial_id"].strip()
                 and len(epoch["trial_id"]) <= 128 and identity is not None
@@ -5007,6 +5060,17 @@ class OneFuseRegulator:
                 or decision.plan_id in self._dispatch_records
                 or decision.plan_id > 0 and decision.plan_id <= self._retired_plan_highwater):
             return False
+        if self.settings.meter_envelope_control and decision.command == "set_limit" and decision.current_p1 == 0:
+            engine = self._get_meter_envelope_policy()
+            if (not decision.meter_envelope or decision.current_p2 != 0 or decision.current_p3 != 0
+                    or decision.ttl_seconds != 60
+                    or engine.zero_permits.get(decision.plan_id) != decision.meter_zero_cause
+                    or decision.meter_zero_cause is None):
+                return False
+            try:
+                ElectricalStopCause(decision.meter_zero_cause)
+            except (ValueError, TypeError):
+                return False
         fields = []
         if decision.command == "set_limit" and decision.current_p1 > 0:
             if decision.mode == "low_grid_alignment":
@@ -5025,7 +5089,10 @@ class OneFuseRegulator:
             wall = None if isinstance(inp.wall_now_ts, bool) else _valid_number(inp.wall_now_ts)
             positive = decision.command == "resume" or decision.command == "set_limit" and decision.current_p1 > 0
             boundary_status = (inp.status or "").strip().lower()
-            if positive and (wall is None or shadow._ev_clock_error or inp.data_valid is not True
+            if decision.meter_envelope and positive:
+                if not self.can_continue_meter_dispatch(inp, inp, decision):
+                    return False
+            if positive and not decision.meter_envelope and (wall is None or shadow._ev_clock_error or inp.data_valid is not True
                     or inp.data_error or inp.charger_current_trusted is not True
                     or inp.charger_publication_pending is True
                     or boundary_status not in START_ALLOWED_STATUSES
@@ -5075,6 +5142,8 @@ class OneFuseRegulator:
             self._dispatch_records[decision.plan_id] = {"now": now, "legacy": True,
                 "generation": self._control_generation,
                 "target": (decision.current_p1, decision.current_p2, decision.current_p3)}
+        if decision.meter_envelope and decision.current_p1 == 0:
+            self._get_meter_envelope_policy().zero_permits.pop(decision.plan_id, None)
         for field in fields:
             setattr(self, field, now)
         return True
@@ -5179,6 +5248,10 @@ class OneFuseRegulator:
             dispatch = self._retired_dispatch_records.get(decision.plan_id)
         elif dispatch is not None:
             self._remember_retired_dispatch(decision.plan_id, dispatch)
+        if decision.meter_envelope and dispatch is None and not obsolete:
+            # A plan, a dry run or a caller's ACK without real SDK entry
+            # cannot manufacture a live meter-envelope lease.
+            return
         if (obsolete or decision.current_p1 > 0 and decision.command == "set_limit"
                 and dispatch is not None and (dispatch["generation"] != self._control_generation
                     or dispatch["target"] != (decision.current_p1, decision.current_p2, decision.current_p3))):
@@ -5195,6 +5268,9 @@ class OneFuseRegulator:
             dispatch = None
         self._ack_dispatch = dispatch
         try:
+            if decision.meter_envelope:
+                self._get_meter_envelope_policy().acknowledge(self, decision, now_ts, dispatch)
+                return
             self._acknowledge_accepted(decision, now_ts)
             if not decision.should_call_service or decision.dry_run or decision.command is None:
                 return
@@ -5811,7 +5887,60 @@ class OneFuseRegulator:
         resend = min(self.settings.resend_limit_every_seconds, ttl / 2)
         return now - self.last_set_limit_ts >= max(1, resend)
 
+    def _get_meter_envelope_policy(self):
+        if self._meter_envelope_policy is None:
+            import importlib.util
+            import sys
+            from pathlib import Path
+            name = __name__ + "_meter_envelope"
+            module = sys.modules.get(name)
+            if module is None:
+                spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name("meter_envelope.py"))
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[name] = module
+                spec.loader.exec_module(module)
+            self._meter_envelope_policy = module.MeterEnvelopePolicy(RegulatorDecision, ElectricalStopCause)
+        return self._meter_envelope_policy
+
+    def meter_envelope_fault(self, inp: RegulatorInput, cause: ElectricalStopCause) -> RegulatorDecision:
+        engine = self._get_meter_envelope_policy()
+        return engine.supervisor.zero(engine, self, inp, cause)
+
+    def meter_envelope_retention(self, inp: RegulatorInput,
+                                 proposed: Optional[RegulatorDecision] = None) -> Optional[RegulatorDecision]:
+        return self._get_meter_envelope_policy().retention(self, inp, proposed)
+
+    def can_continue_meter_dispatch(self, planned: RegulatorInput, latest: RegulatorInput,
+                                    decision: RegulatorDecision, *, dispatched: bool = False) -> bool:
+        if not self.settings.meter_envelope_control or not decision.meter_envelope:
+            return False
+        if planned.control_source_id != latest.control_source_id:
+            return False
+        if dispatched:
+            self._get_meter_envelope_policy().observe_inflight(self, latest, decision)
+        shadow = deepcopy(self)
+        engine = shadow._get_meter_envelope_policy()
+        fresh = engine.evaluate(shadow, latest)
+        if fresh.meter_zero_cause is not None:
+            return decision.current_p1 == 0 and decision.meter_zero_cause is not None
+        if dispatched:
+            # An admitted SDK request is already remote. Benign EV movement
+            # can change the NEXT optimum, not turn its delivery into unknown.
+            return decision.command == "set_limit" and decision.current_p1 > 0
+        if decision.command != "set_limit" or decision.current_p1 <= 0:
+            return decision.current_p1 == 0 and decision.meter_zero_cause is not None
+        if fresh.current_p1 >= decision.current_p1:
+            return True
+        # A benign completion/pause during an already planned circuit write
+        # does not turn it into a start/resume or unknown electrical fault.
+        raw = _valid_number(latest.grid_l1)
+        return bool(raw is not None and latest.status in IDLE_STATUSES | PAUSED_STATUSES
+            and raw+max(engine.upper, decision.current_p1)
+                <= self.settings.main_fuse_amps-self.settings.buffer_amps)
+
     def evaluate(self, inp: RegulatorInput) -> RegulatorDecision:
+        if self.settings.meter_envelope_control:
+            return self._get_meter_envelope_policy().evaluate(self, inp)
         s = self.settings
         previous_grid_ts, previous_charger_ts = self._last_input_grid_ts, self._last_input_charger_ts
         self._observe_ev_clock(inp)

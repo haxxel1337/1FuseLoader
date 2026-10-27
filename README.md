@@ -50,6 +50,52 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Separate meter-envelope policy (b39, explicit opt-in)
+
+`meter_envelope_control` selects a separate controller. It defaults to **off**
+and requires the configured import-only, peak-triggered automatic overload
+profile, dynamic current control and a maximum offer of 16 A. Existing
+installations retain the legacy policy until the operator explicitly enables
+it. The sections below describing older observation windows apply to that
+legacy policy.
+
+The meter-envelope controller distinguishes three inputs: validated grid
+current, critical actuator/control health, and vehicle estimate quality. A
+late, incomplete or inconsistent vehicle estimate can prevent a higher offer.
+It cannot by itself turn an ordinary observation deadline into a 0 A command.
+With fresh valid grid/control inputs and a genuinely live accepted offer, the
+controller can retain or lower that offer under measured-grid supervision.
+This is measured feedback, not a certificate that the entire unresolved
+vehicle allowance fits below the buffered nominal limit. A higher offer still
+requires independently eligible evidence.
+
+Every 0 A decision has a typed critical cause. Real grid/control faults, unknown
+delivery, expired leases and actual electrical limits keep stop authority.
+Normal observation bookkeeping cannot borrow that authority or create restart
+debt. A plan, an SDK request, a successful HTTP response, a returned limit and
+physical vehicle response remain different events.
+
+After a real peak, an actually accepted live 7 A offer may continue when a
+new validated grid report has returned to at most 25 A. A delayed EV report
+alone then does not order a stop. This grants no increase or EV response
+credit: unresolved higher authority and the original peak deadline remain.
+If high load returns without independent qualifying evidence after that
+deadline, there is no fresh ten-second allowance. A separately qualified
+normal operating state can retire the old electrical need without claiming
+that the vehicle answered the earlier command on time.
+
+The selected profile's electrical rules and persisted accounting remain in
+force: 7 A minimum response to a measured peak above 28 A, the original 10-second
+response deadline, the separately configured grid confirmation, the 29 A
+sustained ceiling, immediate protection above 38 A, and the 30-minute cumulative
+overload budget after qualification. Automatic recovery still requires 30
+continuous minutes strictly below 23 A. These are experimental operating
+settings, not a verified thermal rating for a particular fuse. Policy selection
+does not reset exposure, manufacture a lease or resume a user-paused session.
+The existing 90-second reserve for admitting a finite overload lease also
+remains: a new 60-second lease is refused when that reserve no longer fits.
+Consequently a continuous overload can stop before all 1,800 seconds are used.
+
 ### Observation expiry and normal continuation (b38)
 
 A command-response observation and permission to continue an accepted normal
