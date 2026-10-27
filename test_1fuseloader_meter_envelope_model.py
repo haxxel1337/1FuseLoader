@@ -44,12 +44,12 @@ class MeterEnvelopePlant(original.ControllerPlant):
                 self.meter_samples.append(dict(at=self.now,raw=inp.grid_l1,
                     grid_report_ts=inp.grid_report_ts,
                     electrical_response_deadline=self.r.peak_response_deadline(self.now),
-                    peak_previous_authority=self.r.export_overload_state().get('peak_response_previous_authority')))
+                    peak_previous_authority=self.r.export_overload_state().get('meter_control',{}).get('episode_previous')))
                 self.last_meter_signature=meter_signature
             if self.trace and self.trace[-1]['event']=='PLAN' and self.trace[-1]['at']==self.now:
                 self.trace[-1]['grid_report_ts']=self.c._read_input().grid_report_ts
                 self.trace[-1]['electrical_response_deadline']=self.c.last_decision.nominal_response_deadline_ts
-                self.trace[-1]['peak_previous_authority']=self.r.export_overload_state().get('peak_response_previous_authority')
+                self.trace[-1]['peak_previous_authority']=self.r.export_overload_state().get('meter_control',{}).get('episode_previous')
             cycle=self.r.export_overload_state()['automatic_cycle']
             signature=(cycle['cycle_id'],cycle['state'],cycle['failure_reason'])
             if signature!=self.last_cycle_signature:
@@ -321,8 +321,8 @@ class MeterEnvelopePlantTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(row['electrical_response_deadline']==200.2 for row in normal),normal[-5:])
         self.assertTrue(all(row['peak_previous_authority']==16 for row in normal),normal[-5:])
         exposure=result['final_exposure']
-        self.assertTrue(exposure['peak_response_pending'])
-        self.assertEqual(exposure['peak_response_previous_authority'],16)
+        self.assertTrue(exposure['meter_control']['episode_active'])
+        self.assertEqual(exposure['meter_control']['episode_previous'],16)
         self.assertEqual(exposure['normal_control']['stops'],0)
 
 

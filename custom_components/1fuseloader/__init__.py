@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from collections import deque
+from copy import deepcopy
 from pathlib import Path
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
@@ -81,6 +82,11 @@ _SOURCE_METADATA_FIELDS = frozenset({
     "meter_envelope_control", "meter_control_health", "meter_estimate_quality",
     "meter_grid_valid", "meter_actuator_valid", "meter_ev_valid",
     "meter_state", "meter_zero_cause",
+    "meter_control_state", "meter_episode_id", "meter_operational_fault",
+    "meter_recovery_stage",
+    "meter_episode_phase", "meter_response_deadline_ts", "meter_grid_deadline_ts",
+    "meter_recovery_required", "meter_cycle_id", "meter_cycle_used_seconds",
+    "meter_cycle_remaining_seconds", "meter_historical_fault", "meter_incident_count",
     "controlled_l1_current", "controlled_l1_observed_current", "controlled_l1_used",
     "controlled_l1_received_at_utc", "controlled_l1_source_at_utc",
     "controlled_l1_output_phase", "controlled_l1_mapping_epoch",
@@ -428,6 +434,7 @@ class OneFuseLoaderController:
         self._budget_error_type: str | None = None
         self._budget_retry_at = 0.0
         self._budget_pending_token: object | None = None
+        self._meter_checkpoint_proposal: dict[str, Any] | None = None
         self._overload_restore_receipt_floor: float | None = None
         self._trial_action_result = "not_requested"
         self._trial_action_error: str | None = None
@@ -545,6 +552,8 @@ class OneFuseLoaderController:
 
     def _trial_start_input(self, generation: int) -> RegulatorInput:
         """Read current start prerequisites without requesting any EV action."""
+        if self.settings.meter_envelope_control:
+            raise ValueError("Manual trials are unavailable in standalone meter control")
         if self._stopped or generation != self._generation:
             raise ValueError("Trial start interrupted by controller reconfiguration")
         if not self._budget_loaded or self._budget_error:
@@ -611,9 +620,13 @@ class OneFuseLoaderController:
 
     async def async_end_overload_trial(self) -> None:
         """Withdraw the period and let ordinary protection evaluate next."""
+        if self.settings.meter_envelope_control:
+            raise ValueError("Manual trials are unavailable in standalone meter control")
         self._generation += 1
         self._cancel_positive_dispatch()
         async with self._lock:
+            if self.settings.meter_envelope_control:
+                raise ValueError("Manual trials are unavailable in standalone meter control")
             if self._stopped or not self._budget_loaded:
                 raise ValueError("Controller is not ready to end a trial")
             self.regulator.end_overload_trial(self._read_input())
@@ -644,11 +657,12 @@ class OneFuseLoaderController:
                 try:
                     saved = await asyncio.wait_for(self._budget_store.async_load(), INITIAL_EXPOSURE_LOAD_TIMEOUT_SECONDS)
                     if saved is not None:
-                        self._normal_control_checkpoint_pending = bool(saved.get("normal_control"))
+                        self._normal_control_checkpoint_pending = bool(
+                            not self.settings.meter_envelope_control and saved.get("normal_control"))
                         if not self.regulator.import_overload_state(saved):
                             restore_rejected = True
                             raise ValueError("Invalid restored exposure")
-                        if saved.get("minimum_held"):
+                        if not self.settings.meter_envelope_control and saved.get("minimum_held"):
                             self._overload_restore_receipt_floor = datetime.now(timezone.utc).timestamp()
                 except Exception as err:
                     self._budget_error = "overload_budget_restore_failed"
@@ -845,6 +859,7 @@ class OneFuseLoaderController:
         self._passive_journal_unsub = self._passive_journal_token = None
 
     def _cancel_positive_dispatch(self) -> None:
+        self._meter_checkpoint_proposal = None
         if self._dispatch_positive and self._dispatch_task is not None and not self._dispatch_task.done():
             self._dispatch_superseded = True
             # Cancellation before the adapter's actual SDK boundary cannot
@@ -1891,20 +1906,38 @@ class OneFuseLoaderController:
             transition = None
         after = bool(record and transition is not None and transition >= record.started)
         age = self.hass.loop.time() - transition if transition is not None else None
-        # A GET receipt cannot turn an old 0 A current event into fresh proof.
-        accepted = self.last_accepted_limit
-        started = self._utc_time(accepted.get("started_at_utc")) if accepted else None
-        fresh_ev = bool(inp.charger_current_trusted and (not require_new_current or (
-                        started is not None and inp.charger_report_ts is not None
-                        and inp.charger_report_ts > started.timestamp()
-                        and (not inp.charger_event_source_known or (
-                            inp.charger_event_source_ts is not None
-                            and inp.charger_event_source_ts > started.timestamp())))))
+        if self.settings.meter_envelope_control:
+            # The standalone episode owns the original zero-command floor and
+            # any newer possibly delivered positive command. Only qualified
+            # mapped L1 evidence can discharge that delivery barrier. A GET or
+            # aggregate MAX report cannot create such physical response proof.
+            current_evidence = self.regulator.meter_zero_current_evidence(inp)
+            healthy = bool(inp.meter_grid_health and inp.meter_grid_health.valid
+                           and inp.meter_actuator_health and inp.meter_actuator_health.valid)
+        else:
+            # A GET receipt cannot turn an old 0 A current event into fresh proof.
+            accepted = self.last_accepted_limit
+            started = self._utc_time(accepted.get("started_at_utc")) if accepted else None
+            fresh_ev = bool(inp.charger_current_trusted and (not require_new_current or (
+                            started is not None and inp.charger_report_ts is not None
+                            and inp.charger_report_ts > started.timestamp()
+                            and (not inp.charger_event_source_known or (
+                                inp.charger_event_source_ts is not None
+                                and inp.charger_event_source_ts > started.timestamp())))))
+            current_evidence = inp.charger_current if fresh_ev else None
+            healthy = inp.data_valid
         return dict(phases=reported if self.source_diagnostics.get("reported_circuit_available") else None,
                     after_submission=after, report_age=age,
-                    ev_current=inp.charger_current if fresh_ev else None,
-                    healthy=inp.data_valid, offline_zero=bool(getattr(self._adapter, "offline_limits_verified_zero", False)),
+                    ev_current=current_evidence,
+                    healthy=healthy, offline_zero=bool(getattr(self._adapter, "offline_limits_verified_zero", False)),
                     max_age=self.settings.max_sensor_age_seconds)
+
+    def _zero_ordering_confirmed(self, inp: RegulatorInput) -> bool:
+        """Separate expired prior authority from a measured physical OFF."""
+        if self._delivery.can_skip_zero(**self._zero_readback_evidence(inp, require_new_current=False)):
+            return True
+        return bool(self.settings.meter_envelope_control
+                    and self.regulator.meter_positive_authority_ended(inp))
 
     @staticmethod
     def _report_timestamp(state: Any) -> float | None:
@@ -2044,17 +2077,36 @@ class OneFuseLoaderController:
                 "blocked" if self.last_decision is not None
                 and getattr(self.last_decision, "meter_zero_cause", None) is not None
                 else self.source_diagnostics.get("meter_control_health", "unverified"))
+            standalone = self.regulator.meter_control_diagnostics()
+            meter_control.update({public: standalone.get(internal) for public, internal in (
+                ("meter_control_state", "state"), ("meter_episode_id", "episode_id"),
+                ("meter_episode_phase", "episode_phase"),
+                ("meter_response_deadline_ts", "response_deadline"),
+                ("meter_grid_deadline_ts", "grid_deadline"),
+                ("meter_operational_fault", "operational_fault"),
+                ("meter_recovery_stage", "recovery_stage"),
+                ("meter_recovery_required", "recovery_required"),
+                ("meter_cycle_id", "cycle_id"), ("meter_cycle_used_seconds", "used_seconds"),
+                ("meter_cycle_remaining_seconds", "remaining_seconds"),
+                ("meter_historical_fault", "historical_failure"),
+                ("meter_incident_count", "incident_count"),
+            )})
         return self.compact_state_attributes({
             **self.source_diagnostics,
             **meter_control,
             **delivery,
-            "peak_only_response": self.regulator.settings.peak_only_response,
-            "response_policy": ("raw_peak_over_28_only" if self.regulator.settings.peak_only_response else "legacy"),
+            "peak_only_response": (self.settings.meter_envelope_control or self.regulator.settings.peak_only_response),
+            "peak_only_response_setting": self.regulator.settings.peak_only_response,
+            "response_policy": ("standalone_meter_episode" if self.settings.meter_envelope_control
+                                else "raw_peak_over_28_only" if self.regulator.settings.peak_only_response else "legacy"),
             "peak_response_trigger_amps": PEAK_RESPONSE_TRIGGER_AMPS,
             "peak_response_active": self.regulator.peak_response_active,
             "peak_response_deadline_ts": self.regulator.peak_response_deadline(),
-            "ordinary_lower_offer_pending": self.regulator._ordinary_lower is not None,
-            "automatic_overload_cycles": self.regulator.settings.automatic_overload_cycles,
+            "ordinary_lower_offer_pending": (not self.settings.meter_envelope_control
+                                              and self.regulator._ordinary_lower is not None),
+            "automatic_overload_cycles": (self.settings.meter_envelope_control
+                                           or self.regulator.settings.automatic_overload_cycles),
+            "automatic_overload_cycles_setting": self.regulator.settings.automatic_overload_cycles,
             "disconnected_readiness": self.regulator.settings.disconnected_readiness,
             **self.regulator.automatic_cycle_diagnostics(),
             **({"mode": self.last_decision.mode, "reason": self.last_decision.reason,
@@ -2066,7 +2118,9 @@ class OneFuseLoaderController:
                 "controlled_l1_used": getattr(self.last_decision, "controlled_l1_used", False),
                 "readiness_deadline_ts": getattr(self.last_decision, "readiness_deadline_ts", None)}
                 if self.last_decision is not None else {}),
-            "zero_confirmation_scope": "native_ProductUpdate_receipt_and_correlated_delivery_not_physical_response",
+            "zero_confirmation_scope": ("qualified_mapped_L1_after_actual_zero_SDK_and_circuit_delivery_not_GET_or_MAX"
+                if self.settings.meter_envelope_control
+                else "native_ProductUpdate_receipt_and_correlated_delivery_not_physical_response"),
             "last_command_attempt": dict(self.last_command_attempt) if self.last_command_attempt else None,
             "last_accepted_command": dict(self.last_accepted_command) if self.last_accepted_command else None,
             "last_accepted_limit": dict(accepted) if accepted else None,
@@ -2234,8 +2288,7 @@ class OneFuseLoaderController:
         if (receipt and receipt.phases == (0, 0, 0)
                 and (receipt.http_status is not None or receipt.state in {
                     "submission_failed_unverified", "superseded_unverified", "vendor_rejected"})
-                and not self._delivery.can_skip_zero(**self._zero_readback_evidence(
-                    inp, require_new_current=False))):
+                and not self._zero_ordering_confirmed(inp)):
             return None
         if self.settings.meter_envelope_control:
             return self.regulator.meter_envelope_retention(inp, proposed)
@@ -2330,7 +2383,7 @@ class OneFuseLoaderController:
             self._budget_error = "overload_budget_save_failed"
             self._budget_error_type = self._budget_store.last_error_type
             self._budget_retry_at = self.hass.loop.time() + EXPOSURE_STORE_RETRY_SECONDS
-        if self.settings.overload_enabled:
+        if self.settings.overload_enabled or self.settings.meter_envelope_control:
             offline_problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
             budget_fault = self._budget_error if self._budget_error != "overload_budget_save_pending" else None
             if offline_problem or budget_fault:
@@ -2339,32 +2392,73 @@ class OneFuseLoaderController:
         # Keep only bounded scalar diagnostics for the private incident journal;
         # these snapshots have no control authority or public entity attribute.
         r = self.regulator
-        ordinary = r._ordinary_lower
-        confirmation = r._minimum_confirmation
-        private_plan_context = {
-            "established_current_before": _finite_current_number(r._ev_established_value),
-            "established_value_match_before": r._ev_established_value is not None
-                and inp.charger_current == r._ev_established_value,
-            "established_binding_match_before": r._ev_established_binding is not None
-                and inp.control_source_id == r._ev_established_binding,
-            "active_owner_caps_before": {key: value for key, value in {
-                "positive": r._positive_cap,
-                "ordinary": ordinary.cap if ordinary is not None else None,
-                "minimum_confirmation": confirmation.cap if confirmation is not None else None,
-            }.items() if value is not None},
-            "active_owner_deadlines_before": {key: value for key, value in {
-                "positive": r._positive_ramp_deadline,
-                "ordinary": ordinary.observation_deadline if ordinary is not None else None,
-                "minimum_confirmation": confirmation.deadline if confirmation is not None else None,
-                "nominal": r._normal_shed_deadline,
-                "low_grid": r._low_grid_deadline,
-                "readiness": r._readiness_wait_deadline,
-                "peak": getattr(r._peak_response, "deadline", None),
-            }.items() if value is not None},
-            "shared_confirmation_owner_before": confirmation.owner if confirmation is not None else None,
-            "owner_clock_scope": "monotonic_seconds_not_utc",
-        }
-        decision = self.regulator.evaluate(inp)
+        if self.settings.meter_envelope_control:
+            private_plan_context = {"meter_control_before": r.meter_control_diagnostics(),
+                                    "owner_clock_scope": "standalone_episode_monotonic_seconds_not_utc"}
+        else:
+            ordinary = r._ordinary_lower
+            confirmation = r._minimum_confirmation
+            private_plan_context = {
+                "established_current_before": _finite_current_number(r._ev_established_value),
+                "established_value_match_before": r._ev_established_value is not None
+                    and inp.charger_current == r._ev_established_value,
+                "established_binding_match_before": r._ev_established_binding is not None
+                    and inp.control_source_id == r._ev_established_binding,
+                "active_owner_caps_before": {key: value for key, value in {
+                    "positive": r._positive_cap,
+                    "ordinary": ordinary.cap if ordinary is not None else None,
+                    "minimum_confirmation": confirmation.cap if confirmation is not None else None,
+                }.items() if value is not None},
+                "active_owner_deadlines_before": {key: value for key, value in {
+                    "positive": r._positive_ramp_deadline,
+                    "ordinary": ordinary.observation_deadline if ordinary is not None else None,
+                    "minimum_confirmation": confirmation.deadline if confirmation is not None else None,
+                    "nominal": r._normal_shed_deadline,
+                    "low_grid": r._low_grid_deadline,
+                    "readiness": r._readiness_wait_deadline,
+                    "peak": getattr(r._peak_response, "deadline", None),
+                }.items() if value is not None},
+                "shared_confirmation_owner_before": confirmation.owner if confirmation is not None else None,
+                "owner_clock_scope": "monotonic_seconds_not_utc",
+            }
+        decision = None
+        pending_proposal = self._meter_checkpoint_proposal
+        if pending_proposal is not None:
+            # A verified write can take longer than the caller's bounded I/O
+            # wait. Re-evaluating and saving a moving exposure counter on every
+            # completion would make that successful checkpoint obsolete before
+            # its original reduction could ever enter SDK. Keep this one
+            # unsent intent and exact snapshot, without pausing source checks.
+            compatible = bool(self.settings.meter_envelope_control and same_settings
+                and pending_proposal["generation"] == generation
+                and self._budget_error in {None, "overload_budget_save_pending"}
+                and self._budget_store.fingerprint(r.export_overload_state())
+                    == pending_proposal["fingerprint"]
+                and r.can_continue_meter_dispatch(pending_proposal["input"], inp,
+                                                 pending_proposal["decision"]))
+            if not compatible:
+                self._meter_checkpoint_proposal = None
+            elif self._budget_store.verification_pending:
+                retained = self._committed_normal_retention(inp, pending_proposal["decision"])
+                self.last_decision = retained if retained is not None else replace(
+                    pending_proposal["decision"], mode="meter_wait_storage", meter_state="meter_wait_storage",
+                    current_p1=0, current_p2=0, current_p3=0, command=None, service=None,
+                    should_call_service=False, meter_normal_retention=False,
+                    reason="Waiting for this exact normal proposal's checkpoint; no command or lease has been issued.")
+                self.last_service_result = "not_sent_storage_pending"
+                self._schedule_overload_deadline(self.last_decision)
+                self.notify()
+                return
+            elif self._budget_store.state_is_durable(pending_proposal["exposure"]):
+                decision = pending_proposal["decision"]
+                self._meter_checkpoint_proposal = None
+                if self._budget_error == "overload_budget_save_pending":
+                    self._budget_error = self._budget_error_type = None
+                    self._budget_retry_at = 0.
+            else:
+                self._meter_checkpoint_proposal = None
+        if decision is None:
+            decision = self.regulator.evaluate(inp)
         if self._protective_zero_pending and self.settings.active_control and not self.settings.dry_run:
             self.regulator.reject_unsubmitted(decision, self.hass.loop.time())
             if self.settings.meter_envelope_control:
@@ -2377,18 +2471,20 @@ class OneFuseLoaderController:
         if decision.current_refresh_required:
             self._request_current_snapshot()
         exposure = self.regulator.export_overload_state()
-        normal_control = exposure.get("normal_control", {})
-        normal_active = bool(normal_control.get("cap") is not None
+        normal_control = exposure.get("normal_control", {}) if not self.settings.meter_envelope_control else {}
+        normal_active = bool(not self.settings.meter_envelope_control and (
+                             normal_control.get("cap") is not None
                              or normal_control.get("response_pending")
                              or normal_control.get("alignment_pending")
                              or normal_control.get("stops")
-                             or normal_control.get("response_failure"))
+                             or normal_control.get("response_failure")))
         if normal_active:
             self._normal_control_checkpoint_pending = True
         if (self._budget_error != "overload_budget_restore_failed"
                 and (self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"]
                      or exposure.get("trial_epoch") is not None
                      or exposure.get("automatic_cycle") is not None
+                     or exposure.get("meter_control") is not None
                      or self._normal_control_checkpoint_pending)
                 and self.hass.loop.time() >= self._budget_retry_at):
             try:
@@ -2404,6 +2500,14 @@ class OneFuseLoaderController:
                 self._budget_error_type = type(err).__name__
                 self._budget_retry_at = self.hass.loop.time() + EXPOSURE_STORE_RETRY_SECONDS
                 if pending:
+                    if (self.settings.meter_envelope_control and decision.current_p1 > 0
+                            and decision.command == "set_limit" and decision.should_call_service
+                            and not decision.dry_run):
+                        self._meter_checkpoint_proposal = {
+                            "generation": generation, "input": inp, "decision": decision,
+                            "exposure": deepcopy(exposure),
+                            "fingerprint": self._budget_store.fingerprint(exposure),
+                        }
                     self._watch_pending_checkpoint()
                     _LOGGER.warning("1FuseLoader exposure verification is still pending; timed overload remains blocked")
                 else:
@@ -2460,7 +2564,7 @@ class OneFuseLoaderController:
                 decision = retained
         pending_normal = self._pending_checkpoint_allows_normal(decision, inp)
         checkpoint_unverified = bool(self._budget_error and not pending_normal or (
-            self.settings.automatic_overload_cycles
+            (self.settings.meter_envelope_control or self.settings.automatic_overload_cycles)
             and self.regulator.automatic_cycle_requires_checkpoint
             and not self._budget_store.state_is_durable(self.regulator.export_overload_state())
             and not (self.settings.meter_envelope_control and pending_normal
@@ -2472,7 +2576,8 @@ class OneFuseLoaderController:
                     decision.meter_overload_authority if self.settings.meter_envelope_control
                     else decision.mode.removeprefix("dry_run_").startswith("overload"))
                 and (decision.overload_remaining_seconds < OVERLOAD_LEASE_RESERVE_SECONDS
-                     or (self._overload_restore_receipt_floor is not None and (
+                     or (not self.settings.meter_envelope_control
+                         and self._overload_restore_receipt_floor is not None and (
                          inp.grid_report_ts is None or inp.charger_report_ts is None
                          or inp.grid_report_ts < self._overload_restore_receipt_floor
                          or inp.charger_report_ts < self._overload_restore_receipt_floor
@@ -2665,7 +2770,7 @@ class OneFuseLoaderController:
             # execute any stale positive offer, including a reduction or a
             # lease renewal. A new hard load/fault can require zero instead.
             latest = self._read_input()
-            if self.settings.overload_enabled:
+            if self.settings.overload_enabled or self.settings.meter_envelope_control:
                 problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
                 pending_safe = self._pending_checkpoint_allows_normal(decision, latest)
                 budget_fault = self._budget_error if not pending_safe else None
@@ -2695,7 +2800,7 @@ class OneFuseLoaderController:
         # a newly changed EV event here could deadlock a car already at zero.
         # A fresh native cap event and matching delivery (when correlatable)
         # still precede a new offer. This makes no physical-response claim.
-        ordered_zero = self._delivery.can_skip_zero(**self._zero_readback_evidence(inp, require_new_current=False))
+        ordered_zero = self._zero_ordering_confirmed(inp)
         if (decision.command == "set_limit" and decision.current_p1 == 0 and confirmed_zero):
             # No API call and no acknowledge: a cached zero must never renew
             # a lease, a response timer, or a thermal allowance.
@@ -2735,6 +2840,13 @@ class OneFuseLoaderController:
                         return False
                 elif not ready or not self.regulator.can_continue_readiness_dispatch(inp, latest, decision):
                     return False
+            if (self.settings.meter_envelope_control and positive_submission
+                    and decision.meter_overload_authority
+                    and not self.regulator.meter_overload_admitted(latest, decision)):
+                # The standalone episode owns post-restore admission. A local
+                # refusal is unsent work, not a new electrical zero or an
+                # alternate legacy aggregate-current response deadline.
+                return False
             if not self.regulator.begin_submission(decision, self.hass.loop.time(), inp=latest):
                 return False
             self._dispatch_started = True
@@ -2954,7 +3066,7 @@ class OneFuseLoaderController:
                 # changed while awaiting it. Immediately plan from new data;
                 # do not wait for another periodic tick or replay this offer.
                 latest = self._read_input()
-                if self.settings.overload_enabled:
+                if self.settings.overload_enabled or self.settings.meter_envelope_control:
                     problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
                     budget_fault = (self._budget_error
                         if self._budget_error != "overload_budget_save_pending" else None)
@@ -2975,11 +3087,14 @@ class OneFuseLoaderController:
                     "house_load_l1": _finite_current_number(decision.house_load_l1),
                     "native_committed": inp.charger_native_committed is True,
                     "snapshot_used": inp.charger_snapshot_verified is True,
-                    "established_current_after": _finite_current_number(self.regulator._ev_established_value),
-                    "established_value_match_after": self.regulator._ev_established_value is not None
-                        and inp.charger_current == self.regulator._ev_established_value,
-                    "established_binding_match_after": self.regulator._ev_established_binding is not None
-                        and inp.control_source_id == self.regulator._ev_established_binding,
+                    **({"meter_control_after": self.regulator.meter_control_diagnostics()}
+                       if self.settings.meter_envelope_control else {
+                           "established_current_after": _finite_current_number(self.regulator._ev_established_value),
+                           "established_value_match_after": self.regulator._ev_established_value is not None
+                               and inp.charger_current == self.regulator._ev_established_value,
+                           "established_binding_match_after": self.regulator._ev_established_binding is not None
+                               and inp.control_source_id == self.regulator._ev_established_binding,
+                       }),
                 }})
             self._queue_incident_journal()
         self.notify()

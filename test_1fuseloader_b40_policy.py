@@ -55,7 +55,7 @@ class B40PolicyTests(unittest.TestCase):
         _,confirmed=self.f.sample(r,20.694,20.,8.34,mapped_current=7.094,
             receipt=18.148788,phase_receipt=18.151245,sequence=3,grid_at=20.)
         self.assertIsNone(confirmed.meter_zero_cause)
-        self.assertIsNone(r._peak_response)
+        self.assertFalse(r.peak_response_active)
         self.assertEqual(confirmed.current_p1,10)
         self.assertEqual(confirmed.house_load_basis,'eligible_mapped_l1_then_meter')
 
@@ -85,8 +85,8 @@ class B40PolicyTests(unittest.TestCase):
         _,stopped=self.f.sample(r,20.,31.,8.34,mapped_current=7.094,receipt=19.8,
             sequence=5,grid_at=15.,mapping_epoch=2,adopted=18.5)
         self.assertEqual(stopped.meter_zero_cause,'peak_response_timeout')
-        self.assertEqual(r._peak_response.deadline,20.)
-        self.assertLess(r._peak_response.deadline,original)
+        self.assertEqual(r._get_meter_envelope_policy().episode.deadline,20.)
+        self.assertLess(r._get_meter_envelope_policy().episode.deadline,original)
 
     def test_same_provider_second_real_native_credit_advances_after_sdk(self):
         r=self.f.live()
@@ -126,7 +126,7 @@ class B40PolicyTests(unittest.TestCase):
             sequence=4,provider=9.,grid_at=10.)
         self.assertEqual(response.mode,'meter_grid_wait')
         self.assertAlmostEqual(response.grid_confirmation_deadline_ts,41.2,places=4)
-        self.assertAlmostEqual(r._peak_response.deadline,original,places=7)
+        self.assertAlmostEqual(r._get_meter_envelope_policy().episode.deadline,original,places=7)
         _,after_ten=self.f.sample(r,20.01,31.,8.34,mapped_current=7.094,receipt=11.2,
             sequence=4,provider=9.,grid_at=10.)
         self.assertIsNone(after_ten.meter_zero_cause)
@@ -135,7 +135,7 @@ class B40PolicyTests(unittest.TestCase):
             sequence=4,provider=9.,grid_at=20.)
         self.assertIsNone(normal.meter_zero_cause)
         self.assertEqual(normal.current_p1,10)
-        self.assertIsNone(r._peak_response)
+        self.assertFalse(r.peak_response_active)
 
     def test_ack_uses_actual_dispatch_phase_floor_not_new_http_input(self):
         r=self.f.live()

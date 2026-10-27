@@ -31,9 +31,15 @@ class MeterEnvelopeConfigTests(unittest.TestCase):
         for value in ("true", "false", 0, 1, None):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 config.const.validate_options({**PROFILE, KEY: value})
-        for key in (*PROFILE, "enable_dynamic_limit"):
-            with self.subTest(missing=key), self.assertRaises(ValueError):
-                config.const.validate_options({**PROFILE, KEY: True, key: False})
+        # The standalone policy does not depend on the legacy estimator and
+        # automatic-cycle switches merely to provide ordinary regulation.
+        for key in PROFILE:
+            with self.subTest(independent=key):
+                selected=config.const.validate_options({**PROFILE, KEY: True, key: False})
+                self.assertTrue(selected[KEY])
+                self.assertFalse(selected[key])
+        with self.assertRaises(ValueError):
+            config.const.validate_options({**PROFILE, KEY: True, "enable_dynamic_limit": False})
         with self.assertRaises(ValueError):
             config.const.validate_options({**PROFILE, KEY: True, "max_charge_amps": 17})
         with self.assertRaises(ValueError):
@@ -181,7 +187,9 @@ class MeterSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(inp.meter_ev_health)
 
     async def test_unsupported_switch_update_is_atomic_before_transport_or_generation(self):
-        self.entry.options.update(meter_envelope_control=False, nominal_import_only_fallback=False)
+        # 17 A is valid for the legacy controller but outside the selected
+        # single-phase vehicle profile. Legacy estimator opt-outs are now valid.
+        self.entry.options.update(meter_envelope_control=False, max_charge_amps=17)
         self.controller._reload_settings_locked()
         before = deepcopy(self.entry.options)
         generation = self.controller._generation
@@ -347,9 +355,15 @@ class MeterEnvelopeOptionsFlowTests(unittest.IsolatedAsyncioTestCase):
         marker = next(key for key in form["data_schema"].schema if str(key.schema) == KEY)
         self.assertIs(marker.default(), False)
         self.assertIs(form["data_schema"].schema[marker], bool)
-        invalid = await flow.async_step_init({KEY: True})
+        invalid = await flow.async_step_init({KEY: True, "max_charge_amps": 17})
         self.assertEqual(invalid["type"], "form")
         self.assertEqual(invalid["errors"].get("base"), "invalid_settings")
+        self.assertEqual(dict(self.entry.options), before)
+        ordinary = await flow.async_step_init({KEY: True})
+        self.assertEqual(ordinary["type"], "create_entry")
+        self.assertIs(ordinary["data"][KEY], True)
+        for key in PROFILE:
+            self.assertEqual(ordinary["data"][key], before[key])
         self.assertEqual(dict(self.entry.options), before)
         accepted = await flow.async_step_init({**PROFILE, KEY: True})
         self.assertEqual(accepted["type"], "create_entry")

@@ -61,12 +61,21 @@ class MeterEnvelopePolicyTests(unittest.TestCase):
         self.assertEqual((r.last_target[0],first.nominal_response_deadline_ts),(7,20.))
         return r
 
+    def restore_legacy_block(self,r):
+        # Migrate a real predecessor checkpoint through the public boundary.
+        # A private cycle mutation alone cannot represent the standalone
+        # controller's separate current operational-fault state.
+        saved=r.export_overload_state()
+        saved.pop('meter_control')
+        saved['automatic_cycle'].update(state='blocked',failure_reason='response_timeout')
+        self.assertTrue(r.import_overload_state(saved))
+
     def verified_minimum(self):
         r=self.peak()
         _,d=self.sample(r,12.,35.,7.1,receipt=11.8,sequence=3,grid_at=10.)
         self.assertAlmostEqual(d.grid_confirmation_deadline_ts,41.8,places=4)
         self.sample(r,15.,28.5,7.1,receipt=11.8,sequence=3)
-        self.assertIsNone(r._peak_response)
+        self.assertFalse(r.peak_response_active)
         return r
 
     def test_expired_ordinary_owners_and_fractional_partial_current_have_no_stop_authority(self):
@@ -202,7 +211,7 @@ class MeterEnvelopePolicyTests(unittest.TestCase):
             _,d=self.sample(r,float(at),28.5,7.1,receipt=11.8,sequence=3)
             self.assertIsNone(d.meter_zero_cause,d)
             self.assertEqual(d.current_p1,7)
-            self.assertIsNone(r._peak_response)
+            self.assertFalse(r.peak_response_active)
         self.assertEqual(r._automatic_cycle['state'],'active')
         _,d=self.sample(r,1810.,28.5,7.1,receipt=11.8,sequence=3,accept=False)
         self.assertEqual(d.meter_zero_cause,logic.ElectricalStopCause.OVERLOAD_BUDGET.value)
@@ -244,7 +253,7 @@ class MeterEnvelopePolicyTests(unittest.TestCase):
 
     def test_genuine_normal_decrease_precedes_blocked_overload_admission(self):
         r=self.live()
-        r._ensure_automatic_cycle().update(state='blocked',failure_reason='response_timeout')
+        self.restore_legacy_block(r)
         _,d=self.sample(r,5.,25.2,16.1,receipt=4.8,sequence=2)
         self.assertEqual(d.current_p1,13)
         self.assertTrue(d.meter_ordinary_decrease)
@@ -268,7 +277,7 @@ class MeterEnvelopePolicyTests(unittest.TestCase):
         for cap,current,error in ((7,7.1,False),(16,16.1,True)):
             with self.subTest(cap=cap,error=error):
                 r=self.live(cap)
-                r._ensure_automatic_cycle().update(state='blocked',failure_reason='response_timeout')
+                self.restore_legacy_block(r)
                 _,d=self.sample(r,5.,25.2,current,receipt=4.8,sequence=2,accept=False,
                     meter_ev_health=logic.SourceHealth(not error,'estimate_error' if error else None))
                 self.assertEqual(d.meter_zero_cause,logic.ElectricalStopCause.OVERLOAD_NOT_ADMITTED.value)
