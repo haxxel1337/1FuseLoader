@@ -50,6 +50,29 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Observation expiry and normal continuation (b38)
+
+A command-response observation and permission to continue an accepted normal
+offer are separate decisions. Under the existing peak-triggered policy,
+before an observation-only decrease or stop,
+the regulator checks independent normal evidence for the entire unresolved
+accepted offer. Fresh raw grid current plus that whole offer can establish
+normal permission without subtracting uncertain vehicle current. Qualified
+same-receiver native state uses its original evidence and matching joint
+house-load/upper-current bound.
+
+Independent normal evidence can retain and ordinarily renew the same accepted
+finite offer. It does not prove command causality, advance a vehicle clock,
+erase unresolved higher physical authority, extend a response window or grant
+an EV-based increase. A separately qualified whole-raw increase remains a
+different operation. Bounded status and incomplete-publication holds remain
+no-write holds under their original deadlines and live lease.
+
+Actual electrical response deadlines, invalid sources, unknown delivery,
+storage failures, retry barriers and overload accounting still take precedence.
+Source clock metadata remains visible when larger historical diagnostics are
+truncated; omitted or invalid metadata is not presented as fresh measurement.
+
 ### Normal operation and command evidence (b36)
 
 An actual accepted command and a proposed command are separate records. A
@@ -59,14 +82,18 @@ qualification governs retention across connected waiting labels and delayed
 reports. Independent normal-state retention requires the whole unresolved
 accepted authority to fit the normal buffered envelope, with the original
 source binding, native receiver and finite lease.
-Waiting retains only that cap; it sends no command, renewal, increase or resume.
+An anchor-only waiting hold retains only that cap; it sends no command,
+renewal, increase or resume. Independently qualified same-cap renewal under
+the peak-response policy is described above.
 Independent fresh raw-grid headroom can still authorize an ordinary offer
 without subtracting uncertain EV current.
 
 Normal operation and command response answer different questions. A fresh
 trusted native current report and later coherent grid can qualify the existing
 normal offer without proving that a particular API call caused the current.
-This can retire a measurement-only observation owner. It cannot clear a real
+This can discharge measurement-only observation work. Unconfirmed higher
+physical authority remains until genuine response evidence resolves it.
+It cannot clear a real
 peak, an interrupted recovery barrier, an overload failure or spent exposure,
 or create another response window or overload cycle.
 

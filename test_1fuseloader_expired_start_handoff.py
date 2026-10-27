@@ -83,14 +83,11 @@ class ExpiredStartHandoffTests(unittest.TestCase):
                         self.assertIsNone(r._ordinary_lower.first_response)
                     else:
                         # No lower request left the regulator. This new pair
-                        # proves the WHOLE actual16 offer fits normal budget;
-                        # retain it without sending/ACKing either16 or7.
-                        if now == 91.:
-                            self.assertEqual((d.mode, d.current_p1, d.command), ("normal_continuity", 16, None))
-                            self.assertFalse(d.should_call_service)
-                        else:
-                            self.assertEqual((d.mode, d.current_p1, d.command), ("normal", 16, "set_limit"))
-                            self.assertTrue(d.should_call_service)
+                        # proves the WHOLE actual16 offer fits normal budget.
+                        # Its normal renewal may be proposed immediately;
+                        # this test sends neither16 nor7 and grants no ACK.
+                        self.assertEqual((d.mode, d.current_p1, d.command), ("normal", 16, "set_limit"))
+                        self.assertTrue(d.should_call_service)
                         self.assertIsNone(r._ordinary_lower)
                     self.assertEqual(r.last_target[0], 16)
                     self.assertEqual(r.last_set_limit_ts, 60.)

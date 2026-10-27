@@ -319,10 +319,37 @@ class CommittedNormalAuthorityTests(unittest.TestCase):
         self.assertEqual(r._committed_normal.observation_deadline, 225.)
         first = r.evaluate(self.partial_decrease(224.5))
         self.assertAlmostEqual(first.source_processing_deadline_ts, 225.)
-        late = self.frame(226., grid=23.2, current=15.2, receipt=225.2, grid_at=226.,
+        # The new pair is outside normal even at the accepted15 offer:
+        #23.3 -15.2 +15 =23.1 A. The expired phase supplies no extension.
+        late = self.frame(226., grid=23.3, current=15.2, receipt=225.2, grid_at=226.,
             sequence=2, charger_report_provenance=("receiver", "max_terminals", 182, 183),
             charger_observation_sequences=((182, 225), (183, 2), (184, 0), (185, 0)))
         self.assertIsNone(r.committed_normal_retention(late, first))
+
+    def test_fresh_normal_pair_after_observation_expiry_retains_only_live_cap_without_mutation(self):
+        r = self.normal_decrease(resend_limit_every_seconds=15)
+        renewal_input = self.frame(215., grid=24.2, current=16.2, receipt=65., sequence=1)
+        renewal = r.evaluate(renewal_input)
+        self.assertTrue(r.begin_submission(renewal, 215., inp=renewal_input))
+        r.acknowledge(renewal, 215.2)
+        self.assertEqual(r._committed_normal.observation_deadline, 225.)
+        first = r.evaluate(self.partial_decrease(224.5))
+        late = self.frame(226., grid=23.2, current=15.2, receipt=225.2, grid_at=226.,
+            sequence=2, charger_report_provenance=("receiver", "max_terminals", 182, 183),
+            charger_observation_sequences=((182, 225), (183, 2), (184, 0), (185, 0)))
+        before = deepcopy(r.__dict__)
+        held = r.committed_normal_retention(late, first)
+        self.assertIsNotNone(held)
+        self.assertEqual((held.mode, held.current_p1, held.command, held.should_call_service),
+                         ("normal_continuity", 15, None, False))
+        self.assertAlmostEqual(held.house_load_l1+held.current_p1, 23.)
+        self.assertEqual(held.normal_continuity_deadline_ts, 275.)
+        # This is current operating permission, not a claim that response
+        # happened before225 or that any request renewed the original phase.
+        self.assertEqual(r.__dict__, before)
+        self.assertEqual(r.last_set_limit_ts, 215.)
+        self.assertEqual(r._committed_normal.observation_deadline, 225.)
+        self.assertEqual(r._committed_normal.unresolved_cap, 16)
 
     def test_high_raw_cannot_extend_a_general_connected_status_bridge(self):
         r, f = self.normal()

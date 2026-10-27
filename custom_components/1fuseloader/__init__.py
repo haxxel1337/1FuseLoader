@@ -67,6 +67,14 @@ _PENDING_BUDGET_WRITES_KEY = f"{DOMAIN}_pending_budget_writes"
 OVERLOAD_LEASE_RESERVE_SECONDS = 90
 # Leave room for HA's own entity attributes below Recorder's 16 KiB limit.
 DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES = 11 * 1024
+# The source clocks are operational evidence, not expendable incident detail.
+# Keep their bounded scalar representations intact through both publication passes.
+_SOURCE_METADATA_FIELDS = frozenset({
+    "grid_source_kind", "grid_reported_at_utc", "grid_mqtt_received_at_utc",
+    "charger_current_reported_at_utc", "effective_charger_reported_at_utc",
+    "charger_status_reported_at_utc", "easee_stream_pulse_utc",
+    "reported_circuit_reported_at_utc", "easee_source_health",
+})
 
 
 def _finite_current_number(value: Any) -> float | None:
@@ -112,6 +120,38 @@ def _limit_receipt_summary(record: dict[str, Any]) -> dict[str, Any]:
 def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     """Bound only HA state views; never mutate regulator or private journal data."""
     truncated = bool(attributes.get("diagnostics_truncated"))
+    previous_omitted = attributes.get("diagnostics_omitted_fields_count", 0)
+    omitted = (min(previous_omitted, 2**63 - 1)
+               if isinstance(previous_omitted, int) and not isinstance(previous_omitted, bool)
+               and previous_omitted >= 0 else 0)
+    prior_metadata_omissions = attributes.get("source_metadata_omitted_fields", [])
+    metadata_omissions = ({key for key in prior_metadata_omissions
+                          if isinstance(key, str) and key in _SOURCE_METADATA_FIELDS}
+                         if isinstance(prior_metadata_omissions, (list, tuple)) else set())
+    source_metadata = {}
+    for key in _SOURCE_METADATA_FIELDS & attributes.keys():
+        value = attributes[key]
+        scalar_value = value is None or isinstance(value, (str, int, float, bool))
+        try:
+            bounded = (scalar_value and len(json.dumps(value, ensure_ascii=True,
+                       allow_nan=False).encode("utf-8")) <= 256)
+        except (TypeError, ValueError, OverflowError):
+            bounded = False
+        # Never shorten a timestamp into a plausible but different clock, and
+        # never publish a nested payload in place of primary source evidence.
+        source_metadata[key] = value if bounded else None
+        if not bounded:
+            metadata_omissions.add(key)
+            truncated = True
+
+    def publication_flags() -> None:
+        view.update(source_metadata)
+        if metadata_omissions:
+            view["source_metadata_omitted_fields"] = sorted(metadata_omissions)
+        view["diagnostics_scope"] = "compact_state_view_full_incident_journal_in_storage"
+        view["diagnostics_truncated"] = truncated
+        if omitted or "diagnostics_omitted_fields_count" in attributes:
+            view["diagnostics_omitted_fields_count"] = omitted
 
     def compact(value: Any, *, text_bytes: int = 1024, depth: int = 0) -> Any:
         nonlocal truncated
@@ -133,15 +173,16 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             return [compact(item, text_bytes=text_bytes, depth=depth + 1) for item in value[:4]]
         return value
 
-    view = compact(attributes)
+    view = compact({key: value for key, value in attributes.items()
+                    if key not in _SOURCE_METADATA_FIELDS
+                    and key not in {"source_metadata_omitted_fields", "diagnostics_omitted_fields_count"}})
     policy = view.get("overload_trial_policy")
     if isinstance(policy, dict) and "settings" in policy:
         # The immutable complete settings snapshot belongs to the ledger, not
         # three trial sensors and Source Health on every watchdog evaluation.
         policy.pop("settings")
         truncated = True
-    view["diagnostics_scope"] = "compact_state_view_full_incident_journal_in_storage"
-    view["diagnostics_truncated"] = truncated
+    publication_flags()
 
     def size() -> int:
         # Escaped ASCII is a conservative upper bound for UTF-8 JSON as well.
@@ -150,7 +191,7 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     if size() > DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES:
         truncated = True
         view = compact(view, text_bytes=384)
-        view["diagnostics_truncated"] = True
+        publication_flags()
         # Histories are optional state summaries. The full rings remain in the
         # private incident journal and must never be shortened for Recorder.
         for key in ("recent_command_journal", "recent_stop_contexts", "recent_command_deliveries"):
@@ -178,9 +219,9 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             "budget_latest_state_durable", "budget_checkpoint_verified_at_utc",
             "recent_command_journal_count", "recent_stop_contexts_count", "recent_command_deliveries_count",
             "last_command_attempt", "last_accepted_command", "last_accepted_limit",
-            "diagnostics_scope", "diagnostics_truncated",
-        }
-        omitted = 0
+            "diagnostics_scope", "diagnostics_truncated", "diagnostics_omitted_fields_count",
+            "source_metadata_omitted_fields",
+        } | _SOURCE_METADATA_FIELDS
         # A future unexpectedly verbose source field must not silently discard
         # the latest cause or accounting counters by crossing Recorder's limit.
         for key in sorted((key for key in view if key not in essential),
@@ -189,7 +230,7 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
                 break
             del view[key]
             omitted += 1
-        view["diagnostics_omitted_fields_count"] = omitted
+        publication_flags()
     if size() > DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES:
         # Fixed final projection keeps the limit hard even if a future nested
         # source payload is accidentally attached to an essential field.
@@ -211,22 +252,24 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
                     high = middle - 1
             return text[:low] + " [truncated]"
         last_stop = view.get("last_stop_context")
-        view = {key: scalar(view[key]) for key in essential if key in view}
+        view = {key: (view[key] if key in _SOURCE_METADATA_FIELDS
+                      or key == "source_metadata_omitted_fields" else scalar(view[key]))
+                for key in essential if key in view}
         if isinstance(last_stop, dict):
             view["last_stop_context"] = {key: scalar(last_stop[key]) for key in (
                 "plan_utc", "reason", "mode", "grid_l1", "charger_current", "status",
                 "command_result", "command_error", "overload_failure_reason",
             ) if key in last_stop}
-        view["diagnostics_truncated"] = True
-        view["diagnostics_scope"] = "compact_state_view_full_incident_journal_in_storage"
+        publication_flags()
         if size() > DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES:
             view = {key: view[key] for key in (
                 "mode", "reason", "current_p1", "current_p2", "current_p3", "source_health",
                 "source_health_reason", "last_stop_context", "overload_lifetime_used_seconds",
                 "overload_historical_failure_reason", "overload_trial_state", "overload_trial_used_seconds",
                 "overload_trial_remaining_seconds", "recent_command_journal_count", "recent_stop_contexts_count",
-                "diagnostics_truncated", "diagnostics_scope",
-            ) if key in view}
+                "diagnostics_truncated", "diagnostics_scope", "diagnostics_omitted_fields_count",
+                "source_metadata_omitted_fields",
+            ) + tuple(_SOURCE_METADATA_FIELDS) if key in view}
     return view
 
 

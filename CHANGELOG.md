@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0b38
+
+- Under the existing peak-triggered policy, assess independent normal operating
+  evidence before an observation-only
+  decrease or stop. An elapsed command-observation window does not invalidate
+  the same accepted offer when fresh grid data independently bounds the whole
+  unresolved offer within the normal buffered limit.
+- Separate permission to continue and renew that same finite offer from proof
+  that the vehicle responded to a particular command. Preserve unresolved
+  higher authority and the original response history; cached vehicle state
+  grants no new response event, EV-based increase or response window.
+- Keep source clocks and source-kind metadata in the bounded diagnostic
+  projection, including after the sensor's second compaction pass. Diagnostic
+  size limits remain unchanged.
+- Preserve electrical response limits, source and delivery faults, durable
+  command admission, finite leases and overload accounting. This change does
+  not establish the cause of an offered-current zero received before a local
+  zero command.
+
 ## 0.4.0b37
 
 - With the existing import-only raw fallback enabled, release a completed

@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+from enum import Enum
 from math import floor, isfinite
 from typing import NamedTuple, Optional
 
@@ -292,12 +293,45 @@ class CommittedNormalAuthority:
     status_deadline: Optional[float] = None
     observation_deadline: Optional[float] = None
     unresolved_cap: Optional[int] = None
+    observation_history: tuple["NormalObservationRecord", ...] = ()
+    source_processing_deadline: Optional[float] = None
+    native_floor: Optional[float] = None
+    native_observation_keys: tuple = ()
+    native_source_known: bool = False
+
+
+class NormalObservationRecord(NamedTuple):
+    """Original normal observation facts, not a successful EV response."""
+    kind: str
+    cap: int
+    previous: int
+    origin: Optional[float]
+    deadline: Optional[float]
+    grid_floor: Optional[float]
+    ev_floor: Optional[float]
+    ev_clock_snapshot: str
+
+
+class NormalProofKind(str, Enum):
+    WHOLE_RAW = "whole_raw"
+    COHERENT_NATIVE = "coherent_native"
+    STABLE_NATIVE = "stable_native_state"
+    STATUS_ANCHOR = "status_anchor"
+    OBSERVATION_ANCHOR = "observation_anchor"
+    SOURCE_COHORT = "source_cohort"
 
 
 class NormalOperatingProof(NamedTuple):
     cap: int
     house: float
     retires_measurement: bool
+    kind: NormalProofKind
+
+    @property
+    def permits_renew(self) -> bool:
+        """Independent normal operation can renew only its accepted cap."""
+        return self.kind in {NormalProofKind.WHOLE_RAW,
+            NormalProofKind.COHERENT_NATIVE, NormalProofKind.STABLE_NATIVE}
 
 
 @dataclass(slots=True)
@@ -729,7 +763,8 @@ class OneFuseRegulator:
         cap = self.last_target[0]
         whole = max(cap, self._reduction_previous_cap or 0 if self._awaiting_reduction_target is not None else cap,
                     self._low_grid_previous or 0 if self._low_grid_pending else cap,
-                    self._uncertainty_previous_offer or 0 if self._uncertainty_ceiling is not None else cap)
+                    self._uncertainty_previous_offer or 0 if self._uncertainty_ceiling is not None else cap,
+                    self._committed_current_upper())
         if (not s.min_charge_amps <= cap <= whole <= s.max_charge_amps
                 or current > whole+.5 or grid+whole > s.main_fuse_amps-s.buffer_amps
                 or self._normal_shed_deadline is not None and now >= self._normal_shed_deadline
@@ -797,9 +832,12 @@ class OneFuseRegulator:
                 or identity is None or identity != self._accepted_control_source_id
                 or self.last_target is None or not s.min_charge_amps <= self.last_target[0] <= s.max_charge_amps
                 or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
-                or current > self.last_target[0]+.5
+                or current > max(self.last_target[0], self._committed_current_upper()
+                    if s.peak_only_response else 0)+.5
                 or current > grid+1 and not any(self._ev_current_evidence_credit.get(key) is False
                     for key in self._ev_current_winners)
+                    and not (s.peak_only_response and self._committed_normal is not None
+                        and grid+self._committed_current_upper() <= s.main_fuse_amps-s.buffer_amps)
                 or self._restart_required or self._uncertainty_ceiling is not None or self._uncertainty_stops > 0
                 or self._uncertainty_retry_submission_pending or self._uncertainty_restart
                 or self._positive_cap is not None or self._awaiting_reduction_target is not None
@@ -814,7 +852,9 @@ class OneFuseRegulator:
         if self._ev_event_source_known and (self._ev_event_source_ts is None or self._ev_event_source_ts > wall+5):
             return None
         candidate = int(floor(min(s.max_charge_amps, s.main_fuse_amps-s.buffer_amps-grid)))
-        return candidate if self.last_target[0] < candidate <= s.max_charge_amps else None
+        return candidate if (self.last_target[0] < candidate <= s.max_charge_amps
+            and grid+max(candidate, self._committed_current_upper())
+                <= s.main_fuse_amps-s.buffer_amps) else None
 
     def _reduction_source_processing_hold(self, now: float, grid: float, current: float,
                                           status: str, inp: RegulatorInput):
@@ -1111,10 +1151,15 @@ class OneFuseRegulator:
             and _valid_number(inp.grid_l1) <= self.settings.main_fuse_amps-self.settings.buffer_amps
             and owner.context.house+owner.context.cap <= self.settings.main_fuse_amps-self.settings.buffer_amps)
 
+    def _committed_current_upper(self) -> int:
+        """Accepted normal authority includes every still unresolved upper."""
+        owner = self._committed_normal
+        return max(owner.cap, owner.unresolved_cap or 0) if owner is not None else 0
+
     def _peak_whole_authority(self) -> int:
         values = [self.last_target[0] if self.last_target else 0,
                   self._uncertainty_previous_offer or 0,
-                  self._positive_cap or 0]
+                  self._positive_cap or 0, self._committed_current_upper()]
         accepted = self.last_target[0] if self.last_target else 0
         late_high = self._peak_last_current_value is not None and self._peak_last_current_value > accepted+.5
         if (self._awaiting_reduction_target is not None
@@ -1999,7 +2044,7 @@ class OneFuseRegulator:
                 if name.startswith(("_positive_", "_low_grid_", "_normal_shed_", "_uncertainty_"))}
             previous = max(accepted, self._reduction_previous_cap or 0,
                 self._uncertainty_previous_offer or 0, self._low_grid_previous or 0,
-                self._normal_shed_previous or 0)
+                self._normal_shed_previous or 0, self._committed_current_upper())
             origin = now-(wall-gt)
             ctx = self._ordinary_lower = OrdinaryLowerOffer(identity, cap, previous, gt, et,
                 grid, origin+min(s.measurement_settle_seconds, s.max_sensor_age_seconds))
@@ -2220,6 +2265,7 @@ class OneFuseRegulator:
         known_offer = (self._low_grid_previous if self._low_grid_deadline is not None else
                        max(self.last_target[0] if self.last_target else 0,
                            self._uncertainty_previous_offer or 0, self._reduction_previous_cap or 0))
+        known_offer = max(known_offer or 0, self._committed_current_upper())
         beyond_known_offer = (source_rejection is not None
                               and current > min(s.max_charge_amps, known_offer) + .5)
         invalid_lease = bool(source_rejection is not None and self.last_target is not None
@@ -2273,6 +2319,7 @@ class OneFuseRegulator:
         previous = self._low_grid_previous if self._low_grid_deadline is not None else max(
             accepted or 0, self._uncertainty_previous_offer or 0,
             self._reduction_previous_cap or 0)
+        previous = max(previous or 0, self._committed_current_upper())
         timely_minimum = bool(s.grid_confirmation_seconds > 0 and active
             and accepted == cap and self._low_grid_accepted_at is not None
             and self._low_grid_ack_ev_floor is not None
@@ -2876,7 +2923,8 @@ class OneFuseRegulator:
                 or self._positive_skew_since is not None or self._positive_ramp_deadline is not None
                 or self._positive_raw_recovery or self._positive_response_ts is not None):
             return False
-        whole = max(cap, self._uncertainty_previous_offer or cap, s.max_charge_amps)
+        whole = max(cap, self._uncertainty_previous_offer or cap, s.max_charge_amps,
+            self._committed_current_upper())
         return bool(s.min_charge_amps <= cap <= whole <= s.max_charge_amps
                     and grid+whole <= s.main_fuse_amps-s.buffer_amps)
 
@@ -2980,7 +3028,8 @@ class OneFuseRegulator:
             return None  # an expired cloud lease is not an accepted live offer
         if not s.min_charge_amps <= accepted <= s.max_charge_amps:
             return None
-        previous = max(accepted, self._uncertainty_previous_offer or accepted)
+        previous = max(accepted, self._uncertainty_previous_offer or accepted,
+            self._committed_current_upper())
         if (self._reduction_previous_cap is not None
                 and (self._awaiting_reduction_target == accepted or self._accepted_reduction_cap == accepted)):
             previous = max(previous, self._reduction_previous_cap)
@@ -3090,7 +3139,8 @@ class OneFuseRegulator:
         elif outcome != "wait":
             whole = max(cap or 0, self._reduction_previous_cap or 0
                 if self._awaiting_reduction_target is not None else 0,
-                self._uncertainty_previous_offer or 0 if self._uncertainty_ceiling is not None else 0)
+                self._uncertainty_previous_offer or 0 if self._uncertainty_ceiling is not None else 0,
+                self._committed_current_upper())
             self._clear_positive_alignment()
             if outcome == "timeout" and grid+whole <= s.main_fuse_amps-s.buffer_amps:
                 # This is independent raw headroom, never late EV success or
@@ -3263,7 +3313,7 @@ class OneFuseRegulator:
             return None
         return (key[0], key[1][:key[1].index("max_terminals")])
 
-    def _normal_authority_evidence(self, inp: RegulatorInput):
+    def _normal_authority_evidence(self, inp: RegulatorInput, *, response_only: bool = False):
         """An independent normal state certificate, never command causality.
 
         Fresh native feedback plus a later grid can bound the WHOLE unresolved
@@ -3275,11 +3325,14 @@ class OneFuseRegulator:
             for v in (inp.now_ts, inp.wall_now_ts, inp.grid_l1, inp.charger_current,
                       inp.grid_report_ts, inp.charger_report_ts))
         status = (inp.status or "").strip().lower()
+        publication = bool(owner is not None and s.peak_only_response
+            and inp.charger_publication_pending is True
+            and (owner.observation_history or self._awaiting_reduction_target == owner.cap))
         if (owner is None or not s.enable_dynamic_limit or not s.active_control or s.dry_run
                 or now is None or wall is None or grid is None or current is None or gt is None
                 or not inp.data_valid or inp.data_error or not inp.charger_current_trusted
-                or inp.charger_native_committed is not True or inp.charger_snapshot_verified
-                or inp.charger_publication_pending or self._ev_clock_error is not None
+                or inp.charger_native_committed is not True and not publication or inp.charger_snapshot_verified
+                or inp.charger_publication_pending and not publication or self._ev_clock_error is not None
                 or status not in START_ALLOWED_STATUSES or self._restart_required or self.paused_by_us
                 or self.last_target is None or self.last_target[0] != owner.cap
                 or self.last_target[1:3] != (0, 0) or now >= owner.lease_expires
@@ -3295,24 +3348,60 @@ class OneFuseRegulator:
                 or self._peak_response is not None or self._nominal_shedding_started is not None
                 or self.automatic_cycle_requires_checkpoint):
             return None
+        if any(record["target"][0] not in {0, owner.cap} for record in self._dispatch_records.values()):
+            return None
+        if response_only:
+            normal_work = bool(owner.observation_history or s.peak_only_response and (
+                self._positive_cap is not None or self._ordinary_lower is not None
+                or self._awaiting_reduction_target is not None))
+            if (normal_work and self._minimum_confirmation is None and not self._low_grid_pending
+                    and self._normal_shed_deadline is None
+                    and status == "charging" and self._fast_sources_fresh()
+                    and inp.charger_increase_ready is True and not publication
+                    and self._ev_advanced_since(self._accepted_control_ev_ts, "_accepted_control_ev_ts")
+                    and et is not None and gt > et and 1 <= current <= owner.cap+.5
+                    and current <= grid+1
+                    and grid-current+owner.cap <= s.main_fuse_amps-s.buffer_amps):
+                return NormalOperatingProof(owner.cap, max(0., grid-current), True,
+                    NormalProofKind.COHERENT_NATIVE)
+            return None
         unresolved = max(owner.cap, owner.unresolved_cap or 0,
             self._reduction_previous_cap or 0 if self._awaiting_reduction_target is not None
                 and not self._reduction_response_completed else 0,
             self._uncertainty_previous_offer or 0 if self._uncertainty_ceiling is not None else 0,
             self._low_grid_previous or 0 if self._low_grid_pending else 0,
             self._normal_shed_previous or 0 if self._normal_shed_deadline is not None else 0)
+        if publication:
+            if (owner.source_processing_deadline is not None and now < owner.source_processing_deadline
+                    and grid <= s.main_fuse_amps-s.buffer_amps
+                    and owner.house+unresolved <= s.main_fuse_amps-s.buffer_amps
+                    and current <= unresolved+.5):
+                return NormalOperatingProof(owner.cap, owner.house, False, NormalProofKind.SOURCE_COHORT)
+            return None
+        if (s.peak_only_response and status == "charging" and inp.charger_increase_ready is True
+                and self._minimum_confirmation is None and not self._low_grid_pending
+                and self._normal_shed_deadline is None and self._fast_sources_fresh()
+                and et is not None and gt > et and 1 <= current <= owner.cap+.5
+                and current <= grid+1 and self._native_receiver_scope() is not None
+                and self._ev_advanced_since(self._accepted_control_ev_ts, "_accepted_control_ev_ts")
+                and grid-current+owner.cap <= s.main_fuse_amps-s.buffer_amps):
+            # Prefer genuine ordered post-dispatch state over a weaker RAW
+            # certificate. Otherwise7 A+RAW12 would choose RAW11 even though
+            # the real7 A response and later meter already prove16 A headroom.
+            return NormalOperatingProof(owner.cap, max(0., grid-current), True,
+                NormalProofKind.COHERENT_NATIVE)
         if grid+unresolved <= s.main_fuse_amps-s.buffer_amps:
             # A whole-RAW certificate needs no EV timestamp or subtraction.
             # This can retain only an already ACKed cap, not start/restart it.
-            active_observation = bool(self._positive_cap is not None or self._ordinary_lower is not None
-                or self._low_grid_pending or self._normal_shed_deadline is not None
-                or self._minimum_confirmation is not None or self._awaiting_reduction_target is not None)
-            expired_phase = bool(self._minimum_confirmation is not None
-                and now >= self._minimum_confirmation.deadline)
-            return NormalOperatingProof(owner.cap, grid, not active_observation or expired_phase)
+            # Electrical permission and command-response proof are distinct:
+            # this bound cannot retire unresolved physical response authority.
+            legacy_retirement = bool(not s.peak_only_response and (
+                not (self._positive_cap is not None or self._ordinary_lower is not None
+                     or self._low_grid_pending or self._normal_shed_deadline is not None
+                     or self._minimum_confirmation is not None or self._awaiting_reduction_target is not None)
+                or self._minimum_confirmation is not None and now >= self._minimum_confirmation.deadline))
+            return NormalOperatingProof(owner.cap, grid, legacy_retirement, NormalProofKind.WHOLE_RAW)
         if (self._minimum_confirmation is not None and now >= self._minimum_confirmation.deadline):
-            return None
-        if any(record["target"][0] not in {0, owner.cap} for record in self._dispatch_records.values()):
             return None
         if (status != "charging" and (owner.status_deadline is None or now >= owner.status_deadline)):
             return None
@@ -3320,7 +3409,7 @@ class OneFuseRegulator:
                 and owner.status_deadline is not None
                 and now < owner.status_deadline
                 and owner.house+unresolved <= s.main_fuse_amps-s.buffer_amps):
-            return NormalOperatingProof(owner.cap, owner.house, False)
+            return NormalOperatingProof(owner.cap, owner.house, False, NormalProofKind.STATUS_ANCHOR)
         if et is None or self._native_receiver_scope() is None:
             return None
         winners = self._ev_current_winners
@@ -3339,44 +3428,152 @@ class OneFuseRegulator:
         if fresh:
             house = max(0., grid-current, self._house_before_reduction or 0.)
             if house+unresolved <= s.main_fuse_amps-s.buffer_amps:
-                return NormalOperatingProof(owner.cap, house, True)
+                pending = bool(self._positive_cap is not None or self._ordinary_lower is not None
+                    or self._awaiting_reduction_target is not None or owner.observation_history)
+                retires = not pending or self._ev_advanced_since(
+                    self._accepted_control_ev_ts, "_accepted_control_ev_ts")
+                if s.peak_only_response and inp.charger_increase_ready is not True:
+                    return (NormalOperatingProof(owner.cap, house, False, NormalProofKind.SOURCE_COHORT)
+                        if owner.source_processing_deadline is not None
+                        and now < owner.source_processing_deadline else None)
+                return NormalOperatingProof(owner.cap, house, retires, NormalProofKind.COHERENT_NATIVE)
         if grid > s.main_fuse_amps-s.buffer_amps:
             # Only the fully fresh coherent certificate above may use EV
             # subtraction here. Cached ancestry is still strictly RAW<=23;
             # the separate accepted-decrease process fence owns a partial
             # native batch, not a wider normal or overload permission.
             return None
+        # Same-receiver cached conductor continuity retains b35's conservative
+        # reported-state floor, without changing established values or clocks.
+        # This floor belongs to the JOINT normal certificate established
+        # before the command. A newly arriving partial rise can update the
+        # receiver cache before its later grid; it cannot seed this floor.
+        old = owner.native_floor if s.peak_only_response else self._ev_established_value
+        legacy_cache = bool(self._awaiting_reduction_target in {None, owner.cap}
+            and self._settle_started is None and self._reduction_guard_deadline is None
+            and self._partial_reduction_current is None and self._positive_cap is None
+            and self._ordinary_lower is None and self._minimum_confirmation is None
+            and not self._low_grid_pending and self._normal_shed_deadline is None)
+        if (status == "charging" and s.nominal_import_only_fallback and old is not None and old >= 1 and current >= 1
+                and current <= (unresolved if s.peak_only_response else owner.cap)+.5
+                and (s.peak_only_response or legacy_cache)
+                and self._ev_established_binding == owner.source_id
+                and self._ev_established_receiver_scope == owner.receiver_scope
+                and (not (owner.native_source_known if s.peak_only_response else self._ev_established_source_known)
+                     or self._ev_event_source_known)
+                and all(key in (owner.native_observation_keys if s.peak_only_response
+                                else self._ev_established_observation_keys) for key in winners)):
+            # owner.house and unresolved are one inherited joint certificate.
+            # A later lower-specific house estimate must not be cross-maxed
+            # against that earlier higher current authority.
+            house = max(0., grid-min(old, current),
+                owner.house if s.peak_only_response else self._house_before_reduction or 0.)
+            if house+unresolved <= s.main_fuse_amps-s.buffer_amps:
+                if s.peak_only_response and inp.charger_increase_ready is not True:
+                    return (NormalOperatingProof(owner.cap, house, False, NormalProofKind.SOURCE_COHORT)
+                        if owner.source_processing_deadline is not None
+                        and now < owner.source_processing_deadline else None)
+                return NormalOperatingProof(owner.cap, house, False, NormalProofKind.STABLE_NATIVE)
         if (owner.receiver_scope is not None and owner.observation_deadline is not None
                 and now < owner.observation_deadline
                 and owner.house+unresolved <= s.main_fuse_amps-s.buffer_amps
                 and current <= unresolved+.5):
-            return NormalOperatingProof(owner.cap, owner.house, False)
-        # Same-receiver cached conductor continuity retains b35's conservative
-        # reported-state floor, without changing established values or clocks.
-        old = self._ev_established_value
-        inactive_lower = bool(self._awaiting_reduction_target in {None, owner.cap}
-            and self._settle_started is None and self._reduction_guard_deadline is None
-            and self._partial_reduction_current is None)
-        if (status == "charging" and s.nominal_import_only_fallback and old is not None and old >= 1 and current >= 1
-                and current <= owner.cap+.5 and self._ev_established_binding == owner.source_id
-                and self._ev_established_receiver_scope == owner.receiver_scope
-                and (not self._ev_established_source_known or self._ev_event_source_known)
-                and all(key in self._ev_established_observation_keys for key in winners)
-                and self._positive_cap is None and self._ordinary_lower is None
-                and self._minimum_confirmation is None and not self._low_grid_pending
-                and self._normal_shed_deadline is None and inactive_lower):
-            house = max(0., grid-min(old, current), self._house_before_reduction or 0.)
-            if house+unresolved <= s.main_fuse_amps-s.buffer_amps:
-                return NormalOperatingProof(owner.cap, house, False)
+            return NormalOperatingProof(owner.cap, owner.house, False, NormalProofKind.OBSERVATION_ANCHOR)
         # A bounded connected-status handoff preserves only the previously
         # qualified normal offer. Raw alone may prove it afresh, but an old EV
         # report supplies no new subtraction or charging-response credit.
         if status != "charging" and owner.house+unresolved <= s.main_fuse_amps-s.buffer_amps:
             if grid+unresolved <= s.main_fuse_amps-s.buffer_amps:
-                return NormalOperatingProof(owner.cap, grid, True)
+                return NormalOperatingProof(owner.cap, grid, False, NormalProofKind.WHOLE_RAW)
             if owner.status_deadline is not None and now < owner.status_deadline:
-                return NormalOperatingProof(owner.cap, owner.house, False)
+                return NormalOperatingProof(owner.cap, owner.house, False, NormalProofKind.STATUS_ANCHOR)
         return None
+
+    def _observe_normal_source_cohort(self, inp: RegulatorInput, *, allow_clear: bool = True) -> None:
+        """One first fixed source fence also survives an awaited checkpoint."""
+        owner = self._committed_normal
+        now, wall, gt = (_valid_number(value) if not isinstance(value, bool) else None
+            for value in (inp.now_ts, inp.wall_now_ts, inp.grid_report_ts))
+        if (owner is None or not self.settings.peak_only_response
+                or None in (now, wall, gt) or not inp.data_valid or inp.data_error
+                or inp.charger_current_trusted is not True
+                or inp.control_source_id != owner.source_id
+                or owner.source_id != self._accepted_control_source_id
+                or now >= owner.lease_expires or not 0 <= wall-gt <= self.settings.max_sensor_age_seconds):
+            return
+        if inp.charger_increase_ready is not True or inp.charger_publication_pending:
+            if owner.source_processing_deadline is None:
+                owner.source_processing_deadline = min(now+1., owner.lease_expires)
+        elif allow_clear and inp.charger_native_committed is True:
+            owner.source_processing_deadline = None
+
+    def _close_normal_observation_work(self, *, allow_unstarted_positive: bool = False) -> None:
+        """Close measurement work without declaring physical response.
+
+        The whole unresolved upper and immutable original floors/deadlines
+        survive on the accepted owner. Real electrical/minimum phases never
+        enter this path. A later RAW-only rise still has to budget the entire
+        offered current; cached EV subtraction cannot release this veto.
+        """
+        owner = self._committed_normal
+        if (owner is None or self._minimum_confirmation is not None
+                or self._low_grid_pending or self._normal_shed_deadline is not None
+                or self._peak_response is not None or self._overload_hold_active
+                or self._overload_transition_started is not None):
+            return
+        records = []
+        upper = max(owner.cap, owner.unresolved_cap or 0)
+        if (self._positive_cap is not None and (allow_unstarted_positive
+                or self._positive_raw_deadline is not None or self._positive_ramp_deadline is not None)):
+            upper = max(upper, self._positive_cap)
+            records.append(NormalObservationRecord("positive", self._positive_cap,
+                owner.cap, self._positive_skew_since,
+                self._positive_raw_deadline if self._positive_raw_recovery else self._positive_ramp_deadline,
+                self._positive_grid_ts, self._positive_ev_ts,
+                repr(self._ev_owner_clocks.get("_positive_ev_ts"))))
+            self._clear_positive_alignment()
+        ordinary = self._ordinary_lower
+        if ordinary is not None and ordinary.accepted_at is not None:
+            upper = max(upper, ordinary.previous)
+            records.append(NormalObservationRecord("ordinary_lower", ordinary.cap,
+                ordinary.previous, ordinary.accepted_at, ordinary.observation_deadline,
+                ordinary.grid_floor, ordinary.ev_floor,
+                repr(self._ev_owner_clocks.get("_ordinary_ev_floor"))))
+            self._ordinary_lower = None
+            self._ordinary_pending_before = None
+            self._ordinary_pending_plan_id = None
+        if self._awaiting_reduction_target is not None:
+            upper = max(upper, self._reduction_previous_cap or 0)
+            records.append(NormalObservationRecord("accepted_lower", self._awaiting_reduction_target,
+                self._reduction_previous_cap or owner.cap, self._reduction_chain_origin,
+                self._reduction_guard_deadline or owner.observation_deadline,
+                self._reduction_grid_ts, self._reduction_charger_ts,
+                repr(self._ev_owner_clocks.get("_reduction_charger_ts"))))
+            self._awaiting_reduction_target = self._house_before_reduction = self._settle_started = None
+            self._clear_partial_reduction_alignment()
+        if records:
+            owner.unresolved_cap = upper
+            owner.observation_history = (owner.observation_history+tuple(records))[-32:]
+
+    def _complete_normal_observation_response(self, inp: RegulatorInput) -> None:
+        """Only genuine post-dispatch feedback releases an archived upper."""
+        owner = self._committed_normal
+        proof = self._normal_authority_evidence(inp, response_only=True)
+        if owner is None or proof is None:
+            return
+        self._retire_measurement_owners()
+        owner.unresolved_cap = None
+        owner.observation_history = ()
+        owner.observation_deadline = None
+        owner.house = proof.house
+        self._update_normal_native_anchor(owner, _valid_number(inp.charger_current))
+
+    def _update_normal_native_anchor(self, owner: CommittedNormalAuthority, current: Optional[float]) -> None:
+        """Save only a qualified coherent pair, never the newest cache alone."""
+        if current is not None and current >= 1 and self._native_receiver_scope() is not None:
+            owner.native_floor = current
+            owner.native_observation_keys = tuple(self._ev_current_observations)
+            owner.native_source_known = self._ev_event_source_known
 
     def _retire_measurement_owners(self) -> None:
         """Normal operation discharges observation work, never real faults."""
@@ -3414,6 +3611,10 @@ class OneFuseRegulator:
         template = proposed or self._last_decision
         if owner is None or template is None:
             return None
+        # A native cohort can start while Store I/O is awaited. Observe the
+        # SAME first fixed fence before taking a detached proof copy; repeating
+        # this query cannot spend a new second or renew the accepted lease.
+        self._observe_normal_source_cohort(inp, allow_clear=False)
         shadow = deepcopy(self)
         if self._ordinary_lower is not None and self._ordinary_lower.accepted_at is None:
             if self._ordinary_pending_before is not None:
@@ -3424,7 +3625,30 @@ class OneFuseRegulator:
         shadow._last_input_wall_now_ts = _valid_number(inp.wall_now_ts)
         shadow._last_input_grid_ts = _valid_number(inp.grid_report_ts)
         shadow._last_input_charger_ts = _valid_number(inp.charger_report_ts)
+        shadow._observe_normal_source_cohort(inp)
         evidence = shadow._normal_authority_evidence(inp)
+        if (evidence is None and self.settings.peak_only_response
+                and self._positive_cap == owner.cap and not self._positive_raw_recovery):
+            # Source reports can change DURING a verified Store await. Reuse
+            # the actual accepted positive owner's ordinary grid/EV-first
+            # observation, even if the pre-await decision was normal. The core
+            # derives its FIRST deadline from the original mismatch report;
+            # copy only that fixed work clock, never EV response or authority.
+            fresh = shadow.evaluate(inp)
+            deadline = fresh.positive_response_deadline_ts
+            if (fresh.mode.removeprefix("dry_run_") == "positive_ramp_hold"
+                    and fresh.current_p1 == owner.cap and fresh.command is None
+                    and not fresh.should_call_service and deadline is not None
+                    and inp.now_ts < deadline):
+                if self._positive_ramp_deadline is None:
+                    self._positive_ramp_deadline = deadline
+                    self._positive_skew_since = shadow._positive_skew_since
+                if owner.observation_deadline is None:
+                    owner.observation_deadline = self._positive_ramp_deadline
+                else:
+                    owner.observation_deadline = min(owner.observation_deadline, self._positive_ramp_deadline)
+                evidence = NormalOperatingProof(owner.cap, owner.house, False,
+                    NormalProofKind.OBSERVATION_ANCHOR)
         response_at = (inp.now_ts-(inp.wall_now_ts-inp.charger_report_ts)
             if all(type(value) in (int, float) and isfinite(value)
                 for value in (inp.now_ts, inp.wall_now_ts, inp.charger_report_ts)) else None)
@@ -3451,7 +3675,7 @@ class OneFuseRegulator:
                 evidence = shadow._normal_authority_evidence(inp)
         if evidence is None:
             return None
-        cap, house, fresh_normal = evidence
+        cap, house, fresh_normal = evidence.cap, evidence.house, evidence.retires_measurement
         now, grid = _valid_number(inp.now_ts), _valid_number(inp.grid_l1)
         if (self.settings.enable_pause_resume and shadow._timer_reached(now, "above_pause_since",
                 grid > self.settings.pause_limit_amps, self.settings.pause_for_seconds)
@@ -3460,10 +3684,12 @@ class OneFuseRegulator:
                                          self.settings.soft_for_seconds)):
             return None
         deadlines = [owner.lease_expires]
-        if (not fresh_normal and owner.status_deadline is not None
+        if evidence.kind == NormalProofKind.SOURCE_COHORT:
+            deadlines.append(owner.source_processing_deadline)
+        if (not evidence.permits_renew and owner.status_deadline is not None
                 and inp.status.strip().lower() != "charging"):
             deadlines.append(owner.status_deadline)
-        if (not fresh_normal and owner.observation_deadline is not None
+        if (not evidence.permits_renew and owner.observation_deadline is not None
                 and now < owner.observation_deadline):
             deadlines.append(owner.observation_deadline)
         deadline = min(deadlines)
@@ -3648,8 +3874,9 @@ class OneFuseRegulator:
             return reject("raw_grid_above_post_response_ceiling")
         assert self.last_target is not None
         accepted = self.last_target[0]
-        previous = (self._reduction_previous_cap if self._awaiting_reduction_target is not None
-                    and self._reduction_previous_cap is not None else accepted)
+        previous = max(self._committed_current_upper(),
+            self._reduction_previous_cap if self._awaiting_reduction_target is not None
+            and self._reduction_previous_cap is not None else accepted)
         if not s.min_charge_amps <= accepted <= s.max_charge_amps:
             return reject("accepted_limit_outside_current_bounds")
         if current > min(previous, s.max_charge_amps) + 0.5:
@@ -4294,6 +4521,9 @@ class OneFuseRegulator:
         """JSON-safe exposure state; the controller adds its UTC save time."""
         startup = (self._minimum_confirmation if self._minimum_confirmation is not None
                    and self._minimum_confirmation.owner == "startup" else None)
+        unresolved = (self._committed_normal if self._committed_normal is not None
+            and self._committed_normal.observation_history
+            and self._committed_normal.unresolved_cap is not None else None)
         return {
             "version": 1,
             "used_seconds": self._overload_used_seconds,
@@ -4313,10 +4543,10 @@ class OneFuseRegulator:
             "normal_control": {
                 "version": 1,
                 "response_pending": (self._normal_shed_deadline is not None and self._normal_shed_failure is None)
-                    or self._ordinary_lower is not None or startup is not None,
+                    or self._ordinary_lower is not None or startup is not None or unresolved is not None,
                 **({"alignment_pending": True} if self._low_grid_pending else {}),
-                "cap": self._uncertainty_ceiling if self._uncertainty_ceiling is not None else startup.cap if startup else None,
-                "previous_offer": self._uncertainty_previous_offer if self._uncertainty_previous_offer is not None else startup.cap if startup else None,
+                "cap": self._uncertainty_ceiling if self._uncertainty_ceiling is not None else startup.cap if startup else unresolved.cap if unresolved else None,
+                "previous_offer": self._uncertainty_previous_offer if self._uncertainty_previous_offer is not None else startup.cap if startup else self._committed_current_upper() if unresolved else None,
                 "stops": self._uncertainty_stops,
                 "stop_recorded": self._uncertainty_stop_recorded,
                 "restart": self._uncertainty_restart,
@@ -4806,8 +5036,39 @@ class OneFuseRegulator:
                         if shadow._ev_clock_key is not None and _valid_number(inp.charger_report_ts) is not None else {}),
                       "wall_floor": wall, "vectors": dict(shadow._ev_observation_watermarks),
                       "sequences": dict(shadow._ev_observation_sequences), "actual_dispatch": True}
+            normal_anchor = None
+            owner = self._committed_normal
+            grid, current, gt = (_valid_number(value) for value in
+                (inp.grid_l1, inp.charger_current, inp.grid_report_ts))
+            if (positive and self.settings.peak_only_response and owner is not None
+                    and decision.command == "set_limit" and decision.current_p1 != owner.cap
+                    and now < owner.lease_expires and owner.source_id == inp.control_source_id
+                    and inp.charger_native_committed is True and not inp.charger_snapshot_verified
+                    and grid is not None and current is not None and gt is not None
+                    and 0 <= wall-gt <= min(self.settings.measurement_settle_seconds,
+                        self.settings.max_sensor_age_seconds)
+                    and 1 <= current <= grid+1
+                    and grid+max(decision.current_p1, self._committed_current_upper())
+                        <= self.settings.main_fuse_amps-self.settings.buffer_amps
+                    and shadow._ev_established_value == current
+                    and shadow._ev_established_binding == owner.source_id
+                    and shadow._native_receiver_scope() == owner.receiver_scope
+                    and _valid_number(inp.charger_report_ts) is not None
+                    and gt > _valid_number(inp.charger_report_ts)
+                    and (not shadow._ev_established_source_known or shadow._ev_event_source_known)
+                    and (not shadow._ev_event_source_known or shadow._ev_event_source_ts is not None
+                         and shadow._ev_event_source_ts <= wall+5)
+                    and shadow._ev_current_winners
+                    and all(key in shadow._ev_established_observation_keys
+                        for key in shadow._ev_current_winners)):
+                # Capture PRE-command established state only when the WHOLE
+                # previous/prospective authority is independently RAW-safe.
+                # A later partial rise or identical TTL ACK cannot seed it.
+                normal_anchor = (current, tuple(shadow._ev_current_observations),
+                    shadow._ev_established_source_known, owner.receiver_scope)
             self._dispatch_records[decision.plan_id] = {"now": now, "wall": wall,
                 "source_id": inp.control_source_id, "ev_owner": record,
+                "normal_anchor": normal_anchor,
                 "generation": self._control_generation,
                 "target": (decision.current_p1, decision.current_p2, decision.current_p3)}
         else:
@@ -4989,7 +5250,20 @@ class OneFuseRegulator:
                         old.receiver_scope if same or old_bound else self._native_receiver_scope(),
                         old.status_deadline if same else None,
                         old.observation_deadline if same else lower_deadline,
-                        old.unresolved_cap if same else max(old.cap, old.unresolved_cap or 0) if decrease else None)
+                        old.unresolved_cap if same else max(old.cap, old.unresolved_cap or 0) if decrease else
+                        max(decision.current_p1, old.unresolved_cap)
+                        if old is not None and old.unresolved_cap is not None else None,
+                        old.observation_history if old is not None else (),
+                        old.source_processing_deadline if same else None,
+                        old.native_floor if old is not None else None,
+                        old.native_observation_keys if old is not None else (),
+                        old.native_source_known if old is not None else False)
+                    anchor = dispatch.get("normal_anchor") if dispatch is not None else None
+                    if (anchor is not None and self._committed_normal.native_floor is None
+                            and anchor[3] == self._committed_normal.receiver_scope):
+                        self._committed_normal.native_floor = anchor[0]
+                        self._committed_normal.native_observation_keys = anchor[1]
+                        self._committed_normal.native_source_known = anchor[2]
                     self._ordinary_pending_before = None
         finally:
             self._ack_dispatch = None
@@ -5206,7 +5480,10 @@ class OneFuseRegulator:
                              and self._reduction_guard_deadline is not None
                              and now_ts < self._reduction_guard_deadline))
                 )
-                previous_cap = self._reduction_previous_cap if same_pending_chain else old_target
+                prior_cap = self._reduction_previous_cap if same_pending_chain else old_target
+                known_upper = self._committed_current_upper()
+                previous_cap = (max(prior_cap or 0, known_upper)
+                    if prior_cap is not None or known_upper > 0 else None)
                 chain_origin = self._reduction_chain_origin if same_pending_chain else now_ts
                 budget = (self._partial_reduction_budget if same_pending_chain else
                           min(self.settings.measurement_settle_seconds, self.settings.max_sensor_age_seconds))
@@ -5820,6 +6097,10 @@ class OneFuseRegulator:
                 owner.house = house
                 owner.receiver_scope = self._native_receiver_scope()
                 owner.status_deadline = None
+                if (self._fast_sources_fresh() and self._event_source_usable()
+                        and self._last_input_grid_ts is not None and self._last_input_charger_ts is not None
+                        and self._last_input_grid_ts > self._last_input_charger_ts):
+                    self._update_normal_native_anchor(owner, current)
             return result
 
         error = inp.data_error or self._ev_clock_error
@@ -5998,7 +6279,10 @@ class OneFuseRegulator:
             origin = now-(self._last_input_wall_now_ts-self._last_input_grid_ts)
             owner.status_deadline = min(owner.lease_expires,
                 origin+min(s.measurement_settle_seconds, s.max_sensor_age_seconds))
+        self._observe_normal_source_cohort(inp)
+        self._complete_normal_observation_response(inp)
         normal_evidence = self._normal_authority_evidence(inp)
+        normal_raw_rise = None
         measurement_owner = bool(self._positive_cap is not None or self._ordinary_lower is not None
             or self._low_grid_pending or self._normal_shed_deadline is not None
             or self._awaiting_reduction_target is not None or self._minimum_confirmation is not None)
@@ -6021,10 +6305,20 @@ class OneFuseRegulator:
             and waiting_raw_cap >= owner.cap
             and grid+max(owner.cap, owner.unresolved_cap or 0, waiting_raw_cap)
                 <= s.main_fuse_amps-s.buffer_amps)
+        normal_observation_work = bool((measurement_owner or owner is not None and owner.observation_history)
+            and self._minimum_confirmation is None and not self._low_grid_pending
+            and self._normal_shed_deadline is None)
         if (normal_evidence is not None and (
-                normal_evidence[2] and measurement_owner
+                s.peak_only_response and normal_evidence.permits_renew and normal_observation_work
+                or s.peak_only_response and normal_evidence.kind == NormalProofKind.WHOLE_RAW
+                   and not measurement_owner
+                or normal_evidence.retires_measurement and measurement_owner
+                or normal_evidence.kind == NormalProofKind.SOURCE_COHORT
+                   and self._minimum_confirmation is None and not self._low_grid_pending
+                   and self._normal_shed_deadline is None
                 or status != "charging" and not measurement_owner) and not waiting_raw_offer):
-            cap, normal_house, fresh_normal = normal_evidence
+            cap, normal_house, fresh_normal = (normal_evidence.cap,
+                normal_evidence.house, normal_evidence.retires_measurement)
             soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
             pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
             if not (s.enable_pause_resume and pause or s.enable_soft_guard and soft and s.soft_current_amps < cap):
@@ -6034,15 +6328,40 @@ class OneFuseRegulator:
                     owner.receiver_scope = self._native_receiver_scope()
                     owner.observation_deadline = None
                     owner.unresolved_cap = None
+                    self._update_normal_native_anchor(owner, current)
                     if status == "charging":
                         owner.status_deadline = None
+                elif s.peak_only_response and normal_evidence.permits_renew:
+                    self._close_normal_observation_work(allow_unstarted_positive=(
+                        normal_evidence.kind == NormalProofKind.WHOLE_RAW))
                 house, available = normal_house, cap
-                house_basis = "committed_normal_authority"
-                normal_continuity_deadline = owner.lease_expires
-                if not fresh_normal and owner.status_deadline is not None:
-                    normal_continuity_deadline = min(normal_continuity_deadline, owner.status_deadline)
-                return decision("normal_continuity", "Independent normal operating evidence retains only the accepted offer; no command, causal response credit, renewal or new authority.", None, cap)
-        cached_normal = self._cached_native_normal_cap(inp, now, grid, current, status)
+                house_basis = "committed_normal_operating_proof"
+                # A separately bounded whole-RAW rise is the existing path
+                # for new authority. The archived native value grants none.
+                raw_rise = None
+                if normal_evidence.kind == NormalProofKind.WHOLE_RAW:
+                    probe = deepcopy(self)
+                    probe._close_normal_observation_work(allow_unstarted_positive=True)
+                    raw_rise = probe._raw_budget_recovery_candidate(now, grid, current, status, inp)
+                    if raw_rise is not None:
+                        self._close_normal_observation_work(allow_unstarted_positive=True)
+                if raw_rise is not None:
+                    normal_raw_rise = raw_rise
+                    house, available = grid, raw_rise
+                    house_basis = "raw_grid_without_established_ev_value"
+                elif s.peak_only_response and normal_evidence.permits_renew:
+                    refresh_required = normal_evidence.kind != NormalProofKind.COHERENT_NATIVE
+                    return decision("normal", "Independent normal operating proof preserves the accepted cap and its finite lease; unconfirmed command response grants no EV credit or increased authority.",
+                        "set_limit", cap, self.last_target[3])
+                else:
+                    normal_continuity_deadline = owner.lease_expires
+                    if normal_evidence.kind == NormalProofKind.SOURCE_COHORT:
+                        normal_continuity_deadline = min(normal_continuity_deadline, owner.source_processing_deadline)
+                    elif owner.status_deadline is not None:
+                        normal_continuity_deadline = min(normal_continuity_deadline, owner.status_deadline)
+                    return decision("normal_continuity", "Prior normal status evidence retains only the accepted offer inside its original fixed deadline; no command or renewal.", None, cap)
+        cached_normal = (self._cached_native_normal_cap(inp, now, grid, current, status)
+            if normal_raw_rise is None else None)
         if cached_normal is not None:
             cache_cap, cache_house = cached_normal
             soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
