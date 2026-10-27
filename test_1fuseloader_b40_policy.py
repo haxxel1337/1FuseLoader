@@ -103,15 +103,39 @@ class B40PolicyTests(unittest.TestCase):
             sequence=4,provider=10.,grid_at=10.,phase_credit=False)
         self.assertEqual(uncredited.meter_zero_cause,'peak_response_timeout')
 
-    def test_delayed_provider_bucket_before_sdk_cannot_become_a_response(self):
+    def test_provider_regression_below_captured_floor_cannot_become_a_response(self):
         r=self.f.live()
         self.f.sample(r,5.,20.1,16.1,receipt=4.8,sequence=2,provider=4.)
         self.f.sample(r,10.6,31.,16.1,receipt=9.8,sequence=3,provider=9.,grid_at=10.)
         self.f.sample(r,18.,31.,8.34,mapped_current=7.094,receipt=17.8,
-            sequence=4,provider=9.,grid_at=15.)
+            sequence=4,provider=8.,grid_at=15.)
         _,d=self.f.sample(r,20.01,31.,8.34,mapped_current=7.094,receipt=17.8,
-            sequence=4,provider=9.,grid_at=15.)
+            sequence=4,provider=8.,grid_at=15.)
         self.assertEqual(d.meter_zero_cause,'peak_response_timeout')
+
+    def test_fast_native_response_with_lagging_provider_clock_keeps_original_phases(self):
+        r=self.f.live()
+        self.f.sample(r,5.,20.1,16.1,receipt=4.8,sequence=2,provider=2.)
+        _,first=self.f.sample(r,10.6,31.,16.1,receipt=10.1,sequence=3,
+            provider=8.,grid_at=10.)
+        original=first.nominal_response_deadline_ts
+        # The source clock advances8→9 independently of HA wall10.6→11.2.
+        # Native183 is new and credited after SDK; no cross-clock offset is
+        # asserted, and neither electrical observation phase is extended.
+        _,response=self.f.sample(r,11.2,31.,8.34,mapped_current=7.094,receipt=11.2,
+            sequence=4,provider=9.,grid_at=10.)
+        self.assertEqual(response.mode,'meter_grid_wait')
+        self.assertAlmostEqual(response.grid_confirmation_deadline_ts,41.2,places=4)
+        self.assertAlmostEqual(r._peak_response.deadline,original,places=7)
+        _,after_ten=self.f.sample(r,20.01,31.,8.34,mapped_current=7.094,receipt=11.2,
+            sequence=4,provider=9.,grid_at=10.)
+        self.assertIsNone(after_ten.meter_zero_cause)
+        self.assertAlmostEqual(after_ten.grid_confirmation_deadline_ts,41.2,places=4)
+        _,normal=self.f.sample(r,20.694,20.,8.34,mapped_current=7.094,receipt=11.2,
+            sequence=4,provider=9.,grid_at=20.)
+        self.assertIsNone(normal.meter_zero_cause)
+        self.assertEqual(normal.current_p1,10)
+        self.assertIsNone(r._peak_response)
 
     def test_ack_uses_actual_dispatch_phase_floor_not_new_http_input(self):
         r=self.f.live()
