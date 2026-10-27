@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.0b37
+
+- With the existing import-only raw fallback enabled, release a completed
+  normal measurement recovery while a connected vehicle is waiting without
+  drawing power. The existing 30-second observation and
+  advancing fresh grid reports must prove that raw L1 plus the whole previous,
+  accepted and prospective normal offer fits the normal buffered budget.
+  A full vehicle therefore need not draw current to release an obsolete 7 A
+  recovery ceiling. A higher offer still requires its ordinary durable command
+  submission and actual acknowledgement.
+- Let an independently whole-raw-bounded waiting offer reach the ordinary
+  current calculation and timely finite-lease renewal. Keeping an old accepted
+  cap without writing must not indefinitely suppress a safe increase or delay
+  renewal until after expiry. Active response observation keeps its fixed
+  deadlines and receives no new response time from a renewal.
+- Keep restart, retry, source, lease and electrical fault guards. The existing
+  normal recovery exit does not reset overload exposure, cycle budget or
+  historical faults, and sends no start or resume command.
+
 ## 0.4.0b36
 
 - Keep committed normal command authority separate from proposed changes.
