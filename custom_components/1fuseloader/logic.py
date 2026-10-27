@@ -2836,6 +2836,49 @@ class OneFuseRegulator:
         self._uncertainty_last_attempt_cap: Optional[int] = None
         self._uncertainty_retry_submission_pending = False
         self._restored_normal_wait = 0.0
+        self._uncertainty_idle_raw_scope = None
+
+    def _idle_raw_normal_recovery(self, now: float, grid: float, current: float,
+                                  status: str, inp: Optional[RegulatorInput]) -> bool:
+        """Independent capacity proof, without claiming a waiting car drew 7 A.
+
+        The FULL earlier/current/prospective offer must fit beside raw import.
+        This is an alternative normal-recovery certificate, not a start/resume,
+        new EV event, allowance refill or exception to a terminal retry barrier.
+        """
+        s = self.settings
+        cap = self.last_target[0] if self.last_target is not None else None
+        wall, gt = self._last_input_wall_now_ts, self._last_input_grid_ts
+        if (inp is None or not s.nominal_import_only_fallback or not s.enable_dynamic_limit
+                or not s.active_control or s.dry_run or status not in START_ALLOWED_STATUSES
+                or not 0 <= current <= .5 or inp.data_valid is not True or inp.data_error
+                or inp.charger_native_committed is not True or inp.charger_snapshot_verified
+                or inp.charger_publication_pending or inp.charger_current_trusted is not True
+                or inp.charger_report_family != "native_terminal_receipt" or self._ev_clock_error is not None
+                or self._last_input_control_source_id is None
+                or self._last_input_control_source_id != self._accepted_control_source_id
+                or self._restart_required or self._uncertainty_restart or self.paused_by_us
+                or self._uncertainty_stops >= 3 or self._uncertainty_retry_submission_pending
+                or self._uncertainty_retry_after is not None and now < self._uncertainty_retry_after
+                or self._dispatch_records or self.last_target is None or self.last_target[1:3] != (0, 0)
+                or cap != self.startup_current or self._uncertainty_ceiling != cap
+                or self.last_set_limit_ts is None or not 0 <= now-self.last_set_limit_ts < self.last_target[3]
+                or wall is None or gt is None or not 0 <= wall-gt <= s.max_sensor_age_seconds
+                or self._ev_event_source_known and (self._ev_event_source_ts is None or self._ev_event_source_ts > wall+5)
+                or self._awaiting_reduction_target is not None or self._settle_started is not None
+                or self._partial_reduction_current is not None or self._ordinary_lower is not None
+                or self._minimum_confirmation is not None or self._low_grid_pending
+                or self._low_grid_failure is not None or self._normal_shed_deadline is not None
+                or self._normal_shed_failure is not None or self._nominal_shedding_started is not None
+                or self._overload_transition_started is not None or self._overload_hold_active
+                or self._peak_response is not None or self.automatic_cycle_requires_checkpoint
+                or self._ready_owner is not None or self._positive_cap not in {None, cap}
+                or self._positive_skew_since is not None or self._positive_ramp_deadline is not None
+                or self._positive_raw_recovery or self._positive_response_ts is not None):
+            return False
+        whole = max(cap, self._uncertainty_previous_offer or cap, s.max_charge_amps)
+        return bool(s.min_charge_amps <= cap <= whole <= s.max_charge_amps
+                    and grid+whole <= s.main_fuse_amps-s.buffer_amps)
 
     def _record_uncertainty_stop(self, now: float) -> None:
         if self._uncertainty_ceiling is None or self._uncertainty_stop_recorded:
@@ -2849,7 +2892,7 @@ class OneFuseRegulator:
         self._uncertainty_recovery_epochs = 0
 
     def _observe_uncertainty_recovery(self, now: float, grid: float, current: float,
-                                      status: str) -> bool:
+                                      status: str, *, inp: Optional[RegulatorInput] = None) -> bool:
         """Do not promote a lower offer from a new GET receipt alone.
 
         Vendor current is an event-driven state, not a periodic sample. An
@@ -2861,17 +2904,32 @@ class OneFuseRegulator:
             return False
         cap = self.last_target[0]
         available, _ = self.calculate_available_l1(grid, current)
-        valid = (not self._restart_required and not self._uncertainty_restart
+        charging_valid = (not self._restart_required and not self._uncertainty_restart
                  and self._meaningfully_charging(status, current)
                  and self.settings.min_charge_amps <= cap <= self.settings.max_charge_amps
                  and cap <= self._uncertainty_ceiling
                  and self._current_cache_and_grid_usable() and current <= cap + 0.5 and current <= grid + 1
                  and grid <= self.settings.main_fuse_amps - self.settings.buffer_amps and available >= cap)
+        idle_valid = self._idle_raw_normal_recovery(now, grid, current, status, inp)
+        valid = charging_valid or idle_valid
         if not valid:
             self._uncertainty_recovery_since = None
             self._uncertainty_recovery_epochs = 0
             self._uncertainty_recovery_grid_ts = None
+            self._uncertainty_idle_raw_scope = None
             return False
+        if idle_valid:
+            provenance = inp.charger_report_provenance
+            scope = (inp.control_source_id, inp.charger_report_family,
+                provenance[:provenance.index("max_terminals")]
+                if isinstance(provenance, tuple) and "max_terminals" in provenance else provenance)
+            if scope != self._uncertainty_idle_raw_scope:
+                self._uncertainty_recovery_since = None
+                self._uncertainty_recovery_epochs = 0
+                self._uncertainty_recovery_grid_ts = None
+            self._uncertainty_idle_raw_scope = scope
+        else:
+            self._uncertainty_idle_raw_scope = None
         if self._uncertainty_recovery_since is None:
             self._uncertainty_recovery_since = now
             self._uncertainty_recovery_epochs = 1
@@ -5520,6 +5578,7 @@ class OneFuseRegulator:
         source_processing_deadline = None
         normal_continuity_deadline = None
         expired_observation = False
+        idle_recovery_observed = False
         readiness_context = None
         if self.last_target is None and not current_fresh:
             # Initial takeover cannot be seeded from an old retained EV value.
@@ -5923,6 +5982,13 @@ class OneFuseRegulator:
             self._restart_required = True
             return decision("unavailable", "Accepted positive response source binding changed; requesting 0 A.",
                             "set_limit", emergency=True)
+        if (self._uncertainty_ceiling is not None and current <= .5
+                and status in START_ALLOWED_STATUSES):
+            # Observe independent RAW recovery before no-write baseline/owner
+            # returns. They may legitimately retain 7 A while a full car draws
+            # 0 A, but must not prevent the existing 30 s recovery advancing.
+            self._observe_uncertainty_recovery(now, grid, current, status, inp=inp)
+            idle_recovery_observed = True
         owner = self._committed_normal
         if (owner is not None and status != "charging" and owner.status_deadline is None
                 and status in START_ALLOWED_STATUSES and self._last_input_wall_now_ts is not None
@@ -5936,9 +6002,28 @@ class OneFuseRegulator:
         measurement_owner = bool(self._positive_cap is not None or self._ordinary_lower is not None
             or self._low_grid_pending or self._normal_shed_deadline is not None
             or self._awaiting_reduction_target is not None or self._minimum_confirmation is not None)
+        active_waiting_observation = bool(self._positive_cap is not None and (
+            owner is None or self._positive_cap != owner.cap or self._positive_skew_since is not None
+            or self._positive_ramp_deadline is not None or self._positive_raw_recovery
+            or self._positive_response_ts is not None)
+            or self._ordinary_lower is not None or self._minimum_confirmation is not None
+            or self._low_grid_pending or self._normal_shed_deadline is not None
+            or self._awaiting_reduction_target is not None)
+        # Whole RAW permits a higher waiting offer and ordinary same-cap TTL
+        # renewal. Keeping an old cap without writes until lease expiry would
+        # break readiness; this grants no EV credit or response-window refund.
+        waiting_raw_cap = int(floor(min(s.max_charge_amps, s.main_fuse_amps-s.buffer_amps-grid)))
+        waiting_raw_offer = bool(normal_evidence is not None and not active_waiting_observation
+            and status != "charging" and status in START_ALLOWED_STATUSES
+            and current <= .5 and s.nominal_import_only_fallback
+            and self._uncertainty_ceiling is None and not self._uncertainty_stops
+            and not self._dispatch_records and owner is not None
+            and waiting_raw_cap >= owner.cap
+            and grid+max(owner.cap, owner.unresolved_cap or 0, waiting_raw_cap)
+                <= s.main_fuse_amps-s.buffer_amps)
         if (normal_evidence is not None and (
                 normal_evidence[2] and measurement_owner
-                or status != "charging" and not measurement_owner)):
+                or status != "charging" and not measurement_owner) and not waiting_raw_offer):
             cap, normal_house, fresh_normal = normal_evidence
             soft = self._timer_reached(now, "above_soft_since", grid > s.soft_limit_amps, s.soft_for_seconds)
             pause = self._timer_reached(now, "above_pause_since", grid > s.pause_limit_amps, s.pause_for_seconds)
@@ -6086,7 +6171,8 @@ class OneFuseRegulator:
                 return decision("soft_limit", "Soft guard overrides raw-budget response alignment.",
                     "set_limit", target, s.soft_ttl_seconds, emergency=True)
             return decision("settling", "Keeping only the accepted raw-budget offer inside its original sample-aged response window; no EV subtraction, rise, resume or lease renewal.", None, cap, self.last_target[3])
-        baseline_hold = (None if raw_recovery_candidate is not None else self._clock_baseline_raw_hold(now, grid, current, status))
+        baseline_hold = (None if raw_recovery_candidate is not None or waiting_raw_offer
+                         else self._clock_baseline_raw_hold(now, grid, current, status))
         if baseline_hold is not None:
             cap, house = baseline_hold
             available, _ = self.calculate_available_l1(grid, 0.0)
@@ -6141,7 +6227,8 @@ class OneFuseRegulator:
             self._restart_required = True
             return decision("unavailable", "The accepted uncertainty-mode lease expired; requesting 0 A before a qualified capped restart.",
                             "set_limit", emergency=True)
-        self._observe_uncertainty_recovery(now, grid, current, status)
+        if not idle_recovery_observed:
+            self._observe_uncertainty_recovery(now, grid, current, status, inp=inp)
         uncertain = (not self._last_input_current_trusted or current > grid + 1
                      or (self._positive_cap is not None and current > self._positive_cap + 0.5)
                      or self._uncertainty_ceiling is not None)

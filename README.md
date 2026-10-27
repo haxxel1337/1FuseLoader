@@ -822,6 +822,21 @@ capacity. There is no short 7-to-6 A pulse. `starting`, `waiting_for_vehicle`,
 `start_headroom_wait` and `waiting_for_vehicle_stalled` distinguish the observed
 waiting conditions; the stalled state is diagnostic and does not trigger
 repeated stop/start commands.
+
+With the import-only raw fallback enabled, a connected vehicle that draws no
+power can also complete normal measurement recovery. For the existing
+30-second recovery period, fresh advancing grid
+reports must leave room for the **entire** previous, accepted and prospective
+normal offer, without subtracting a cached vehicle current. A full vehicle
+does not have to start charging to release an obsolete recovery ceiling.
+Restart and retry guards still apply, and the next higher limit requires its
+ordinary durable submission and actual acknowledgement. This recovery does
+not reset overload exposure, automatic-cycle budget or historical faults.
+When whole-raw headroom independently qualifies a waiting offer, the ordinary
+calculation can increase it and renew its finite lease before expiry. A
+no-write continuity hold cannot suppress those commands indefinitely; active
+response observations keep their existing deadlines.
+
 Takeover of an already charging session can use the verified current and
 buffered headroom; an old EV report without current evidence receives no
 subtraction credit for a new increase. A submitted reduction must be observed
