@@ -50,6 +50,17 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Late phase identification during normal recovery (b43)
+
+The first normal command can precede the charger's valid phase identification.
+An actual accepted normal renewal can then bind a missing or changed-scope
+mapped-L1 floor from that renewal's captured SDK boundary. A valid existing
+same-scope floor is preserved across renewals. Neither a mapping update nor an
+HTTP acknowledgement supplies the subsequent physical measurement: recovery
+still needs a new qualified L1 sample after that SDK and later coherent grid
+feedback. This repairs normal provenance only; original electrical deadlines,
+finite authority, overload permission, cycle/exposure and history are unchanged.
+
 ### Standalone meter control and operational recovery (b42)
 
 The selected meter policy has one active electrical episode and five primary

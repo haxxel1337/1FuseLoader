@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0b43
+
+- Bind missing or changed mapped-phase provenance at a later actual accepted
+  normal SDK renewal. A first command may precede phase identification; keeping
+  its missing floor forever blocked otherwise measured normal recovery.
+- Keep a valid same-scope floor fixed across renewals. Phase adoption, cached
+  observations or an HTTP reply alone still cannot establish recovery; a new
+  mapped L1 sample after the new SDK boundary and later coherent grid are needed.
+- Preserve the electrical episode's original response/grid deadlines, finite
+  leases, exposure, cycle id and incident history. No extra current or time is
+  granted by repairing normal measurement provenance.
+
 ## 0.4.0b42
 
 - Rework selected meter control around one explicit electrical episode and

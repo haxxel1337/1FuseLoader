@@ -307,9 +307,20 @@ class MeterEnvelopePolicy:
         self.lease.cap=d.current_p1;self.lease.origin=origin;self.lease.expires=origin+d.ttl_seconds
         if d.current_p1<=0: return
         self.lease.source_id=dispatch.get('source_id');r._accepted_control_source_id=self.lease.source_id
+        startup_proved=bool(self.start_since is not None and origin-self.start_since>=r.settings.restart_stable_seconds
+            and self.recovery.old_authority_until is not None and origin>=self.recovery.old_authority_until)
+        new_floor=dispatch.get('controlled_l1_floor')
+        normal_floor=not d.meter_overload_authority and new_floor is not None
+        operating_scope_missing=bool(normal_floor and (self.accepted_l1_floor is None
+            or new_floor['key']!=self.accepted_l1_floor['key']))
         if old!=d.current_p1:
-            r._last_limit_change_ts=origin;self.accepted_l1_floor=deepcopy(dispatch.get('controlled_l1_floor'))
+            r._last_limit_change_ts=origin;self.accepted_l1_floor=deepcopy(new_floor)
             self.lease.normal_origin=origin
+        elif operating_scope_missing and (not self.recovery.required or startup_proved):
+            # Phase context may settle after the first positive command. Only
+            # this accepted SDK boundary can establish its missing/new scope;
+            # an ordinary renewal in the same scope must keep the old floor.
+            self.accepted_l1_floor=deepcopy(new_floor);self.lease.normal_origin=origin
         if (not d.meter_overload_authority and number(d.house_load_l1) is not None
                 and d.house_load_l1+d.current_p1<=r.settings.main_fuse_amps-r.settings.buffer_amps):
             self.lease.normal_house=d.house_load_l1
@@ -317,12 +328,10 @@ class MeterEnvelopePolicy:
         elif old!=d.current_p1: self.ordinary_decrease_grid=self.ordinary_decrease_cap=None
         if self.episode is not None and self.episode.unresolved and d.current_p1==7 and self.minimum_dispatch is None:
             self.minimum_dispatch=origin;self.minimum_l1_floor=deepcopy(dispatch.get('controlled_l1_floor'))
-        startup_proved=bool(self.start_since is not None and origin-self.start_since>=r.settings.restart_stable_seconds
-            and self.recovery.old_authority_until is not None and origin>=self.recovery.old_authority_until)
-        new_floor=dispatch.get('controlled_l1_floor')
-        changed_scope=bool(new_floor is not None and self.recovery.normal_floor is not None
-            and new_floor['key']!=self.recovery.normal_floor['key'])
-        if self.recovery.required and startup_proved and (self.recovery.normal_dispatch is None or old!=d.current_p1 or changed_scope):
+        recovery_scope_missing=bool(normal_floor and (self.recovery.normal_floor is None
+            or new_floor['key']!=self.recovery.normal_floor['key']))
+        if (self.recovery.required and startup_proved and not d.meter_overload_authority
+                and (self.recovery.normal_dispatch is None or old!=d.current_p1 or recovery_scope_missing)):
             self.recovery.normal_dispatch=origin;self.recovery.normal_cap=d.current_p1
             self.recovery.normal_floor=deepcopy(dispatch.get('controlled_l1_floor'));self.recovery.stage='await_normal_response'
 
