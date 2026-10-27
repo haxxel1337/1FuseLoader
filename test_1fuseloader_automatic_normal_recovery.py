@@ -142,24 +142,29 @@ class AutomaticNormalRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.now = 302.
         self.grid(16.)
         await self.controller.async_tick()
+        # Independent normal permission may propose the same cap; ordinary
+        # finite-TTL throttling still prevents an actual early renewal.
         self.assertEqual((self.controller.last_decision.current_p1,
-            self.controller.last_decision.command), (12, None))
+            self.controller.last_decision.command,
+            self.controller.last_decision.should_call_service), (12, "set_limit", False))
         self.assertEqual(self.adapter.calls, [])
+        self.assertEqual(r.last_set_limit_ts, 300.)
         self.now = 303.3
         self.report_native(12.05, 303., 3)
         self.grid(16., 302.5)
         await self.controller.async_tick()
         self.assertEqual(self.controller.last_decision.current_p1, 12)
         self.assertEqual(self.adapter.calls, [])
+        self.assertEqual(r.last_set_limit_ts, 300.)
         self.now = 305.
         self.grid(16.)
         await self.controller.async_tick()
-        # Qualifying the accepted12 A offer discharges measurement work;
-        # it does not authorize a higher offer in that same evaluation.
+        # Only this genuinely post-dispatch EV response AND its later grid
+        # qualify the higher normal offer. No extra evaluation is required.
         self.assertEqual((self.controller.last_decision.current_p1,
-            self.controller.last_decision.command), (12, None))
-        self.assertEqual(r.last_set_limit_ts, 300.)
-        self.assertEqual(self.adapter.calls, [])
+            self.controller.last_decision.command), (16, "set_limit"))
+        self.assertEqual(r.last_set_limit_ts, 305.)
+        self.assertEqual([v.current_p1 for v in self.adapter.calls], [16])
         self.now = 310.
         self.grid(16.)
         await self.controller.async_tick()
@@ -232,10 +237,13 @@ class AutomaticNormalRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.async_tick()
         d = self.controller.last_decision
         self.assertEqual((d.current_p1, d.should_call_service), (15, False))
-        self.assertEqual(d.mode, "normal")
+        self.assertEqual(d.mode, "normal_continuity")
         self.assertEqual(self.adapter.calls, [])
         self.assertEqual(r.last_set_limit_ts, 195.)
         self.assertIsNone(d.source_processing_deadline_ts)
+        self.assertAlmostEqual(d.normal_continuity_deadline_ts, 201.36)
+        self.assertLess(d.normal_continuity_deadline_ts,
+            r._committed_normal.observation_deadline)
         self.assertEqual(r._committed_normal.observation_deadline, 220.)
         self.assertLessEqual(r._committed_normal.house + r._committed_normal.unresolved_cap, 23.)
         self.assert_history(r)

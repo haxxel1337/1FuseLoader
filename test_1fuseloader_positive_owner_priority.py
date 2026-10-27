@@ -1,4 +1,5 @@
 """An accepted normal startup owns its mixed EV-first publications, offline."""
+from copy import deepcopy
 import unittest
 
 import test_1fuseloader_positive_ramp_owner as ramp_fixtures
@@ -33,16 +34,29 @@ class PositiveOwnerPriorityTests(unittest.TestCase):
         r = self.bootstrap()
         renewal = r.evaluate(self.frame(90., grid=2.5, current=.16,
             receipt=85., grid_at=85., sequence=1))
-        self.assertEqual((renewal.mode, renewal.current_p1), ("waiting_for_vehicle", 16))
+        # Whole RAW2.5 +16 independently permits this same accepted cap. It
+        # closes observation work, without turning a TTL renewal into response.
+        self.assertEqual((renewal.mode, renewal.current_p1), ("normal", 16))
         self.assertTrue(renewal.should_call_service)
+        floor = r._accepted_control_ev_ts
+        clock = deepcopy(r._ev_owner_clocks.get("_accepted_control_ev_ts"))
+        ledger = r._committed_normal.observation_history
+        self.assertTrue(ledger)
         # A numeric event occurs during the identical-cap API call. It is
         # after the real changed-cap ACK, not after this lease renewal ACK.
         r.acknowledge(renewal, 90.2)
+        self.assertEqual(r.last_set_limit_ts, 90.2)
+        self.assertEqual(r._accepted_control_ev_ts, floor)
+        self.assertEqual(r._ev_owner_clocks.get("_accepted_control_ev_ts"), clock)
+        self.assertEqual(r._committed_normal.observation_history, ledger)
         d = r.evaluate(self.frame(90.3, grid=2.5, current=5.5,
             receipt=90.1, grid_at=85., sequence=2))
-        self.assertEqual((d.mode, d.current_p1, d.command), ("positive_ramp_hold", 16, None))
+        self.assertEqual((d.mode, d.current_p1), ("normal", 16))
         self.assertFalse(d.should_call_service)
-        self.assertAlmostEqual(d.positive_response_deadline_ts, 115.1)
+        self.assertIsNone(d.positive_response_deadline_ts)
+        self.assertEqual(r._committed_normal.observation_history, ledger)
+        self.assertEqual(r._committed_normal.unresolved_cap, 16)
+        self.assertEqual(r._accepted_control_ev_ts, floor)
         self.assertIsNone(r._ordinary_lower)
         for now, grid, current, receipt, gt, seq in (
                 (91., 8.8, 9.2, 90.7, 91., 3),
@@ -53,8 +67,7 @@ class PositiveOwnerPriorityTests(unittest.TestCase):
             # the ENTIRE offer fits. Full-cap demand is not required.
             self.assertEqual(d.current_p1, 16)
             self.assertFalse(d.should_call_service)
-            if d.positive_response_deadline_ts is not None:
-                self.assertAlmostEqual(d.positive_response_deadline_ts, 115.1)
+            self.assertIsNone(d.positive_response_deadline_ts)
             self.assertEqual(r.last_set_limit_ts, 90.2)
         d = r.evaluate(self.frame(100., grid=18.6, current=16.1,
             receipt=94.6, grid_at=99., sequence=4))
@@ -67,16 +80,32 @@ class PositiveOwnerPriorityTests(unittest.TestCase):
 
     def test_existing_owner_first_partial_cannot_become_an_ordinary_lower_attempt(self):
         r = self.bootstrap()
-        d = r.evaluate(self.frame(65.3, grid=2.5, current=5.5,
+        # RAW9 + the unresolved16 offer does not independently fit23 A.
+        # This genuinely needs the existing EV-first observation owner.
+        d = r.evaluate(self.frame(65.3, grid=9., current=5.5,
             receipt=65.1, grid_at=64., sequence=1))
         self.assertEqual((d.mode, d.current_p1, d.command), ("positive_ramp_hold", 16, None))
         self.assertFalse(d.should_call_service)
         self.assertEqual(r.last_target[0], 16)
         self.assertIsNone(r._ordinary_lower)
 
+    def test_independent_whole_raw_budget_keeps_same_cap_without_claiming_response(self):
+        r = self.bootstrap()
+        accepted = r.last_set_limit_ts
+        d = r.evaluate(self.frame(65.3, grid=2.5, current=5.5,
+            receipt=65.1, grid_at=64., sequence=1))
+        self.assertEqual((d.mode, d.current_p1), ("normal", 16))
+        self.assertFalse(d.should_call_service)
+        self.assertEqual(r.last_target[0], 16)
+        self.assertEqual(r.last_set_limit_ts, accepted)
+        self.assertIsNone(r._ordinary_lower)
+        self.assertEqual(r._committed_normal.unresolved_cap, 16)
+        self.assertTrue(r._committed_normal.observation_history)
+        self.assertIsNone(r._positive_response_ts)
+
     def test_repeated_partial_without_coherent_budget_keeps_first_clock_and_expires(self):
         r = self.bootstrap()
-        first = r.evaluate(self.frame(65.3, grid=2.5, current=5.5,
+        first = r.evaluate(self.frame(65.3, grid=9., current=5.5,
             receipt=65.1, grid_at=64., sequence=1))
         self.assertAlmostEqual(first.positive_response_deadline_ts, 90.1)
         # A later partial report has a later grid, but its implied house plus
@@ -110,7 +139,7 @@ class PositiveOwnerPriorityTests(unittest.TestCase):
             receipt=119., grid_at=120., sequence=1))
         self.assertNotEqual(d.mode, "positive_ramp_hold")
 
-    def test_ordinary_fallback_remains_available_without_positive_owner(self):
+    def test_finished_startup_whole_raw_budget_keeps_cap_without_false_lower(self):
         r = self.bootstrap()
         # A genuine partial draw + later grid first retires the startup owner
         # by proving that the whole16 offer fits; it is not a fabricated ACK.
@@ -118,14 +147,38 @@ class PositiveOwnerPriorityTests(unittest.TestCase):
             receipt=64., grid_at=65., sequence=1))
         self.assertEqual(d.current_p1, 16)
         self.assertIsNone(r._positive_cap)
+        accepted, receipt = r.last_set_limit_ts, r._last_input_charger_ts
         d = r.evaluate(self.frame(66., grid=2.5, current=8.,
             receipt=64., grid_at=66., sequence=1))
-        self.assertEqual((d.mode, d.current_p1, d.command), ("ordinary_lower_offer", 7, "set_limit"))
+        self.assertEqual((d.mode, d.current_p1), ("normal", 16))
+        self.assertFalse(d.should_call_service)
+        self.assertIsNone(r._ordinary_lower)
+        self.assertEqual(r.last_target[0], 16)
+        self.assertEqual(r.last_set_limit_ts, accepted)
+        self.assertEqual(r._last_input_charger_ts, receipt)
+
+    def test_ordinary_fallback_remains_available_without_independent_normal_proof(self):
+        r = self.bootstrap()
+        d = r.evaluate(self.frame(65., grid=13., current=8.,
+            receipt=64., grid_at=65., sequence=1))
+        self.assertEqual(d.current_p1, 16)
+        self.assertIsNone(r._positive_cap)
+        # Neither RAW15.1 + old16 nor the original joint floor8 can bound
+        # the whole16 offer. The new high native event is still inconsistent
+        # with RAW; only a lower7 offer has an independent full-RAW budget.
+        d = r.evaluate(self.frame(66., grid=15.1, current=16.3,
+            receipt=65.8, grid_at=66., sequence=2))
+        self.assertEqual((d.mode, d.current_p1, d.command),
+                         ("ordinary_lower_offer", 7, "set_limit"))
         self.assertIsNotNone(r._ordinary_lower)
+        self.assertIsNone(r._ordinary_lower.accepted_at)
+        self.assertEqual(r._ordinary_lower.previous, 16)
+        self.assertLessEqual(d.grid_l1+d.current_p1, 23.)
+        self.assertEqual(r.last_target[0], 16)
 
     def test_expired_rise_may_handoff_to_independently_raw_bounded_lower_offer(self):
         r = self.bootstrap()
-        first = r.evaluate(self.frame(65.3, grid=2.5, current=5.5,
+        first = r.evaluate(self.frame(65.3, grid=9., current=5.5,
             receipt=65.1, grid_at=64., sequence=1))
         self.assertEqual(first.mode, "positive_ramp_hold")
         d = r.evaluate(self.frame(90.1, grid=13., current=14.5,

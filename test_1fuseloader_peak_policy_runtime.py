@@ -4,6 +4,7 @@ Helpers are reused without inheriting older test classes. Conductor values,
 source bindings, clocks and API responses are synthetic; no private proof or
 household time-series is imported into these public regressions.
 """
+from copy import deepcopy
 from dataclasses import replace
 import unittest
 
@@ -48,7 +49,10 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.now = receipt+.3
         self.native_vector(float32(7.1), (182, 183),
             {182: receipt, 183: receipt}, {182: 3, 183: 3}, receipt)
-        self.grid(13.7, receipt-.5)
+        # The old16 upper cannot be independently normal here:
+        # RAW14.2 - the new7.1 draw +16 =23.1 A. This case genuinely
+        # needs its original fixed grid-confirmation phase.
+        self.grid(14.2, receipt-.5)
         await self.controller.async_tick()
         self.assertEqual((self.controller.last_decision.mode,
             self.controller.last_decision.command), ("ordinary_grid_wait", None))
@@ -62,26 +66,38 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(state["used_seconds"], 3601.)
         self.assertNotIn("trial_epoch", state)
 
-    async def test_raw_bounded_conflict_holds_lower_offer_past_old_cutoffs(self):
+    async def test_independent_normal_minimum_renews_without_restarting_old_observation(self):
         r = await self.ordinary()
         original_ack = r.last_set_limit_ts
         original_observation_end = r._ordinary_lower.observation_deadline
+        original_floor = r._accepted_control_ev_ts
+        original_clock = deepcopy(r._ev_owner_clocks.get("_accepted_control_ev_ts"))
+        ledger = None
         for at in (211., 226., 240.):
             self.now = at
             self.grid(13.7)
             await self.controller.async_tick()
             self.assertEqual(self.controller.last_decision.current_p1, 7)
-            self.assertIn(self.controller.last_decision.mode,
-                {"ordinary_lower_offer", "ordinary_response_hold"})
-            if self.controller.last_decision.mode == "ordinary_response_hold":
-                self.assertIsNone(self.controller.last_decision.command)
+            self.assertEqual(self.controller.last_decision.mode, "normal")
+            if at < original_ack+r.settings.resend_limit_every_seconds:
                 self.assertFalse(self.controller.last_decision.should_call_service)
                 self.assertEqual(r.last_set_limit_ts, original_ack)
-                self.assertEqual(self.controller.last_decision.ordinary_response_deadline_ts,
-                    original_observation_end)
+            else:
+                self.assertEqual(r.last_set_limit_ts, at)
+                self.assertLess(at, original_ack+r.last_target[3])
+            self.assertEqual(r._accepted_control_ev_ts, original_floor)
+            self.assertEqual(r._ev_owner_clocks.get("_accepted_control_ev_ts"), original_clock)
+            self.assertEqual(r._committed_normal.unresolved_cap, 16)
+            if ledger is None:
+                ledger = r._committed_normal.observation_history
+                records = [item for item in ledger if item.kind == "ordinary_lower"]
+                self.assertEqual(len(records), 1)
+                self.assertEqual((records[0].previous, records[0].deadline),
+                                 (16, original_observation_end))
+            self.assertEqual(r._committed_normal.observation_history, ledger)
             self.assertIsNone(self.controller.last_decision.nominal_response_deadline_ts)
         self.assertTrue(all(d.current_p1 == 7 for d in self.adapter.calls))
-        self.assertEqual(r._ordinary_lower.previous, 16)
+        self.assertIsNone(r._ordinary_lower)
         self.assert_no_trial(r)
 
     async def test_checkpoint_revision_abort_spends_no_attempt_or_zero(self):
@@ -120,7 +136,7 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
         r = await self.minimum_wait()
         accepted = r.last_set_limit_ts
         self.now = 230.
-        self.grid(13.7, 214.5)
+        self.grid(14.2, 214.5)
         await self.controller.async_tick()
         decision = self.controller.last_decision
         self.assertEqual((decision.current_p1, decision.command,
@@ -133,7 +149,7 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_observation_expiry_can_keep_independent_raw_safe_offer(self):
         r = await self.minimum_wait()
         self.now = self.controller.last_decision.grid_confirmation_deadline_ts
-        self.grid(13.7, 214.5)
+        self.grid(14.2, 214.5)
         await self.controller.async_tick()
         self.assertEqual(self.controller.last_decision.current_p1, 7)
         self.assertIsNone(self.controller.last_decision.grid_confirmation_deadline_ts)
@@ -141,11 +157,47 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.now = 246.3
         self.native_vector(float32(7.08), (182, 183),
             {182: 246., 183: 246.}, {182: 4, 183: 4}, 246.)
-        self.grid(13.7, 245.5)
+        self.grid(14.2, 245.5)
         await self.controller.async_tick()
         self.assertEqual(self.controller.last_decision.current_p1, 7)
         self.assertIsNone(self.controller.last_decision.grid_confirmation_deadline_ts)
         self.assertTrue(all(d.current_p1 > 0 for d in self.adapter.calls))
+        self.assert_no_trial(r)
+
+    async def test_independent_joint_normal_proof_retains_minimum_without_new_phase(self):
+        r = await self.ordinary()
+        accepted = r.last_set_limit_ts
+        ordinary = r._ordinary_lower
+        original_deadline, original_floor = ordinary.observation_deadline, ordinary.ev_floor
+        native_floor = r._committed_normal.native_floor
+        self.adapter.calls.clear()
+        self.now = 215.3
+        self.native_vector(float32(7.1), (182, 183),
+            {182: 215., 183: 215.}, {182: 3, 183: 3}, 215.)
+        self.grid(13.7, 214.5)
+        await self.controller.async_tick()
+        d = self.controller.last_decision
+        self.assertEqual((d.mode, d.current_p1, d.should_call_service), ("normal", 7, False))
+        self.assertEqual(self.adapter.calls, [])
+        self.assertEqual(r.last_set_limit_ts, accepted)
+        self.assertIsNone(d.grid_confirmation_deadline_ts)
+        self.assertIsNone(r._minimum_confirmation)
+        self.assertIsNone(r._ordinary_lower)
+        # The older RAW cannot complete a physical response or authorize an
+        # EV-based rise. Only normal continuation of the same7 offer is proven.
+        self.assertFalse(r._reduction_response_completed)
+        self.assertEqual(r._committed_normal.unresolved_cap, 16)
+        self.assertEqual(r._committed_normal.native_floor, native_floor)
+        records = [item for item in r._committed_normal.observation_history
+                   if item.kind == "ordinary_lower"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual((records[0].previous, records[0].deadline, records[0].ev_floor),
+                         (16, original_deadline, original_floor))
+        self.now = 216.
+        await self.controller.async_tick()
+        self.assertEqual(self.controller.last_decision.current_p1, 7)
+        self.assertEqual(r.last_set_limit_ts, accepted)
+        self.assertEqual(self.adapter.calls, [])
         self.assert_no_trial(r)
 
     async def test_native_fault_and_changed_binding_still_send_zero(self):
@@ -188,7 +240,7 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.calls[-1].current_p1, 0)
         self.assert_no_trial(r)
 
-    async def test_real_fourteen_to_eight_then_seven_response_releases_anchor(self):
+    async def test_real_fourteen_to_eight_partial_response_releases_anchor_without_extra_minimum_cut(self):
         r = await self.establish()
         self.grid(25., 200.)
         await self.controller.async_tick()
@@ -204,26 +256,35 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
             {182: 203., 183: 203.}, {182: 4, 183: 4}, 203.)
         self.grid(13.3)
         await self.controller.async_tick()
-        self.assertEqual(self.adapter.calls[-1].current_p1, 7)
+        # Genuine7.9 A after the8 A ACK and its later grid prove the whole
+        # existing8 offer. A second reduction to7 would add no protection.
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [14, 8])
+        self.assertEqual(r.last_target[0], 8)
+        self.assertEqual(r.last_set_limit_ts, 202.3)
+        self.assertIsNone(r._committed_normal.unresolved_cap)
+        self.assertIsNone(r._house_before_reduction)
         self.now = 205.3
         self.native_vector(float32(7.05), (182, 183),
             {182: 205., 183: 205.}, {182: 5, 183: 5}, 205.)
         self.grid(13.3, 204.8)
         await self.controller.async_tick()
-        self.assertEqual(self.controller.last_decision.mode, "ordinary_grid_wait")
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [14, 8])
+        self.assertEqual(r.last_target[0], 8)
+        self.assertIsNone(self.controller.last_decision.grid_confirmation_deadline_ts)
         self.now = 207.
         self.grid(12., 206.)
         await self.controller.async_tick()
-        self.assertEqual(self.controller.last_decision.mode, "ordinary_lower_complete")
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [14, 8])
+        self.assertEqual(r.last_target[0], 8)
         self.assertIsNone(r._ordinary_lower)
         self.assertIsNone(r._house_before_reduction)
         self.now = 210.
         self.grid(12., 209.8)
         await self.controller.async_tick()
-        self.assertEqual(self.adapter.calls[-1].current_p1, 16)
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [14, 8, 16])
         self.assertTrue(all(d.current_p1 > 0 for d in self.adapter.calls))
 
-    async def test_intermediate_ten_then_timely_seven_does_not_inherit_false_cutoff(self):
+    async def test_intermediate_ten_waits_for_partial_response_and_later_grid_without_extra_cut(self):
         r = await self.establish()
         self.native_vector(float32(4.), (182, 183),
             {182: 199., 183: 199.}, {182: 3, 183: 3}, 199.)
@@ -235,23 +296,33 @@ class PeakPolicyRuntimeTests(unittest.IsolatedAsyncioTestCase):
             {182: 204., 183: 204.}, {182: 4, 183: 4}, 204.)
         self.grid(9.1, 205.)
         await self.controller.async_tick()
-        self.assertEqual(self.adapter.calls[-1].current_p1, 7)
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [10])
+        self.assertEqual(r.last_target[0], 10)
+        self.assertEqual(r._committed_normal.unresolved_cap, 16)
         self.now = 213.3
         self.native_vector(float32(6.94), (182, 183),
             {182: 213., 183: 213.}, {182: 5, 183: 5}, 213.)
         self.grid(9.1, 209.)
         await self.controller.async_tick()
-        self.assertEqual(self.controller.last_decision.mode, "ordinary_grid_wait")
-        self.assertAlmostEqual(self.controller.last_decision.grid_confirmation_deadline_ts, 243., places=6)
+        # The partial draw is genuine, but its grid still predates it. Keep
+        # old16 unresolved and continue only accepted10 inside the joint bound.
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [10])
+        self.assertEqual(r.last_target[0], 10)
+        self.assertEqual(r._committed_normal.unresolved_cap, 16)
+        self.assertIsNone(self.controller.last_decision.grid_confirmation_deadline_ts)
         self.now = 215.1
         self.grid(9.1, 209.)
         await self.controller.async_tick()
-        self.assertEqual(self.controller.last_decision.current_p1, 7)
-        self.assertEqual(self.controller.last_decision.command, None)
+        self.assertEqual(self.controller.last_decision.current_p1, 10)
+        self.assertFalse(self.controller.last_decision.should_call_service)
+        self.assertEqual(r.last_set_limit_ts, 200.)
+        self.assertEqual(r._committed_normal.unresolved_cap, 16)
         self.now = 216.2
         self.grid(9.3, 216.)
         await self.controller.async_tick()
-        self.assertEqual(self.controller.last_decision.mode, "ordinary_lower_complete")
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [10, 16])
+        self.assertEqual(r.last_set_limit_ts, 216.2)
+        self.assertIsNone(r._committed_normal.unresolved_cap)
         self.assertTrue(all(d.current_p1 > 0 for d in self.adapter.calls))
 
 

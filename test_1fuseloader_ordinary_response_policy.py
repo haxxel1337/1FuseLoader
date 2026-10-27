@@ -52,7 +52,7 @@ class OrdinaryResponsePolicyTests(unittest.TestCase):
         self.assertFalse(state["transition_pending"])
 
     def test_raw_bounded_lower_offer_survives_ten_and_twentyfive_seconds(self):
-        for grid in (2.4, 9.2, 13.7, 15.):
+        for grid in (9.2, 13.7, 15.):
             with self.subTest(grid=grid):
                 r, initial = self.lower(grid)
                 ctx = r._ordinary_lower
@@ -74,6 +74,20 @@ class OrdinaryResponsePolicyTests(unittest.TestCase):
                     self.assertEqual(ctx.previous, 16)
                     self.assertLessEqual(d.grid_l1+7, 23.)
                 self.assert_history(r)
+
+    def test_whole_raw_normal_offer_needs_no_lower_handoff(self):
+        r = self.running()
+        original_ev_floor = r._accepted_control_ev_ts
+        for now in (110., 121., 136., 159., 180.):
+            d = self.frame(r, now, 2.4, 16.2, et=102.)
+            self.assertEqual((d.current_p1, r.last_target[0]), (16, 16))
+            self.assertLessEqual(d.grid_l1+16, 23.)
+            self.assertEqual(r._accepted_control_ev_ts, original_ev_floor)
+            self.assertIsNone(r._ordinary_lower)
+            self.assertIsNone(d.nominal_response_deadline_ts)
+            self.assertIsNone(d.grid_confirmation_deadline_ts)
+            self.assertLess(now, r.last_set_limit_ts+r.last_target[3])
+        self.assert_history(r)
 
     def test_unaccepted_lower_proposal_does_not_become_an_accepted_seven(self):
         r = self.running()
@@ -186,22 +200,28 @@ class OrdinaryResponsePolicyTests(unittest.TestCase):
         self.assertTrue(r._restart_required)
         self.assert_history(r)
 
-    def test_pending_fourteen_to_eight_is_lowered_then_released_by_new_seven_response(self):
+    def test_genuine_eight_response_and_later_grid_need_no_extra_seven(self):
         r = self.running()
         fourteen = self.frame(r, 110., 25., 16.2, et=102.)
         self.assertEqual((fourteen.current_p1, r.last_target[0]), (14, 14))
         eight = self.frame(r, 112., 18.1, 4., et=111.)
         self.assertEqual((eight.current_p1, r.last_target[0]), (8, 8))
         self.assertEqual(r._awaiting_reduction_target, 8)
-        lower = self.frame(r, 113., 13.3, 7.9, et=112.5)
-        self.assertEqual((lower.mode, lower.current_p1), ("ordinary_lower_offer", 7))
-        waiting = self.frame(r, 114., 13.3, 7.05, gt=113., et=114.)
-        self.assertEqual(waiting.mode, "ordinary_grid_wait")
-        self.assertIsNone(waiting.nominal_response_deadline_ts)
-        done = self.frame(r, 115., 12., 7.05, et=114.)
-        self.assertEqual(done.mode, "ordinary_lower_complete")
+        response = self.frame(r, 113., 13.3, 7.9, et=112.5)
+        # A genuine response to8 plus its later grid resolves the earlier14.
+        # It can propose16, while ordinary action spacing retains actual8.
+        self.assertEqual((response.mode, response.current_p1), ("normal", 16))
+        self.assertFalse(response.should_call_service)
+        self.assertEqual(r.last_target[0], 8)
+        self.assertIsNone(r._ordinary_lower)
         self.assertIsNone(r._house_before_reduction)
         self.assertIsNone(r._awaiting_reduction_target)
+        self.assertIsNone(r._committed_normal.unresolved_cap)
+        for now, raw, gt in ((114., 13.3, 113.), (115., 12., 115.)):
+            d = self.frame(r, now, raw, 7.05, gt=gt, et=114.)
+            self.assertEqual(r.last_target[0], 8)
+            self.assertGreaterEqual(d.current_p1, 8)
+            self.assertIsNone(d.grid_confirmation_deadline_ts)
         raised = self.frame(r, 119., 12., 7.05, et=114.)
         self.assertEqual((raised.current_p1, r.last_target[0]), (16, 16))
         self.assert_history(r)
