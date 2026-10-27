@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
-from math import floor, isfinite
+from math import ceil, floor, isfinite
 from typing import NamedTuple, Optional
 
 # Native Easee states, plus legacy aliases retained for existing test fixtures.
@@ -455,6 +455,11 @@ class RegulatorDecision:
     meter_basis_grid_ts: Optional[float] = None
     controlled_l1_current: Optional[float] = None
     controlled_l1_used: bool = False
+    meter_control_state: Optional[str] = None
+    meter_episode_id: Optional[int] = None
+    meter_operational_fault: Optional[str] = None
+    meter_recovery_stage: Optional[str] = None
+    meter_episode_retention: bool = False
 
 
 class OneFuseRegulator:
@@ -467,6 +472,7 @@ class OneFuseRegulator:
     def __init__(self, settings: RegulatorSettings | None = None) -> None:
         self.settings = settings or RegulatorSettings()
         self._meter_envelope_policy = None
+        self._accepted_dispatch_order: Optional[tuple[float,int]] = None
         self._controlled_l1_seen: dict[tuple, tuple] = {}
         self._controlled_l1_epochs: dict[tuple, int] = {}
         self._controlled_l1_adoptions: dict[tuple, float] = {}
@@ -1243,6 +1249,9 @@ class OneFuseRegulator:
 
     @property
     def peak_response_active(self) -> bool:
+        if self.settings.meter_envelope_control:
+            e=self._get_meter_envelope_policy().episode
+            return bool(e is not None and e.unresolved)
         return self.settings.peak_only_response is True and self._peak_response is not None
 
     def peak_response_deadline(self, now: Optional[float] = None) -> Optional[float]:
@@ -1251,6 +1260,9 @@ class OneFuseRegulator:
         This accessor sends no zero and does not decide whether a qualified
         minimum response has entered the separate grid-confirmation phase.
         """
+        if self.settings.meter_envelope_control:
+            e=self._get_meter_envelope_policy().episode
+            return e.deadline if e is not None and e.unresolved else None
         return (self._peak_response.deadline
                 if self.settings.peak_only_response is True and self._peak_response is not None else None)
 
@@ -1459,14 +1471,14 @@ class OneFuseRegulator:
 
     @property
     def automatic_cycle_requires_checkpoint(self) -> bool:
-        return bool(self.settings.automatic_overload_cycles and self._automatic_cycle is not None
+        return bool((self.settings.meter_envelope_control or self.settings.automatic_overload_cycles) and self._automatic_cycle is not None
                     and self._automatic_cycle["state"] in {"qualifying", "active"})
 
     def automatic_cycle_diagnostics(self) -> dict:
         cycle = self._automatic_cycle
         used = float(cycle["used_seconds"]) if cycle else 0.0
         gt, now = self._automatic_last_gt, self._automatic_last_now
-        return dict(automatic_overload_cycles=self.settings.automatic_overload_cycles,
+        return dict(automatic_overload_cycles=self.settings.meter_envelope_control or self.settings.automatic_overload_cycles,
             automatic_cycle_state=cycle["state"] if cycle else "disabled",
             automatic_cycle_id=cycle["cycle_id"] if cycle else None,
             automatic_cycle_used_seconds=used,
@@ -1681,6 +1693,10 @@ class OneFuseRegulator:
 
     @property
     def effective_overload_failure_reason(self) -> Optional[str]:
+        if self.settings.meter_envelope_control:
+            p=self._get_meter_envelope_policy();c=self._ensure_automatic_cycle()
+            return (p.operational_fault or ('cumulative_budget_exhausted'
+                if c['used_seconds']>=self.settings.overload_budget_seconds else None))
         if self.settings.automatic_overload_cycles:
             if not self.settings.overload_enabled:
                 return "automatic_cycle_disabled"
@@ -1708,7 +1724,7 @@ class OneFuseRegulator:
 
     @property
     def effective_overload_used_seconds(self) -> float:
-        if self.settings.automatic_overload_cycles:
+        if self.settings.meter_envelope_control or self.settings.automatic_overload_cycles:
             return float(self._ensure_automatic_cycle()["used_seconds"])
         epoch = self._trial_epoch
         if epoch is None:
@@ -1719,7 +1735,7 @@ class OneFuseRegulator:
 
     @property
     def effective_overload_budget_seconds(self) -> float:
-        if self.settings.automatic_overload_cycles:
+        if self.settings.meter_envelope_control or self.settings.automatic_overload_cycles:
             return self.settings.overload_budget_seconds
         return (self._trial_epoch["policy"]["budget_seconds"] if self._trial_epoch is not None
                 else self.settings.overload_budget_seconds)
@@ -1804,7 +1820,7 @@ class OneFuseRegulator:
         return now, wall, identity
 
     def prepare_overload_trial(self, inp: RegulatorInput, *, trial_id: str, started_at_utc: str) -> None:
-        if self.settings.automatic_overload_cycles:
+        if self.settings.meter_envelope_control or self.settings.automatic_overload_cycles:
             raise ValueError("Manual trial activation is unavailable under automatic cycles")
         if (not isinstance(trial_id, str) or not trial_id.strip() or len(trial_id) > 128
                 or self._trial_epoch is not None and (
@@ -1843,6 +1859,8 @@ class OneFuseRegulator:
         self._terminate_trial("failed", reason)
 
     def end_overload_trial(self, inp: RegulatorInput) -> None:
+        if self.settings.meter_envelope_control:
+            raise ValueError('Manual trial actions are unavailable under standalone meter control')
         if self._trial_epoch is None:
             return
         now = None if isinstance(inp.now_ts, bool) else _valid_number(inp.now_ts)
@@ -1890,12 +1908,8 @@ class OneFuseRegulator:
         previous_settings = self.settings
         if type(settings.meter_envelope_control) is not bool:
             raise ValueError("Meter envelope control must be a boolean")
-        if settings.meter_envelope_control and not (
-                settings.nominal_import_only_fallback and settings.peak_only_response
-                and settings.automatic_overload_cycles and settings.overload_enabled
-                and settings.enable_dynamic_limit and settings.max_charge_amps <= 16
-                and settings.normal_ttl_seconds == 60):
-            raise ValueError("Meter envelope requires the import-only automatic peak profile and 60 s TTL")
+        if settings.meter_envelope_control and not self._meter_settings_valid(settings):
+            raise ValueError('Standalone meter control requires the bounded25A/7A/L1/60s profile')
         if settings.controlled_phase != "L1" or settings.unused_phase_current != 0:
             raise ValueError("Only L1 with unused phase currents of 0 A is supported")
         if type(settings.startup_charge_amps) is not int or not 6 <= settings.startup_charge_amps <= 16:
@@ -1912,7 +1926,7 @@ class OneFuseRegulator:
             raise ValueError("Automatic overload cycles must be a boolean")
         if type(settings.disconnected_readiness) is not bool:
             raise ValueError("Disconnected readiness must be a boolean")
-        if settings.automatic_overload_cycles and (not settings.peak_only_response
+        if settings.automatic_overload_cycles and not settings.meter_envelope_control and (not settings.peak_only_response
                 or settings.main_fuse_amps != 25 or settings.startup_charge_amps != 7
                 or not 6 <= settings.min_charge_amps <= 7 <= settings.max_charge_amps):
             raise ValueError("Automatic cycles require the peak-only 25 A / 7 A overload policy")
@@ -1934,13 +1948,22 @@ class OneFuseRegulator:
                 or settings.min_charge_amps >= settings.main_fuse_amps or not settings.enable_dynamic_limit):
             raise ValueError("Enabled overload requires dynamic limiting and a separate transition ceiling")
         if previous_settings == settings:
-            if settings.automatic_overload_cycles:
+            if settings.meter_envelope_control or settings.automatic_overload_cycles:
                 self._ensure_automatic_cycle()
+            return
+        if settings.meter_envelope_control:
+            boundary=self._meter_handoff_snapshot() if not previous_settings.meter_envelope_control else None
+            self.settings=settings;self._ensure_automatic_cycle()
+            if self._meter_envelope_policy is not None:
+                self._meter_envelope_policy.import_boundary(self,boundary)
+            if previous_settings!=settings: self._break_automatic_continuity()
             return
         if replace(previous_settings, meter_envelope_control=settings.meter_envelope_control) == settings:
             # An explicit policy handoff is not a new session, electrical
             # epoch, lease or protective zero. Actual authority and all budget
             # history stay intact; ordinary legacy owners leave its path.
+            if previous_settings.meter_envelope_control and not settings.meter_envelope_control:
+                self._meter_to_legacy_boundary()
             self.settings = settings
             if settings.meter_envelope_control and self._meter_envelope_policy is not None:
                 self._meter_envelope_policy.prepare_handoff(self)
@@ -1990,6 +2013,10 @@ class OneFuseRegulator:
 
     def reset(self) -> None:
         # Routine controller resets must not grant another overload budget.
+        if self.settings.meter_envelope_control and self._meter_envelope_policy is not None:
+            self._control_generation+=1;self._retire_active_dispatches()
+            self._break_automatic_continuity()
+            return
         self._committed_normal = None
         self._control_generation += 1
         self._retire_active_dispatches()
@@ -4605,6 +4632,15 @@ class OneFuseRegulator:
 
     def export_overload_state(self) -> dict[str, object]:
         """JSON-safe exposure state; the controller adds its UTC save time."""
+        if self.settings.meter_envelope_control:
+            p=self._get_meter_envelope_policy();e=p.episode
+            normal=p.legacy_normal_history or dict(version=1,response_pending=False,cap=None,previous_offer=None,
+                stops=0,stop_recorded=False,restart=False,retry_wait_seconds=0.,response_failure=None,retry_submission_pending=False)
+            return dict(version=1,used_seconds=self._overload_used_seconds,exposure_active=self._overload_exposure_active,
+                transition_pending=bool(e and e.unresolved),minimum_held=p.state.value=='MINIMUM_HOLD',
+                failure_reason=self._overload_failure_reason,automatic_cycle=deepcopy(self._ensure_automatic_cycle()),
+                normal_control=deepcopy(normal),meter_control=p.export_state(),
+                **({'trial_epoch':deepcopy(self._trial_epoch)} if self._trial_epoch is not None else {}))
         startup = (self._minimum_confirmation if self._minimum_confirmation is not None
                    and self._minimum_confirmation.owner == "startup" else None)
         unresolved = (self._committed_normal if self._committed_normal is not None
@@ -4701,6 +4737,8 @@ class OneFuseRegulator:
         pending response is therefore latched as interrupted, never renewed.
         Invalid persisted state fails closed instead of refunding exposure.
         """
+        if self.settings.meter_envelope_control:
+            return self._import_meter_overload_state(state,elapsed_seconds)
         self.invalidate_readiness("exposure_state_import")
         previous_trial = deepcopy(self._trial_epoch)
         peak_valid = self._restore_peak_response(state)
@@ -5055,7 +5093,7 @@ class OneFuseRegulator:
     def _remember_retired_dispatch(self, plan_id: int, record: dict) -> None:
         """Keep bounded ordering tombstones, never active source ownership."""
         self._retired_dispatch_records[plan_id] = {name: record[name]
-            for name in ("now", "generation", "target", "ttl", "source_id", "controlled_l1_floor")
+            for name in ("now", "generation", "target", "ttl", "source_id", "controlled_l1_floor", "ev_owner", "native_current", "native_source_known")
             if name in record}
         if plan_id > 0:
             self._retired_plan_highwater = max(self._retired_plan_highwater, plan_id)
@@ -5110,11 +5148,12 @@ class OneFuseRegulator:
             return False
         fields = []
         if decision.command == "set_limit" and decision.current_p1 > 0:
-            if decision.mode == "low_grid_alignment":
+            pass
+            if not decision.meter_envelope and decision.mode == "low_grid_alignment":
                 fields.append("_low_grid_attempt_at")
-            elif decision.mode == "normal_shedding":
+            elif not decision.meter_envelope and decision.mode == "normal_shedding":
                 fields.append("_normal_shed_attempt_at")
-            if (decision.current_p1 == self.overload_minimum_current
+            if (not decision.meter_envelope and decision.current_p1 == self.overload_minimum_current
                     and self._overload_transition_started is not None
                     and self._overload_minimum_accepted_at is None):
                 fields.append("_overload_minimum_attempted_at")
@@ -5122,6 +5161,10 @@ class OneFuseRegulator:
             return False
         if inp is not None:
             shadow = deepcopy(self)
+            if decision.meter_envelope:
+                # Observational SDK baseline for a future explicit policy
+                # handoff; it never grants selected control authority.
+                shadow._ev_owner_clocks={}
             shadow._observe_ev_clock(inp)
             wall = None if isinstance(inp.wall_now_ts, bool) else _valid_number(inp.wall_now_ts)
             positive = decision.command == "resume" or decision.command == "set_limit" and decision.current_p1 > 0
@@ -5144,7 +5187,7 @@ class OneFuseRegulator:
             owner = self._committed_normal
             grid, current, gt = (_valid_number(value) for value in
                 (inp.grid_l1, inp.charger_current, inp.grid_report_ts))
-            if (positive and self.settings.peak_only_response and owner is not None
+            if (not decision.meter_envelope and positive and self.settings.peak_only_response and owner is not None
                     and decision.command == "set_limit" and decision.current_p1 != owner.cap
                     and now < owner.lease_expires and owner.source_id == inp.control_source_id
                     and inp.charger_native_committed is True and not inp.charger_snapshot_verified
@@ -5173,6 +5216,8 @@ class OneFuseRegulator:
             self._dispatch_records[decision.plan_id] = {"now": now, "wall": wall,
                 "ttl": decision.ttl_seconds,
                 "source_id": inp.control_source_id, "ev_owner": record,
+                "native_current":_valid_number(inp.charger_current) if inp.charger_native_committed and inp.charger_current_trusted else None,
+                "native_source_known":inp.charger_event_source_known,
                 "controlled_l1_floor": shadow._controlled_l1_boundary(inp),
                 "normal_anchor": normal_anchor,
                 "generation": self._control_generation,
@@ -5201,6 +5246,7 @@ class OneFuseRegulator:
                 or decision.plan_id in self._retired_dispatch_records
                 or 0 < decision.plan_id <= self._retired_plan_highwater):
             return False
+        if decision.meter_envelope: return False
         changed = False
         if (self._ordinary_lower is not None and self._ordinary_lower.accepted_at is None
                 and decision.mode == "ordinary_lower_offer" and decision.current_p1 == self._ordinary_lower.cap
@@ -5262,6 +5308,7 @@ class OneFuseRegulator:
         # Retain unknown-delivery protection, but never retain a failed call
         # as an eternally active target in normal-state source evidence.
         self._retire_active_dispatches(decision.plan_id)
+        if decision.meter_envelope: return False
         if (not self._uncertainty_retry_submission_pending or not self._uncertainty_restart
                 or decision.command != "set_limit" or decision.current_p1 <= 0
                 or decision.recovery_submission_ts is None
@@ -5291,15 +5338,29 @@ class OneFuseRegulator:
             dispatch = self._retired_dispatch_records.get(decision.plan_id)
         elif dispatch is not None:
             self._remember_retired_dispatch(decision.plan_id, dispatch)
-        if decision.meter_envelope and dispatch is None and not obsolete:
+        if (decision.meter_envelope or self.settings.meter_envelope_control) and dispatch is None and not obsolete:
             # A plan, a dry run or a caller's ACK without real SDK entry
             # cannot manufacture a live meter-envelope lease.
             return
+        if dispatch is not None and (decision.meter_envelope or self.settings.meter_envelope_control):
+            order=(dispatch['now'],decision.plan_id)
+            accepted=self._accepted_dispatch_order
+            if self.settings.meter_envelope_control:
+                lease=self._get_meter_envelope_policy().lease
+                if lease.origin is not None and (accepted is None or lease.origin>accepted[0]):
+                    accepted=(lease.origin,0)
+            if accepted is not None and order<=accepted:
+                return
         if (obsolete or decision.current_p1 > 0 and decision.command == "set_limit"
                 and dispatch is not None and (dispatch["generation"] != self._control_generation
                     or dispatch["target"] != (decision.current_p1, decision.current_p2, decision.current_p3))):
             # Record what the API accepted, without letting an obsolete reply
             # retire a newer source/zero/settings barrier or create an owner.
+            if decision.meter_envelope:
+                # The actual entry remains possible authority in LeaseState;
+                # a late obsolete reply cannot overwrite a newer accepted0.
+                self.last_action_ts=now_ts
+                return
             self.last_action_ts = now_ts
             self.last_set_limit_ts = dispatch["now"] if dispatch is not None else now_ts
             self.last_command = "set_limit"
@@ -5311,10 +5372,14 @@ class OneFuseRegulator:
             dispatch = None
         self._ack_dispatch = dispatch
         try:
-            if decision.meter_envelope:
+            if decision.meter_envelope or self.settings.meter_envelope_control and decision.command=='set_limit':
                 self._get_meter_envelope_policy().acknowledge(self, decision, now_ts, dispatch)
+                self._accepted_dispatch_order=(dispatch['now'],decision.plan_id)
+                if not self.settings.meter_envelope_control: self._meter_to_legacy_boundary()
                 return
             self._acknowledge_accepted(decision, now_ts)
+            if dispatch is not None and decision.should_call_service and not decision.dry_run:
+                self._accepted_dispatch_order=(dispatch['now'],decision.plan_id)
             if not decision.should_call_service or decision.dry_run or decision.command is None:
                 return
             if decision.command in {"pause", "resume"} or decision.current_p1 <= 0:
@@ -5930,6 +5995,150 @@ class OneFuseRegulator:
         resend = min(self.settings.resend_limit_every_seconds, ttl / 2)
         return now - self.last_set_limit_ts >= max(1, resend)
 
+    @staticmethod
+    def _meter_settings_valid(s: RegulatorSettings) -> bool:
+        try:
+            if any(type(value) is not bool for value in (s.active_control,s.dry_run,s.overload_enabled)):
+                return False
+            OneFuseRegulator._trial_policy(replace(s,active_control=True,dry_run=False,overload_enabled=True))
+            return bool(type(s.min_charge_amps) is int and type(s.max_charge_amps) is int
+                and type(s.startup_charge_amps) is int and s.startup_charge_amps==7
+                and s.max_charge_amps<=16 and s.normal_ttl_seconds==60 and s.enable_dynamic_limit
+                and s.controlled_phase=='L1' and s.unused_phase_current==0
+                and s.min_seconds_between_actions>=0 and s.restart_stable_seconds>=0
+                and s.resend_limit_every_seconds>0)
+        except (ValueError,TypeError,OverflowError):
+            return False
+
+    def _meter_handoff_snapshot(self) -> dict:
+        """One-time boundary translation; never consulted by selected decisions."""
+        p=self._get_meter_envelope_policy();peak=self._peak_response
+        result={}
+        candidates=(*self._retired_dispatch_records.items(),*self._dispatch_records.items())
+        actual=next((record for plan_id,record in candidates
+            if self._accepted_dispatch_order is not None
+            and (record.get('now'),plan_id)==self._accepted_dispatch_order),None)
+        if actual is None:
+            actual=next((record for _,record in candidates
+                if self.last_target is not None and record.get('now')==self.last_set_limit_ts
+                and record.get('target')==self.last_target[:3]),None)
+        if actual is not None:
+            result['accepted']=dict(cap=actual['target'][0],origin=actual['now'],
+                expires=actual['now']+(actual.get('ttl') or 60.),source_id=actual.get('source_id'),
+                floor=deepcopy(actual.get('controlled_l1_floor')),normal_origin=self._last_limit_change_ts)
+        result['possible']=[(record.get('target',(0,0,0))[0],record['now']+(record.get('ttl') or 60.))
+            for record in (*self._retired_dispatch_records.values(),*self._dispatch_records.values())
+            if record.get('target',(0,0,0))[0]>0]
+        if peak is not None:
+            incoming=dict(source_id=peak.source_id,origin=peak.origin,deadline=peak.deadline,
+                grid_source_ts=peak.grid_source_ts,previous_authority=peak.previous_authority,
+                interrupted=peak.interrupted,failure=self._peak_response_failure)
+            window=self._minimum_confirmation
+            if window is not None and window.owner in {'overload','nominal'}:
+                incoming.update(phase=p.state.__class__.GRID_WAIT,response_ts=window.first_ev_ts,
+                    response_at=(self._normal_shed_response_monotonic if window.owner=='nominal'
+                        else self._overload_minimum_response_monotonic),grid_deadline=window.deadline,
+                    grid_floor=window.floor,current_value=window.value,
+                    ceiling=self.settings.main_fuse_amps-self.settings.buffer_amps if window.owner=='nominal'
+                        else self.settings.main_fuse_amps+self.settings.overload_margin_amps)
+            record=next((record for record in (*self._retired_dispatch_records.values(),*self._dispatch_records.values())
+                if record.get('target',(0,0,0))[0]==7 and record.get('controlled_l1_floor') is not None
+                and record.get('source_id')==peak.source_id and record.get('now')==self.last_set_limit_ts
+                and (peak.origin is None or record['now']>=peak.origin)),None)
+            if record is not None:
+                incoming.update(minimum_dispatch=record['now'],minimum_floor=deepcopy(record['controlled_l1_floor']))
+            result['episode']=incoming
+        cycle=self._automatic_cycle
+        if cycle is not None and cycle['state']=='blocked':
+            result['operational_fault']=cycle['failure_reason'] or 'unresolved_legacy_operational_fault'
+        return result
+
+    def _meter_to_legacy_boundary(self) -> None:
+        """Translate actual SDK evidence only when explicitly leaving policy."""
+        record=next((record for record in (*self._retired_dispatch_records.values(),*self._dispatch_records.values())
+            if record.get('now')==self.last_set_limit_ts and self.last_target is not None
+            and record.get('target')==self.last_target[:3]),None)
+        if record is not None and record.get('ev_owner'):
+            owner=deepcopy(record['ev_owner'])
+            self._ev_owner_clocks['_accepted_control_ev_ts']=owner
+            self._accepted_control_ev_ts=next(iter(owner['baselines'].values()),None)
+        p=self._meter_envelope_policy;e=p.episode if p is not None else None
+        if p is not None and p.operational_fault is None and p.lease.cap>0:
+            # Transfer a real currently accepted normal lease, rather than a
+            # stale legacy startup flag left inert during selected control.
+            self._restart_required=False
+            current=record.get('native_current') if record is not None else None
+            anchor=p.lease.normal_house
+            if anchor is not None and record is not None and current is not None:
+                owner=record.get('ev_owner',{});key=next(iter(owner.get('baselines',{})),None)
+                if key is not None:
+                    self._ev_clock_key=key
+                    receiver=self._native_receiver_scope()
+                    self._ev_established_value=current;self._ev_established_binding=self._accepted_control_source_id
+                    self._ev_established_receiver_scope=receiver
+                    self._ev_established_observation_keys=frozenset(owner.get('vectors',{}))
+                    self._ev_established_source_known=bool(record.get('native_source_known'))
+                    original=p.lease.normal_origin if p.lease.normal_origin is not None else p.lease.origin
+                    self._committed_normal=CommittedNormalAuthority(p.lease.cap,self._accepted_control_source_id,
+                        original,p.lease.expires,anchor,receiver,
+                        observation_deadline=min(original+self.settings.measurement_settle_seconds,p.lease.expires),
+                        native_floor=current,native_observation_keys=tuple(owner.get('vectors',{})),
+                        native_source_known=bool(record.get('native_source_known')))
+        if e is not None and e.unresolved:
+            self._peak_response=PeakResponseOwner(e.source_id,e.origin,e.deadline,e.grid_source_ts,
+                int(ceil(e.previous_authority)),e.interrupted)
+            self._peak_response_failure=e.failure
+
+    def meter_control_diagnostics(self) -> dict:
+        return self._get_meter_envelope_policy().diagnostics(self)
+
+    def meter_zero_current_evidence(self, inp: RegulatorInput) -> Optional[float]:
+        if not self.settings.meter_envelope_control: return None
+        shadow=deepcopy(self)
+        return shadow._get_meter_envelope_policy().zero_current_evidence(shadow,inp)
+
+    def meter_positive_authority_ended(self, inp: RegulatorInput) -> bool:
+        """Finite command-expiry proof; deliberately not a physical OFF claim."""
+        if not self.settings.meter_envelope_control: return False
+        shadow=deepcopy(self);p=shadow._get_meter_envelope_policy();now=_valid_number(inp.now_ts)
+        if now is None or p.critical_error(shadow,inp) is not None: return False
+        p.observe_positive_authority(shadow,inp,now,p.lease.live(now))
+        return bool(p.lease.cap==0 and p.lease.zero_dispatch is not None
+            and p.lease.origin is not None and p.lease.origin>=p.lease.zero_dispatch
+            and not p.lease.cold_pending and not p.lease.possible_positive)
+
+    def meter_overload_admitted(self, inp: RegulatorInput, decision: RegulatorDecision) -> bool:
+        if not self.settings.meter_envelope_control or not decision.meter_envelope: return False
+        shadow=deepcopy(self);fresh=shadow.evaluate(inp)
+        return bool(fresh.meter_zero_cause is None and fresh.meter_overload_authority
+            and fresh.current_p1>=decision.current_p1)
+
+    def _import_meter_overload_state(self,state:object,elapsed_seconds:float=0.) -> bool:
+        used=state.get('used_seconds') if isinstance(state,dict) else None
+        gap=_valid_number(elapsed_seconds) if not isinstance(elapsed_seconds,bool) else None
+        valid=bool(isinstance(state,dict) and type(state.get('version')) is int and state['version']==1 and type(used) in (int,float)
+            and _valid_number(used) is not None and used>=0 and gap is not None and gap>=0
+            and all(type(state.get(key)) is bool for key in ('exposure_active','transition_pending','minimum_held'))
+            and (state.get('failure_reason') is None or isinstance(state['failure_reason'],str)))
+        if not valid:
+            self._overload_used_seconds=max(self._overload_used_seconds,float(self.settings.overload_budget_seconds))
+            self._overload_failure_reason=self._overload_failure_reason or 'invalid_persisted_exposure'
+            c=self._ensure_automatic_cycle();c.update(state='exhausted',used_seconds=max(c['used_seconds'],self.settings.overload_budget_seconds),failure_reason='invalid_persisted_exposure')
+            return False
+        self._overload_used_seconds=max(self._overload_used_seconds,float(used)+(gap if state['exposure_active'] else 0.))
+        self._overload_exposure_active=state['exposure_active'];self._overload_last_eval_ts=None
+        self._overload_failure_reason=self._overload_failure_reason or state['failure_reason']
+        if 'trial_epoch' in state:
+            self._trial_epoch=deepcopy(state['trial_epoch'])
+        cycle=state.get('automatic_cycle')
+        automatic=bool(cycle is None or isinstance(cycle,dict) and type(cycle.get('version')) is int and cycle['version']==1)
+        automatic=self._restore_automatic_cycle(state,gap,state['exposure_active']) and automatic
+        self._ensure_automatic_cycle()
+        restored=self._get_meter_envelope_policy().restore_state(self,state)
+        if not restored:
+            c=self._ensure_automatic_cycle();c.update(state='exhausted',used_seconds=max(c['used_seconds'],self.settings.overload_budget_seconds))
+        return automatic and restored
+
     def _controlled_l1_context(self, inp: RegulatorInput) -> bool:
         e=inp.controlled_l1
         if (isinstance(e,ControlledL1Evidence)
@@ -6099,6 +6308,12 @@ class OneFuseRegulator:
             return decision.command == "set_limit" and decision.current_p1 > 0
         if decision.command != "set_limit" or decision.current_p1 <= 0:
             return decision.current_p1 == 0 and decision.meter_zero_cause is not None
+        if fresh.command!='set_limit' or fresh.current_p1<=0:
+            return False
+        if latest.status in PAUSED_STATUSES | {'awaiting_smart_start','awaiting_scheduled_start',
+                'awaiting_authorization','de_authorizing','authenticating','paused_due_to_equalizer',
+                'waiting_for_schedule','stop_charging'}:
+            return False
         if fresh.current_p1 >= decision.current_p1:
             return True
         # A benign completion/pause during an already planned circuit write

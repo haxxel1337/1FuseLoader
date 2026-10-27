@@ -79,7 +79,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
         completed = self.step(6., 28.5, 7.1, 4.8, 6.)
         self.assertEqual(completed.current_p1, 7)
         self.assertIsNone(completed.meter_zero_cause)
-        self.assertIsNone(self.r._peak_response)
+        self.assertFalse(self.r.peak_response_active)
 
     def test_original_genuine_minimum_and_grid_deadline_survive_handoff(self):
         self.step(3., 35., 16.1, 2., 3.)
@@ -94,7 +94,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
         self.assertEqual(self.r.last_set_limit_ts, original_lease)
         completed = self.step(6., 28.5, 7.1, 3.8, 6.)
         self.assertIsNone(completed.meter_zero_cause)
-        self.assertIsNone(self.r._peak_response)
+        self.assertFalse(self.r.peak_response_active)
         after_old_response_deadline = self.step(13., 28.5, 7.1, 3.8, 13.)
         self.assertEqual(after_old_response_deadline.current_p1, 7)
         self.assertIsNone(after_old_response_deadline.meter_zero_cause)
@@ -149,7 +149,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
         self.assertEqual(r.last_set_limit_ts, original_lease)
         completed = tick(48., 21.3, 48.)
         self.assertIsNone(completed.meter_zero_cause)
-        self.assertIsNone(r._peak_response)
+        self.assertFalse(r.peak_response_active)
         later = tick(50., 21.3, 50.)
         self.assertIsNone(later.meter_zero_cause)
 
@@ -171,7 +171,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
         _, completed = fixture.sample(r, 14., 28.5, 7.1,
             receipt=11.8, sequence=3)
         self.assertIsNone(completed.meter_zero_cause)
-        self.assertIsNone(r._peak_response)
+        self.assertFalse(r.peak_response_active)
         _, later = fixture.sample(r, 20., 28.5, 7.1,
             receipt=11.8, sequence=3)
         self.assertEqual(later.current_p1, 7)
@@ -189,13 +189,13 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
                     receipt=12.9, sequence=4, grid_at=12., accept=False)
                 self.assertIsNone(changed.meter_zero_cause)
                 self.assertEqual(changed.grid_confirmation_deadline_ts, original_deadline)
-                self.assertIsNotNone(r._peak_response)
+                self.assertTrue(r.peak_response_active)
                 self.assertFalse(changed.should_call_service)
                 _, later_grid = fixture.sample(r, 20., final_grid, 7.4,
                     receipt=12.9, sequence=4, grid_at=13.5, accept=False)
                 if final_grid <= 29.:
                     self.assertIsNone(later_grid.meter_zero_cause)
-                    self.assertIsNone(r._peak_response)
+                    self.assertFalse(r.peak_response_active)
                     self.assertEqual(later_grid.current_p1, 7)
                 else:
                     self.assertEqual(later_grid.meter_zero_cause,
@@ -204,7 +204,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
     def test_fresh_normal_meter_can_renew_real_seven_without_erasing_original_peak(self):
         fixture = meter.MeterEnvelopePolicyTests()
         r = fixture.peak()
-        peak = r._peak_response
+        peak = r._get_meter_envelope_policy().episode
         renewals = 0
         for at in (12., *map(float, range(15, 225, 5))):
             _, decision = fixture.sample(r, at, 18., 16.1,
@@ -214,7 +214,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
             self.assertEqual(decision.current_p1, 7)
             self.assertEqual(r.last_target[0], 7)
             self.assertIsNone(decision.nominal_response_deadline_ts)
-            self.assertIs(r._peak_response, peak)
+            self.assertIs(r._get_meter_envelope_policy().episode, peak)
             self.assertEqual((peak.origin, peak.deadline), (10., 20.))
             self.assertGreaterEqual(r._get_meter_envelope_policy().upper, 16.)
             renewals += decision.should_call_service
@@ -224,7 +224,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
             meter_ev_health=meter.logic.SourceHealth(False, 'late_native'))
         self.assertEqual(returned_peak.meter_zero_cause,
             meter.logic.ElectricalStopCause.PEAK_RESPONSE_TIMEOUT.value)
-        self.assertIs(r._peak_response, peak)
+        self.assertIs(r._get_meter_envelope_policy().episode, peak)
         self.assertEqual(peak.deadline, 20.)
 
     def test_normal_meter_exception_requires_an_actual_accepted_minimum(self):

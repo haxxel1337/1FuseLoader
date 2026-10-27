@@ -229,6 +229,8 @@ class OneFuseSensor(SensorEntity):
         meter_sources = {name: self.controller.source_diagnostics[name] for name in (
             "meter_envelope_control", "meter_control_health", "meter_estimate_quality",
             "meter_grid_valid", "meter_actuator_valid", "meter_ev_valid",
+            "meter_control_state", "meter_episode_id", "meter_operational_fault",
+            "meter_recovery_stage",
             "controlled_l1_observed_current", "controlled_l1_received_at_utc",
             "controlled_l1_source_at_utc", "controlled_l1_output_phase",
             "controlled_l1_mapping_epoch", "controlled_l1_mapping_adopted_at_utc",

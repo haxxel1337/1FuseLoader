@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.0b42
+
+- Rework selected meter control around one explicit electrical episode and
+  separate normal, reduction, grid-confirmation, minimum-hold and recovery
+  states. Legacy estimator and response owners no longer control this path.
+- Separate recovery from a resolved operational fault from replenishing the
+  overload budget. Full measured normal recovery can release an unspent
+  blocked cycle while retaining its id, consumed exposure and fault history.
+  Exhausted budget still requires the full existing below-23 A rearm interval.
+- Keep ordinary meter regulation usable with experimental overload disabled;
+  the overload switch gates extra permission rather than normal operation.
+- Keep original electrical deadlines, mapped-L1 evidence, finite actual SDK
+  leases, delivery barriers, durable accounting and manual session intent.
+  Add independent controller and plant scenarios for recovery and true stops.
+- Resume the same unsent proposal after a slow verified checkpoint instead of
+  starving it with moving snapshots. Retain only existing finite authority
+  while waiting; critical faults and original deadlines still preempt it.
+- Order accepted authority by actual dispatch so an obsolete positive reply
+  cannot replace a newer off command or fabricate a fresh lease.
+
 ## 0.4.0b41
 
 - Compare controlled-L1 provider timestamps only with their own captured

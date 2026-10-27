@@ -405,15 +405,15 @@ class B40ControlledPhaseControllerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_normal_uncertainty_holds_real_seven_across_ttls_without_refunding_old_peak(self):
         r=await self.peak()
-        original=r._peak_response
+        original=r._get_meter_envelope_policy().episode
         for at in range(210,431,5):
             await self.tick(float(at),18.)
             self.assertIsNone(self.controller.last_decision.meter_zero_cause)
             self.assertEqual(r.last_target[0],7)
-            self.assertEqual(r._peak_response.deadline,original.deadline)
+            self.assertEqual(r._get_meter_envelope_policy().episode.deadline,original.deadline)
         returned=await self.tick(435.,28.5)
         self.assertEqual(returned.meter_zero_cause,'peak_response_timeout')
-        self.assertAlmostEqual(r._peak_response.deadline,210.)
+        self.assertAlmostEqual(r._get_meter_envelope_policy().episode.deadline,210.)
 
     async def fault_zero(self):
         r=await self.peak()
@@ -466,15 +466,43 @@ class B40ControlledPhaseControllerTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_positive_delivery_is_not_a_new_live_or_recovered_lease(self):
         r=await self.boot()
         previous=(r.last_target,r.last_set_limit_ts)
+        before=r.export_overload_state()
+        unknown_at=200.771116
         self.sdk_failure=RuntimeError('synthetic_unknown_sdk_outcome')
-        await self.tick(200.771116,31.,reported=200.)
+        await self.tick(unknown_at,31.,reported=200.)
         self.assertEqual((r.last_target,r.last_set_limit_ts),previous)
+        unknown=next(row for row in reversed(self.sdk_calls) if row['cap']==7)
+        self.assertEqual(unknown['ttl'],60)
         self.sdk_failure=None
         self.sdk_calls.clear()
         for at in range(205,401,5):
             await self.tick(float(at),13.3,status='awaiting_start')
-        self.assertFalse(any(row['cap']>0 for row in self.sdk_calls))
+        # A new normal9 allocation can start only after every original
+        # possible-positive horizon AND the continuous normal restart time.
+        # This actual SDK is not acceptance/recovery of the unknown7 request.
+        positives=[row for row in self.sdk_calls if row['cap']>0]
+        self.assertTrue(positives,self.controller.last_decision)
+        earliest=max(unknown['at']+unknown['ttl'],previous[1]+previous[0][3],
+                     205.+r.settings.restart_stable_seconds)
+        self.assertTrue(all(row['at']>=earliest for row in positives),positives)
+        self.assertTrue(all(row['cap']==9 and row['ttl']==60 and row['phases']==(9,0,0)
+                            for row in positives),positives)
+        self.assertLessEqual(13.3+9.,r.settings.main_fuse_amps-r.settings.buffer_amps)
         self.assertTrue(any(row['cap']==0 for row in self.sdk_calls))
+        self.assertEqual(r.last_target[0],9)
+        # ACK of normal9 still cannot release the operational fault without
+        # a NEW mapped phase response followed by later coherent RAW.
+        diag=r.meter_control_diagnostics()
+        self.assertTrue(diag['recovery_required'])
+        self.assertIsNotNone(diag['operational_fault'])
+        self.assertFalse(self.controller.last_decision.meter_overload_authority)
+        saved=r.export_overload_state()
+        self.assertEqual(saved['automatic_cycle']['cycle_id'],before['automatic_cycle']['cycle_id'])
+        self.assertGreaterEqual(saved['automatic_cycle']['used_seconds'],before['automatic_cycle']['used_seconds'])
+        self.assertGreaterEqual(saved['used_seconds'],before['used_seconds'])
+        self.assertEqual(saved['automatic_cycle']['state'],'blocked')
+        self.assertIsNotNone(saved['automatic_cycle']['failure_reason'])
+        self.assertTrue(any(not event['resolved'] for event in saved['meter_control']['history']))
 
 
 if __name__=='__main__':

@@ -50,6 +50,37 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Standalone meter control and operational recovery (b42)
+
+The selected meter policy has one active electrical episode and five primary
+states: normal operation, reducing, grid confirmation, minimum hold and stop
+recovery. It keeps actual accepted/possibly delivered SDK authority, current
+fault recovery, cumulative exposure and incident history separate. The default
+legacy policy remains available for entries that have not selected meter
+control. Selecting the new policy does not enable writes or refill a budget.
+
+A historical timeout is not a current electrical fault. A blocked **unspent**
+cycle can recover after healthy bound sources, retirement of earlier possible
+positive authority, the configured stable normal restart interval, an actual
+accepted normal command, a new qualified mapped-L1 response and later coherent
+normal grid feedback. This retains the same cycle id, used seconds, lifetime
+exposure and historical record. It does not create a new overload period.
+An exhausted cycle still needs 30 continuous observed minutes strictly below
+23 A to replenish its budget. Operational recovery is not a fuse cooling model.
+
+Ordinary meter control does not require the old estimator/peak/automatic-cycle
+flags. Experimental Timed Overload gates extra overload permission; selected
+meter control owns its automatic exposure accounting. Manual trial actions are
+unavailable in this mode. Numerical installation bounds and finite leases
+remain enforced. Unknown EV estimates suppress unsafe increases while an
+independently allowed normal lease can continue.
+
+The existing 38 A/10-second transition describes reducing a higher or
+unverified offer, followed by at most 30 seconds for grid confirmation after
+a genuine minimum response. This update does not grant every new spike above
+29 A another window when 7 A is already verified. Actual source/control faults,
+unknown delivery, lease expiry and electrical limits still have stop authority.
+
 ### Controlled L1 evidence and post-zero recovery (b40)
 
 The selected meter policy distinguishes aggregate input RMS from current on

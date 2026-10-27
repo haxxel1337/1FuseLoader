@@ -54,13 +54,14 @@ class OneFuseButton(ButtonEntity):
     def available(self) -> bool:
         return not (
             self.entity_description.key in {"start_overload_trial", "end_overload_trial"}
-            and self.controller.settings.automatic_overload_cycles
+            and (self.controller.settings.automatic_overload_cycles
+                 or getattr(self.controller.settings, "meter_envelope_control", False))
         )
 
     async def async_press(self) -> None:
         if not self.available:
             raise ServiceValidationError(
-                "Manual overload trial controls are unavailable while Automatic Overload Cycles is enabled."
+                "Manual overload trial controls are unavailable in automatic or standalone meter control."
             )
         if self.entity_description.key == "reset_state":
             await self.controller.async_reset_state()
