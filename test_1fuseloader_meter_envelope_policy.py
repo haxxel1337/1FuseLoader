@@ -8,7 +8,25 @@ logic=native.logic
 EPOCH=native.EPOCH
 
 class MeterEnvelopePolicyTests(unittest.TestCase):
-    frame=native.PositiveRampOwnerTests.frame
+    def frame(self,now,grid=22.6,current=1.8,*,receipt=67.,sequence=1,**metadata):
+        """Synthetic N+L1 installation with an independently explicit witness.
+
+        The old aggregate fixture alone no longer certifies the controlled
+        phase. Missing/invalid native quality deliberately supplies no witness.
+        Production does not default a missing mapping to this test setup.
+        """
+        inp=native.PositiveRampOwnerTests.frame(self,now,grid,current,
+            receipt=receipt,sequence=sequence,**metadata)
+        quality=inp.meter_ev_health
+        if (receipt is None or current is None or not inp.charger_native_committed
+                or inp.charger_snapshot_verified or inp.charger_publication_pending
+                or not inp.charger_current_trusted or quality is not None and not quality.valid):
+            return inp
+        return replace(inp,controlled_l1=logic.ControlledL1Evidence(
+            current=current,received_at_ts=EPOCH+receipt,sequence=sequence,
+            evidence_credit=True,source_id=inp.control_source_id,
+            receiver_identity=(100,101),mapping_epoch=1,output_phase=10,
+            mapping_adopted_at_ts=EPOCH-1.,mapping_sequence=1))
 
     def regulator(self, **changes):
         options=dict(active_control=True,dry_run=False,meter_envelope_control=True,

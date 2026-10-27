@@ -50,6 +50,37 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Controlled L1 evidence and post-zero recovery (b40)
+
+The selected meter policy distinguishes aggregate input RMS from current on
+the phase it controls. Easee documents output mode `110 = 10` as TN single-phase
+N+L1 on T2/T3; its observation table describes T2/182 as calculated input RMS
+and T3/183 as input current RMS. A validated live mode-10 mapping can therefore
+supply separate T3 evidence for controlled L1. This is not a minimum-of-all-
+terminals rule. See [output phases](https://developer.easee.com/docs/enumerations)
+and [terminal observations](https://developer.easee.com/docs/amqp-connect).
+
+Mapped L1 evidence retains its own native receipt, sequence, provider ordering
+and mapping identity. A phase/context update is not a new current sample.
+Cached state, pilot offer, HTTP acknowledgement and cloud GET cannot prove a
+post-dispatch current response. Unknown, changed, IT or multiphase mappings
+do not inherit this narrow L1 capability. Stable valid mapping need not change
+every time current changes.
+
+Aggregate MAX remains a distinct diagnostic/upper bound. It cannot be blindly
+subtracted from grid L1: an inflated neutral value would understate house load.
+A higher offer needs independently eligible mapped L1 and coherent later grid
+evidence. Response proof alone grants no increase and no new response window.
+Legacy control retains its separate representation.
+
+After a protective zero, only real possible positive commands can own a
+positive uncertainty horizon. Sending or acknowledging another zero cannot
+move it forward. Genuine physical-off evidence or expiry of the original
+possible-positive horizon can retire active uncertainty; fresh normal
+headroom and the existing restart interval then govern ordinary recovery.
+Historical faults, blocked/spent overload permission, exposure and user pauses
+remain distinct and are preserved.
+
 ### Separate meter-envelope policy (b39, explicit opt-in)
 
 `meter_envelope_control` selects a separate controller. It defaults to **off**

@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0b40
+
+- Keep aggregate input-current diagnostics separate from a validated controlled
+  L1 observation. Under documented TN output mode 10, native terminal T3/183
+  supplies L1 evidence with its own receipt, sequence and mapping epoch;
+  calculated neutral T2 is not substituted for the controlled phase.
+- Require actual mapped-phase evidence after dispatch for minimum response,
+  and independently eligible mapped L1 plus coherent grid data for EV
+  subtraction or increases. Unknown, switched or unsupported arrangements
+  cannot acquire this capability from cached values, pilot current or a
+  different terminal with a lower reading. Legacy aggregate behavior remains
+  separate.
+- Anchor unresolved positive authority to actual possible positive dispatches
+  and their original finite horizons. Repeated zero acknowledgements cannot
+  extend positive uncertainty or continually restart normal recovery.
+  Preserve genuine delivery barriers, historical failures and overload
+  accounting while allowing separately safe ordinary restart.
+- Preserve already qualified mapped response and fixed confirmation through
+  legitimate same-source handoffs. Capture observational phase floors in
+  legacy SDK records without changing legacy decisions, and invalidate older
+  off evidence on every later positive dispatch, including unknown outcomes.
+- Preserve the original electrical response and grid-confirmation deadlines,
+  actual grid limits, finite leases, overload admission and automatic recovery
+  conditions. Add native-to-controller regressions for terminal mapping and
+  post-zero recovery.
+
 ## 0.4.0b39
 
 - Add an explicit, separate meter-envelope control policy for the existing

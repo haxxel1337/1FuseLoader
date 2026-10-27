@@ -15,6 +15,7 @@ import test_1fuseloader_connected_full_readiness_controller as connected
 import test_1fuseloader_disconnected_readiness_runtime as ready
 import test_1fuseloader_runtime as fixtures
 from test_1fuseloader_ha_current_representation import float32
+import test_1fuseloader_b40_fixture_evidence as phase_fixture
 
 
 class MeterEnvelopeControllerTests(unittest.IsolatedAsyncioTestCase):
@@ -42,6 +43,7 @@ class MeterEnvelopeControllerTests(unittest.IsolatedAsyncioTestCase):
         # failing only because its Settings constructor lacks the new field.
         if 'meter_envelope_control' in {f.name for f in fields(fixtures.logic.RegulatorSettings)}:
             self.configure(meter_envelope_control=True)
+        phase_fixture.install(self,adopted=90.)
 
     async def sample(self, at, raw, current=None, receipt=None, status='charging'):
         if current is None:

@@ -79,10 +79,26 @@ class MeterSourceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(inp.meter_actuator_health.valid, inp.meter_actuator_health)
 
     def test_new_policy_receives_separate_source_classes(self):
+        # This case has explicitly mapped native L1 evidence. The aggregate
+        # MAX-only case below must not silently assume the same phase context.
+        self.adapter.native_controlled_l1_observation = SimpleNamespace(
+            current=8., received_at=self.wall(99), sequence=1, evidence_credit=True,
+            source_identity=self.owner, mapping_epoch=1, output_phase=10,
+            mapping_adopted_at=self.wall(98), mapping_sequence=1,
+            source_at=self.wall(99), source_highwater_at=self.wall(99),
+            mapping_source_at=self.wall(98), mapping_source_highwater_at=self.wall(98),
+            error=None, observation_id=183, committed=True, current_error=None)
         inp = self.controller._read_input()
         self.assert_critical_sources_valid(inp)
         self.assertTrue(inp.meter_ev_health.valid)
         self.assertEqual(inp.charger_report_ts, self.wall(99).timestamp())
+
+    def test_selected_max_only_adapter_has_no_mapped_l1_increase_credit(self):
+        inp = self.controller._read_input()
+        self.assert_critical_sources_valid(inp)
+        self.assertFalse(inp.meter_ev_health.valid)
+        self.assertIsNone(inp.controlled_l1)
+        self.assertEqual(inp.charger_current, 8.)
 
     def test_invalid_native_vector_is_ev_quality_not_a_grid_or_actuator_fault(self):
         self.native.error = "synthetic_invalid_observation_vector"

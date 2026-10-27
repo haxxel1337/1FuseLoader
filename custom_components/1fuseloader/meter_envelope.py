@@ -39,8 +39,16 @@ class ElectricalSupervisor:
         if not isinstance(cause, self.cause_type):
             raise TypeError("A typed electrical stop cause is required")
         regulator._restart_required = True
+        repeated_historical=bool(policy.recovering and regulator.last_target is not None
+            and regulator.last_target[0]==0 and number(inp.grid_l1) is not None
+            and number(inp.grid_l1)<=regulator.settings.main_fuse_amps
+            and policy.critical_error(regulator,inp) is None
+            and cause in {self.cause_type.PEAK_RESPONSE_TIMEOUT,
+                self.cause_type.GRID_CONFIRMATION_TIMEOUT,self.cause_type.GRID_CEILING,
+                self.cause_type.OVERLOAD_BUDGET,self.cause_type.OVERLOAD_NOT_ADMITTED})
         policy.recovering = True
-        policy.start_since = None
+        if not repeated_historical:
+            policy.start_since = None
         if cause in {self.cause_type.PEAK_RESPONSE_TIMEOUT,
                      self.cause_type.GRID_CONFIRMATION_TIMEOUT,
                      self.cause_type.GRID_CEILING,
@@ -87,12 +95,32 @@ class MeterEnvelopePolicy:
         self.confirmation_ceiling = None
         self.confirmation_value = None
         self.confirmation_grid_floor = None
+        self.l1 = None
+        self.accepted_l1_floor = None
+        self.minimum_l1_floor = None
+        self.zero_l1_floor = None
+        self.possible_positive = {}
+        self.saved_handoff = None
 
-    def prepare_handoff(self):
+    def prepare_handoff(self,r):
         """Re-adopt actual electrical phase on every explicit policy handoff."""
+        self.saved_handoff=None
+        if (r._peak_response is not None and r.last_target is not None
+                and r.last_target[0]==r.startup_current
+                and self.minimum_dispatch is not None
+                and r.last_set_limit_ts>=self.minimum_dispatch
+                and (r._last_limit_change_ts is None or r._last_limit_change_ts<=self.minimum_dispatch)
+                and self.minimum_dispatch>=r._peak_response.origin
+                and self.minimum_l1_floor is not None):
+            self.saved_handoff=dict(peak=r._peak_response,dispatch=self.minimum_dispatch,
+                floor=deepcopy(self.minimum_l1_floor),accepted=deepcopy(self.accepted_l1_floor),
+                response_ts=self.response_ts,response_at=self.response_at,
+                deadline=self.confirmation_deadline,ceiling=self.confirmation_ceiling,
+                value=self.confirmation_value,grid_floor=self.confirmation_grid_floor)
         self.started=False
         self.minimum_verified=False
         self.minimum_dispatch=self.minimum_floor=None
+        self.accepted_l1_floor=self.minimum_l1_floor=None
         self.response_ts=self.response_at=self.confirmation_deadline=None
         self.confirmation_value=self.confirmation_grid_floor=None
         self.confirmation_ceiling=self.adopted_phase=None
@@ -113,10 +141,32 @@ class MeterEnvelopePolicy:
             response_at=number(r._overload_minimum_response_monotonic)
         self.minimum_dispatch=accepted
         self.minimum_floor=floor
+        saved=self.saved_handoff
+        dispatch_origin=saved['dispatch'] if saved is not None else r.last_set_limit_ts
+        record=next((record for record in (*r._dispatch_records.values(),*r._retired_dispatch_records.values())
+            if record.get('now')==dispatch_origin and record.get('target',(0,0,0))[0]==r.startup_current
+            and record.get('source_id')==inp.control_source_id
+            and record.get('controlled_l1_floor') is not None
+            and record['now']>=r._peak_response.origin),None)
+        if record is not None:
+            self.minimum_dispatch=record['now']
+            self.minimum_l1_floor=deepcopy(record['controlled_l1_floor'])
+            self.accepted_l1_floor=deepcopy(self.minimum_l1_floor)
+        if (saved is not None and record is not None and saved['peak']==r._peak_response
+                and saved['dispatch']==record['now'] and saved['floor']==self.minimum_l1_floor
+                and r._controlled_l1_context(inp)
+                and r._controlled_l1_key(inp.controlled_l1)==saved['floor']['key']):
+            self.response_ts=saved['response_ts'];self.response_at=saved['response_at']
+            self.confirmation_deadline=saved['deadline'];self.confirmation_ceiling=saved['ceiling']
+            self.confirmation_value=saved['value'];self.confirmation_grid_floor=saved['grid_floor']
+            self.accepted_l1_floor=saved['accepted']
+            self.saved_handoff=None
+            return
+        self.saved_handoff=None
         if (window is not None and owner in {'overload','nominal'}
                 and window.source_id==inp.control_source_id
                 and window.cap==r.startup_current and r.last_target[0]==r.startup_current
-                and accepted is not None):
+                        and accepted is not None):
             self.adopted_phase=owner
             self.response_ts=window.first_ev_ts
             self.response_at=response_at if response_at is not None else now-(wall-window.first_ev_ts)
@@ -175,7 +225,9 @@ class MeterEnvelopePolicy:
             meter_state=mode, meter_normal_retention=bool(cap>0 and not cause and
                 (normal_retention or raw is not None and raw<=s.main_fuse_amps)),
             meter_overload_authority=overload, meter_ordinary_decrease=ordinary_decrease,
-            meter_basis_grid_ts=number(inp.grid_report_ts))
+            meter_basis_grid_ts=number(inp.grid_report_ts),
+            controlled_l1_current=self.l1.current if self.l1 is not None else None,
+            controlled_l1_used=basis=='eligible_mapped_l1_then_meter' or mode in {'meter_grid_wait'})
         r._last_decision = d
         return d
 
@@ -284,15 +336,49 @@ class MeterEnvelopePolicy:
         r._last_input_snapshot_verified=inp.charger_snapshot_verified
         self.last_ev_error=(inp.meter_ev_health.reason if inp.meter_ev_health and not inp.meter_ev_health.valid else r._ev_clock_error)
 
-    def ev_estimate(self, r, inp, ev_valid):
-        raw,ev,gt,et,wall=map(number,(inp.grid_l1,inp.charger_current,inp.grid_report_ts,inp.charger_report_ts,inp.wall_now_ts))
-        return bool(ev_valid and r._ev_clock_error is None and inp.charger_native_committed is True
-            and not inp.charger_snapshot_verified and not inp.charger_publication_pending
-            and inp.charger_increase_ready is True and ev is not None and 1<=ev<=16.5
-            and et is not None and 0<=wall-et<=r.settings.max_sensor_age_seconds
+    def ev_estimate(self, r, inp, ev_valid=None):
+        """Only independently mapped L1 may be subtracted from RAW L1."""
+        raw,gt,wall=map(number,(inp.grid_l1,inp.grid_report_ts,inp.wall_now_ts))
+        e=self.l1
+        ev,et=(e.current,e.received_at_ts) if e is not None else (None,None)
+        return bool(e is not None and 1<=ev<=16.5
+            and 0<=wall-et<=r.settings.max_sensor_age_seconds
             and gt>et and abs(gt-et)<=r.settings.measurement_settle_seconds
-            and ev<=raw+1 and r._ev_established_value==ev
-            and r._event_source_usable())
+            and ev<=raw+1)
+
+    def note_dispatch(self,r,d,record):
+        """Only actual SDK entry creates possible positive electrical authority."""
+        if d.command=='set_limit' and d.current_p1>0:
+            # A possibly delivered positive request invalidates every earlier
+            # OFF witness, even if its HTTP outcome will remain ambiguous.
+            self.zero_l1_floor=None
+            self.possible_positive[d.plan_id]=(d.current_p1,record['now']+d.ttl_seconds)
+            self.upper=max(self.upper,d.current_p1)
+            while len(self.possible_positive)>128:
+                oldest=min(self.possible_positive,key=lambda key:self.possible_positive[key][1])
+                self.possible_positive.pop(oldest)
+        elif d.command=='set_limit' and d.current_p1==0 and self.zero_l1_floor is None:
+            self.zero_l1_floor=record.get('controlled_l1_floor')
+
+    def observe_positive_authority(self,r,now,live):
+        if self.cold_unknown_pending and now>=self.cold_upper_until:
+            self.cold_unknown_pending=False
+        active=[value for value in self.possible_positive.values() if now<value[1]]
+        off=bool(not live and r.last_target is not None and r.last_target[0]==0
+            and self.l1 is not None and self.l1.current<=.5
+            and r._controlled_l1_after(self.l1,self.zero_l1_floor))
+        if off:
+            self.possible_positive.clear();self.cold_unknown_pending=False
+            active=[]
+        if not live and not active and not self.cold_unknown_pending:
+            # The active electrical uncertainty ends; historical failures and
+            # the blocked/spent cumulative cycle deliberately remain intact.
+            self.upper=0.
+            r._peak_response=None;r._peak_response_failure=None
+            self.retire_minimum_phase(r)
+            self.response_ts=self.response_at=self.confirmation_deadline=None
+            self.minimum_dispatch=self.minimum_floor=self.minimum_l1_floor=None
+        return bool(active or self.cold_unknown_pending)
 
     def observe_inflight(self,r,inp,decision):
         """Remember the FIRST real high meter report while an SDK awaits.
@@ -338,14 +424,24 @@ class MeterEnvelopePolicy:
             and inp.charger_current_trusted is True and number(inp.charger_current) is not None
             and number(inp.charger_current)>=0)
         self.observe_input(r,inp,ev_valid)
+        self.l1=r._controlled_l1_projection(inp)
         ev_valid=ev_valid and r._ev_clock_error is None
-        ev=number(inp.charger_current) if ev_valid else None
+        ev=self.l1.current if self.l1 is not None else None
         status=r._last_input_status
         live=bool(r.last_target and r.last_target[0]>0 and r.last_set_limit_ts is not None
             and 0<=now-r.last_set_limit_ts<r.last_target[3])
         if r.last_target and r.last_target[0]>0 and not live:
             return self.supervisor.zero(self,r,inp,C.LEASE_EXPIRED)
         if not self.started:
+            if r.last_target is not None and r.last_target[0]==0:
+                self.recovering=True
+            for record in (*r._retired_dispatch_records.values(),*r._dispatch_records.values()):
+                target=record.get('target',(0,0,0))
+                if target[0]>0 and number(record.get('now')) is not None:
+                    ttl=number(record.get('ttl')) or max(60.,s.normal_ttl_seconds,s.soft_ttl_seconds)
+                    self.possible_positive[('adopt',record['now'],target[0])]=(target[0],record['now']+ttl)
+            if live:
+                self.possible_positive[('accepted',r.last_set_limit_ts)]=(r.last_target[0],r.last_set_limit_ts+r.last_target[3])
             self.upper=max(self.upper,r._committed_current_upper(),r._peak_whole_authority(),
                 r.last_target[0] if r.last_target else 16)
             if not live:
@@ -362,8 +458,7 @@ class MeterEnvelopePolicy:
                 # ordinary legacy measurement owners remain outside this path.
                 self.adopt_minimum_phase(r,inp,now,wall)
             self.started=True
-        if not live and self.cold_unknown_pending and now>=self.cold_upper_until:
-            self.upper=0.;self.cold_unknown_pending=False
+        uncertain_positive=self.observe_positive_authority(r,now,live)
         cap=r.last_target[0] if live else 0
         self.upper=max(self.upper,cap)
         if raw>min(38.,s.overload_transition_limit_amps):
@@ -373,6 +468,17 @@ class MeterEnvelopePolicy:
         if status in manual:
             return self.decision(r,inp,'meter_wait',cap,
                 reason='Charger/user pause, authorization or schedule owns the session; no positive write or resume.')
+        if self.recovering and cap==0:
+            candidate=int(floor(min(s.max_charge_amps,s.main_fuse_amps-s.buffer_amps-raw)))
+            if raw>s.main_fuse_amps or candidate<r.startup_current:
+                self.start_since=self.start_cap=None
+            else:
+                if self.start_since is None:
+                    self.start_since=now;self.start_cap=candidate
+                self.start_cap=min(self.start_cap,candidate)
+                if uncertain_positive or now-self.start_since<s.restart_stable_seconds:
+                    return self.decision(r,inp,'meter_recovery_wait',0,
+                        reason='Waiting for original possible-positive expiry or genuine off evidence and the existing continuous normal restart interval; zero renewals add no authority.')
         if status in {'completed','disconnected'}:
             candidate=int(floor(min(s.max_charge_amps,s.main_fuse_amps-s.buffer_amps-raw)))
             if (s.disconnected_readiness and candidate>=r.startup_current
@@ -382,10 +488,8 @@ class MeterEnvelopePolicy:
             return self.decision(r,inp,'meter_wait',cap,
                 reason='Passive readiness disabled or lacks whole-RAW headroom; no session start.')
         peak=r._peak_response
-        retained_minimum=bool(cap==r.startup_current and ev_valid and ev is not None
-            and inp.charger_native_committed and not inp.charger_publication_pending
-            and inp.charger_increase_ready and r._ev_clock_error is None
-            and r._ev_advanced_since(r._accepted_control_ev_ts,'_accepted_control_ev_ts'))
+        retained_minimum=bool(cap==r.startup_current and self.l1 is not None
+            and r._controlled_l1_after(self.l1,self.accepted_l1_floor))
         if retained_minimum:
             if 1<=ev<=r.startup_current+.5:
                 self.minimum_verified=True
@@ -415,8 +519,8 @@ class MeterEnvelopePolicy:
             # authority. It grants neither a timely EV response nor a new
             # response window: an unresolved return above28 still uses the
             # original, possibly already expired, electrical deadline.
-            if (self.ev_estimate(r,inp,ev_valid) and ev<=minimum+.5
-                    and r._ev_advanced_since(r._accepted_control_ev_ts,'_accepted_control_ev_ts')):
+            if (self.ev_estimate(r,inp) and ev<=minimum+.5
+                    and r._controlled_l1_after(self.l1,self.accepted_l1_floor)):
                 self.upper=max(minimum,ev)
                 self.minimum_verified=True
                 r._peak_response=None;r._peak_response_failure=None
@@ -428,12 +532,20 @@ class MeterEnvelopePolicy:
                 return self.decision(r,inp,'meter_normal',minimum,command='set_limit',
                     reason='Fresh normal meter feedback retains the actual minimum; unresolved peak evidence and its original deadline remain intact.')
         if peak is not None:
-            genuine=bool(ev_valid and ev is not None and 1<=ev<=minimum+.5 and cap==minimum
-                and self.minimum_dispatch is not None and r._last_input_charger_ts is not None
-                and r._ev_advanced_since(self.minimum_floor,'_accepted_control_ev_ts'))
-            at=now-(wall-r._last_input_charger_ts) if genuine else None
+            context=inp.controlled_l1
+            if (self.minimum_l1_floor is not None and context is not None
+                    and (not r._controlled_l1_context(inp)
+                        or r._controlled_l1_key(context)!=self.minimum_l1_floor['key'])):
+                # Mapping changes withdraw the old response; they never buy a
+                # second10s or a replacement30s confirmation interval.
+                self.response_ts=self.response_at=None
+            genuine=bool(self.l1 is not None and 1<=ev<=minimum+.5 and cap==minimum
+                and self.minimum_dispatch is not None
+                and r._controlled_l1_after(self.l1,self.minimum_l1_floor))
+            et=self.l1.received_at_ts if self.l1 is not None else None
+            at=now-(wall-et) if genuine else None
             if genuine and self.response_ts is None and self.minimum_dispatch<at<peak.deadline:
-                self.response_ts=r._last_input_charger_ts;self.response_at=at
+                self.response_ts=et;self.response_at=at
                 self.confirmation_deadline=min(at+s.grid_confirmation_seconds,
                     r.last_set_limit_ts+r.last_target[3]) if s.grid_confirmation_seconds else peak.deadline
                 self.confirmation_grid_floor=self.response_ts
@@ -452,8 +564,8 @@ class MeterEnvelopePolicy:
             if gt>self.response_ts and raw>ceiling:
                 return self.supervisor.zero(self,r,inp,C.GRID_CEILING)
             if (genuine and abs(ev-self.confirmation_value)>.1
-                    and r._last_input_charger_ts>self.confirmation_grid_floor):
-                self.confirmation_grid_floor=r._last_input_charger_ts
+                    and et>self.confirmation_grid_floor):
+                self.confirmation_grid_floor=et
                 self.confirmation_value=ev
             if gt>self.confirmation_grid_floor and genuine:
                 if ev>raw+1 or raw-ev+minimum>ceiling:
@@ -480,13 +592,13 @@ class MeterEnvelopePolicy:
                 return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
                     no_write_deadline=r.last_set_limit_ts+r.last_target[3],
                     reason='The same pre-decrease meter packet cannot claim another response or stop; retain only its actual finite lower lease.')
-            if (status=='charging' and self.ev_estimate(r,inp,ev_valid)
-                    and r._ev_advanced_since(r._accepted_control_ev_ts,'_accepted_control_ev_ts')):
+            if (status=='charging' and self.ev_estimate(r,inp)
+                    and r._controlled_l1_after(self.l1,self.accepted_l1_floor)):
                 house=max(0.,raw-ev)
                 lower=int(floor(min(s.max_charge_amps,s.main_fuse_amps-s.buffer_amps-house)))
                 if minimum<=lower<cap and house+lower<=s.main_fuse_amps-s.buffer_amps:
                     return self.decision(r,inp,'meter_normal_decrease',lower,command='set_limit',
-                        house=house,basis='eligible_native_then_meter',ordinary_decrease=True,
+                        house=house,basis='eligible_mapped_l1_then_meter',ordinary_decrease=True,
                         reason='Genuine native current followed by the meter permits a strictly lower normal offer; no overload authority is used.')
         if raw>s.main_fuse_amps:
             if cycle['used_seconds']>=s.overload_budget_seconds:
@@ -502,17 +614,19 @@ class MeterEnvelopePolicy:
         if not s.active_control or s.dry_run or not s.enable_dynamic_limit:
             return self.decision(r,inp,'meter_monitor',cap,reason='Automatic control is disabled.')
         allowed_start={'charging','start_charging','ready_to_charge','awaiting_start','awaiting_load_balancing','connected','buffering'}
-        coherent=self.ev_estimate(r,inp,ev_valid) and status=='charging'
+        coherent=live and self.ev_estimate(r,inp) and status=='charging'
         basis_label='meter_envelope_feedback'
         if coherent:
             self.feedback_base_cap=self.feedback_source=None
             desired=int(floor(min(s.max_charge_amps,s.main_fuse_amps-s.buffer_amps-(raw-ev))))
-            if r._ev_advanced_since(r._accepted_control_ev_ts,'_accepted_control_ev_ts'):
+            if r._controlled_l1_after(self.l1,self.accepted_l1_floor):
                 self.upper=max(cap,ev)
                 if cap==minimum and ev<=minimum+.5:
                     self.minimum_verified=True
             basis=max(0.,raw-ev)
-            basis_label='eligible_native_then_meter'
+            basis_label='eligible_mapped_l1_then_meter'
+            if desired>cap and not r._controlled_l1_after(self.l1,self.accepted_l1_floor):
+                desired=cap
         elif live:
             # A measured normal total may retain/lower the actual accepted
             # lease. This deliberately uses meter feedback, not RAW+whole proof.
@@ -562,8 +676,7 @@ class MeterEnvelopePolicy:
         r.last_action_ts=now;r.last_set_limit_ts=origin;r.last_command='set_limit'
         r.last_target=(d.current_p1,0,0,60)
         if d.current_p1<=0:
-            self.recovering=True;self.start_since=self.start_cap=None
-            self.cold_unknown_pending=True;self.cold_upper_until=origin+60.
+            self.recovering=True
             r._committed_normal=None
             return
         r._accepted_control_source_id=r._last_input_control_source_id
@@ -573,6 +686,7 @@ class MeterEnvelopePolicy:
         elif old!=d.current_p1:
             self.ordinary_decrease_grid=self.ordinary_decrease_cap=None
         if old!=d.current_p1:
+            self.accepted_l1_floor=dispatch.get('controlled_l1_floor') if dispatch else None
             r._last_limit_change_ts=origin
             baselines=dispatch.get('ev_owner',{}).get('baselines',{}) if dispatch else {}
             r._accepted_control_ev_ts=next(iter(baselines.values()),r._last_input_charger_ts)
@@ -583,8 +697,10 @@ class MeterEnvelopePolicy:
                 self.feedback_base_cap=self.feedback_source=None
         self.upper=max(self.upper,d.current_p1)
         r._restart_required=False
+        self.recovering=False;self.zero_l1_floor=None
         if r._peak_response is not None and d.current_p1==r.startup_current and self.minimum_dispatch is None:
             self.minimum_dispatch=origin;self.minimum_floor=r._accepted_control_ev_ts
+            self.minimum_l1_floor=dispatch.get('controlled_l1_floor') if dispatch else None
             # Even a same-cap minimum request needs its actual original dispatch
             # floor; later TTL acknowledgements never move that response clock.
             r._pin_ev_owner('_accepted_control_ev_ts',wall_floor=r._ack_wall(now))

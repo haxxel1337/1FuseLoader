@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 import test_1fuseloader_independent_operating_model as original
+import test_1fuseloader_b40_fixture_evidence as phase_fixture
 
 
 class MeterEnvelopePlant(original.ControllerPlant):
@@ -23,7 +24,14 @@ class MeterEnvelopePlant(original.ControllerPlant):
         configure=original.ready.DisconnectedReadinessRuntimeTests.configure
         def selected(case,enabled=True,**kwargs):
             kwargs.update(meter_envelope_control=True,measurement_settle_seconds=25)
-            return configure(case,enabled,**kwargs)
+            result=configure(case,enabled,**kwargs)
+            def delivered_l1():
+                if self.opts['secondary_delay']:
+                    component=self.native_components.get(183)
+                    return component[0] if component is not None else None
+                return case.native.current if 183 in case.native.observation_ids else None
+            phase_fixture.install(case,adopted=90.,value_reader=delivered_l1)
+            return result
         with patch.object(original.ready.DisconnectedReadinessRuntimeTests,'configure',selected):
             await super().setup()
 

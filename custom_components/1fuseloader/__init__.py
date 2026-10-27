@@ -33,7 +33,7 @@ from .bmw_context import BMWContext
 from .logic import (
     ALLOWED_ACTIVE_STATUSES, IDLE_STATUSES, START_ALLOWED_STATUSES,
     PEAK_RESPONSE_TRIGGER_AMPS, ElectricalStopCause, OneFuseRegulator,
-    RegulatorInput, RegulatorSettings, SourceHealth,
+    RegulatorInput, RegulatorSettings, SourceHealth, ControlledL1Evidence,
 )
 from .overload_persistence import OverloadBudgetStore
 from .mqtt_freshness import MqttL1Config, MqttL1Source
@@ -81,6 +81,11 @@ _SOURCE_METADATA_FIELDS = frozenset({
     "meter_envelope_control", "meter_control_health", "meter_estimate_quality",
     "meter_grid_valid", "meter_actuator_valid", "meter_ev_valid",
     "meter_state", "meter_zero_cause",
+    "controlled_l1_current", "controlled_l1_observed_current", "controlled_l1_used",
+    "controlled_l1_received_at_utc", "controlled_l1_source_at_utc",
+    "controlled_l1_output_phase", "controlled_l1_mapping_epoch",
+    "controlled_l1_mapping_adopted_at_utc", "controlled_l1_sequence",
+    "controlled_l1_error", "controlled_l1_current_error", "controlled_l1_committed",
 })
 
 
@@ -212,6 +217,7 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             "overload_failure_reason", "overload_historical_failure_reason",
             "overload_lifetime_used_seconds", "overload_trial_state", "overload_trial_used_seconds",
             "overload_trial_remaining_seconds", "overload_trial_failure_reason",
+            "overload_trial_policy",
             "grid_confirmation_deadline_ts", "grid_confirmation_remaining_seconds",
             "ordinary_response_deadline_ts",
             "normal_continuity_deadline_ts",
@@ -1737,6 +1743,72 @@ class OneFuseLoaderController:
                 "meter_estimate_quality": "usable" if ev_health.valid else "unavailable_for_increase",
                 "meter_source_scope": "validated_RAW_and_actuator_faults_are_critical;EV_estimate_quality_controls_increase_credit",
             })
+        controlled_l1 = None
+        # Observational evidence may be captured at a legacy SDK boundary for
+        # a future explicit policy handoff. Only the selected policy consumes
+        # it; legacy numeric inputs, decisions and health remain unchanged.
+        if self._adapter is not None:
+            try:
+                native_l1 = getattr(self._adapter, "native_controlled_l1_observation", None)
+            except Exception:
+                native_l1 = None
+            def l1_stamp(name: str) -> float | None:
+                value = self._utc_time(getattr(native_l1, name, None))
+                return value.timestamp() if value is not None else None
+            if native_l1 is not None:
+                controlled_l1 = ControlledL1Evidence(
+                    current=getattr(native_l1, "current", None),
+                    received_at_ts=l1_stamp("received_at"),
+                    sequence=getattr(native_l1, "sequence", 0),
+                    evidence_credit=getattr(native_l1, "evidence_credit", False),
+                    source_id=source_id,
+                    receiver_identity=getattr(native_l1, "source_identity", ()),
+                    mapping_epoch=getattr(native_l1, "mapping_epoch", 0),
+                    output_phase=getattr(native_l1, "output_phase", None),
+                    mapping_adopted_at_ts=l1_stamp("mapping_adopted_at"),
+                    mapping_sequence=getattr(native_l1, "mapping_sequence", 0),
+                    source_ts=l1_stamp("source_at"),
+                    source_highwater_ts=l1_stamp("source_highwater_at"),
+                    mapping_source_ts=l1_stamp("mapping_source_at"),
+                    mapping_source_highwater_ts=l1_stamp("mapping_source_highwater_at"),
+                    error=getattr(native_l1, "error", None),
+                    observation_id=getattr(native_l1, "observation_id", None),
+                    committed=getattr(native_l1, "committed", False))
+            def l1_utc(name: str) -> str | None:
+                value = self._utc_time(getattr(native_l1, name, None))
+                return value.isoformat() if value is not None else None
+            controlled_diagnostics = {
+                "controlled_l1_observed_current": getattr(native_l1, "current", None),
+                "controlled_l1_received_at_utc": l1_utc("received_at"),
+                "controlled_l1_source_at_utc": l1_utc("source_at"),
+                "controlled_l1_output_phase": getattr(native_l1, "output_phase", None),
+                "controlled_l1_mapping_epoch": getattr(native_l1, "mapping_epoch", None),
+                "controlled_l1_mapping_adopted_at_utc": l1_utc("mapping_adopted_at"),
+                "controlled_l1_mapping_sequence": getattr(native_l1, "mapping_sequence", None),
+                "controlled_l1_sequence": getattr(native_l1, "sequence", None),
+                "controlled_l1_error": getattr(native_l1, "error", "controlled_l1_unavailable"),
+                "controlled_l1_current_error": getattr(native_l1, "current_error", None),
+                "controlled_l1_committed": getattr(native_l1, "committed", False),
+                "controlled_l1_scope": "native183_input_L1_under_verified_output110mode10;MAX_and_pilot_separate",
+            }
+            # MAX is retained as an aggregate diagnostic/upper, never an L1
+            # subtraction certificate. Describe the new estimate channel
+            # without promoting its availability into response/rise proof.
+            if self.settings.meter_envelope_control:
+                self.source_diagnostics.update(controlled_diagnostics)
+                mapped_current = _finite_current_number(getattr(controlled_l1, "current", None))
+                mapped_quality = bool(controlled_l1 is not None and controlled_l1.committed is True
+                    and controlled_l1.error is None and controlled_l1.output_phase == 10
+                    and mapped_current is not None
+                    and mapped_current >= 0 and controlled_l1.received_at_ts is not None
+                    and 0 <= wall_now-controlled_l1.received_at_ts <= self.settings.max_sensor_age_seconds
+                    and (controlled_l1.source_ts is None or 0 <= wall_now-controlled_l1.source_ts <= self.settings.max_sensor_age_seconds))
+                ev_health = SourceHealth(mapped_quality, None if mapped_quality else
+                    getattr(native_l1, "error", None) or getattr(native_l1, "current_error", None)
+                    or "Mapped L1 native evidence is unavailable.")
+                self.source_diagnostics.update({"meter_ev_health": asdict(ev_health),
+                    "meter_ev_valid": ev_health.valid,
+                    "meter_estimate_quality": "mapped_l1_available_for_qualification" if mapped_quality else "unavailable_for_increase"})
         return RegulatorInput(
             now_ts=self.hass.loop.time(),
             status=status_value,
@@ -1768,6 +1840,7 @@ class OneFuseLoaderController:
             meter_grid_health=grid_health,
             meter_actuator_health=actuator_health,
             meter_ev_health=ev_health,
+            controlled_l1=controlled_l1,
         )
 
     def _configured_control_identity(self) -> str | None:
@@ -1989,6 +2062,8 @@ class OneFuseLoaderController:
                 "current_p3": self.last_decision.current_p3,
                 "meter_state": getattr(self.last_decision, "meter_state", None),
                 "meter_zero_cause": getattr(self.last_decision, "meter_zero_cause", None),
+                "controlled_l1_current": getattr(self.last_decision, "controlled_l1_current", None),
+                "controlled_l1_used": getattr(self.last_decision, "controlled_l1_used", False),
                 "readiness_deadline_ts": getattr(self.last_decision, "readiness_deadline_ts", None)}
                 if self.last_decision is not None else {}),
             "zero_confirmation_scope": "native_ProductUpdate_receipt_and_correlated_delivery_not_physical_response",
@@ -2219,6 +2294,7 @@ class OneFuseLoaderController:
                 inp.charger_observation_report_times,
                 inp.charger_observation_sequences, inp.charger_observation_evidence_credit,
                 inp.meter_grid_health, inp.meter_actuator_health, inp.meter_ev_health,
+                inp.controlled_l1 if self.settings.meter_envelope_control else None,
                 age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
     async def _async_tick_locked(self) -> None:
