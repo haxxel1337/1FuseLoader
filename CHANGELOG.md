@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0b41
+
+- Compare controlled-L1 provider timestamps only with their own captured
+  provider ordering floor. Do not require a genuinely new native response's
+  provider bucket to exceed the HA SDK-entry wall-clock bucket: clock offset
+  can otherwise falsely reject a fast response. Local receipt and sequence
+  must still advance after the actual SDK boundary; mapping, native evidence
+  credit, provider nonregression, replay and freshness guards remain intact.
+- Add real adapter/runtime/SDK regressions for fast response with a lagging
+  provider clock, preserving the original electrical and grid deadlines.
+
 ## 0.4.0b40
 
 - Keep aggregate input-current diagnostics separate from a validated controlled

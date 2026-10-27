@@ -6054,7 +6054,6 @@ class OneFuseRegulator:
             and self._controlled_l1_key(e)==floor['key']
             and e.sequence>floor['sequence'] and e.received_at_ts>floor['receipt']
             and e.received_at_ts>floor['wall']
-            and (e.source_ts is None or e.source_ts>=floor['wall']-floor['wall']%1)
             and (floor['provider'] is None or e.source_ts is not None
                  and e.source_ts>=floor['provider']))
 

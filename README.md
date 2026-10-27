@@ -67,6 +67,14 @@ post-dispatch current response. Unknown, changed, IT or multiphase mappings
 do not inherit this narrow L1 capability. Stable valid mapping need not change
 every time current changes.
 
+From b41, the provider ordering floor is compared within that provider's own
+clock domain. It is not required to exceed HA's SDK-entry wall-clock bucket.
+A genuinely new fast native response can carry an advancing provider timestamp
+that still predates the local SDK time because those clocks have an offset.
+Local native receipt and sequence must advance after the actual SDK boundary;
+all existing mapping, replay and freshness checks still apply. These receipt
+checks do not establish synchronized physical acquisition times.
+
 Aggregate MAX remains a distinct diagnostic/upper bound. It cannot be blindly
 subtracted from grid L1: an inflated neutral value would understate house load.
 A higher offer needs independently eligible mapped L1 and coherent later grid
