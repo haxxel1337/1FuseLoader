@@ -104,6 +104,32 @@ class SourceHealth:
     reason: Optional[str] = None
 
 
+@dataclass(frozen=True, slots=True)
+class ControlledL1Evidence:
+    """Independent native183 under an explicit N+L1 mapping epoch.
+
+    This is neither the four-terminal MAX nor pilot/output current. All clocks
+    are UTC receipt/provider bounds, never a physical acquisition guarantee.
+    """
+    current: float
+    received_at_ts: float
+    sequence: int
+    evidence_credit: bool
+    source_id: str | tuple
+    receiver_identity: tuple
+    mapping_epoch: int
+    output_phase: int
+    mapping_adopted_at_ts: float
+    mapping_sequence: int
+    source_ts: Optional[float] = None
+    source_highwater_ts: Optional[float] = None
+    mapping_source_ts: Optional[float] = None
+    mapping_source_highwater_ts: Optional[float] = None
+    error: Optional[str] = None
+    observation_id: int = 183
+    committed: bool = True
+
+
 class ElectricalStopCause(str, Enum):
     CONFIGURATION = "configuration"
     GRID_INVALID = "grid_invalid"
@@ -170,6 +196,7 @@ class RegulatorInput:
     meter_grid_health: Optional[SourceHealth] = None
     meter_actuator_health: Optional[SourceHealth] = None
     meter_ev_health: Optional[SourceHealth] = None
+    controlled_l1: Optional[ControlledL1Evidence] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +453,8 @@ class RegulatorDecision:
     meter_overload_authority: bool = False
     meter_ordinary_decrease: bool = False
     meter_basis_grid_ts: Optional[float] = None
+    controlled_l1_current: Optional[float] = None
+    controlled_l1_used: bool = False
 
 
 class OneFuseRegulator:
@@ -438,6 +467,11 @@ class OneFuseRegulator:
     def __init__(self, settings: RegulatorSettings | None = None) -> None:
         self.settings = settings or RegulatorSettings()
         self._meter_envelope_policy = None
+        self._controlled_l1_seen: dict[tuple, tuple] = {}
+        self._controlled_l1_epochs: dict[tuple, int] = {}
+        self._controlled_l1_adoptions: dict[tuple, float] = {}
+        self._controlled_l1_withdrawn: set[tuple] = set()
+        self._controlled_l1_bucket_values: dict[tuple, tuple] = {}
         self._ev_clock_watermarks: dict[tuple, float] = {}
         self._ev_clock_key = None
         self._ev_clock_baseline: Optional[float] = None
@@ -1909,7 +1943,7 @@ class OneFuseRegulator:
             # history stay intact; ordinary legacy owners leave its path.
             self.settings = settings
             if settings.meter_envelope_control and self._meter_envelope_policy is not None:
-                self._meter_envelope_policy.prepare_handoff()
+                self._meter_envelope_policy.prepare_handoff(self)
             return
         self._control_generation += 1
         self._retire_active_dispatches()
@@ -5021,7 +5055,8 @@ class OneFuseRegulator:
     def _remember_retired_dispatch(self, plan_id: int, record: dict) -> None:
         """Keep bounded ordering tombstones, never active source ownership."""
         self._retired_dispatch_records[plan_id] = {name: record[name]
-            for name in ("now", "generation", "target")}
+            for name in ("now", "generation", "target", "ttl", "source_id", "controlled_l1_floor")
+            if name in record}
         if plan_id > 0:
             self._retired_plan_highwater = max(self._retired_plan_highwater, plan_id)
         while len(self._retired_dispatch_records) > 64:
@@ -5071,6 +5106,8 @@ class OneFuseRegulator:
                 ElectricalStopCause(decision.meter_zero_cause)
             except (ValueError, TypeError):
                 return False
+        if decision.meter_envelope and decision.current_p1>0 and inp is None:
+            return False
         fields = []
         if decision.command == "set_limit" and decision.current_p1 > 0:
             if decision.mode == "low_grid_alignment":
@@ -5134,16 +5171,22 @@ class OneFuseRegulator:
                 normal_anchor = (current, tuple(shadow._ev_current_observations),
                     shadow._ev_established_source_known, owner.receiver_scope)
             self._dispatch_records[decision.plan_id] = {"now": now, "wall": wall,
+                "ttl": decision.ttl_seconds,
                 "source_id": inp.control_source_id, "ev_owner": record,
+                "controlled_l1_floor": shadow._controlled_l1_boundary(inp),
                 "normal_anchor": normal_anchor,
                 "generation": self._control_generation,
                 "target": (decision.current_p1, decision.current_p2, decision.current_p3)}
         else:
             self._dispatch_records[decision.plan_id] = {"now": now, "legacy": True,
+                "ttl": decision.ttl_seconds,
                 "generation": self._control_generation,
                 "target": (decision.current_p1, decision.current_p2, decision.current_p3)}
         if decision.meter_envelope and decision.current_p1 == 0:
             self._get_meter_envelope_policy().zero_permits.pop(decision.plan_id, None)
+        if decision.meter_envelope:
+            self._get_meter_envelope_policy().note_dispatch(
+                self,decision,self._dispatch_records[decision.plan_id])
         for field in fields:
             setattr(self, field, now)
         return True
@@ -5886,6 +5929,134 @@ class OneFuseRegulator:
             return True
         resend = min(self.settings.resend_limit_every_seconds, ttl / 2)
         return now - self.last_set_limit_ts >= max(1, resend)
+
+    def _controlled_l1_context(self, inp: RegulatorInput) -> bool:
+        e=inp.controlled_l1
+        if (isinstance(e,ControlledL1Evidence)
+                and isinstance(e.receiver_identity,tuple) and e.receiver_identity
+                and type(e.mapping_epoch) is int and e.mapping_epoch>0
+                and self._trial_identity(e.source_id)==self._trial_identity(inp.control_source_id)):
+            try:
+                receiver=(self._trial_identity(e.source_id),e.receiver_identity)
+                key=(*receiver,e.mapping_epoch)
+                hash(key)
+                if e.error is not None or e.output_phase!=10:
+                    self._controlled_l1_withdrawn.add(key)
+                    self._controlled_l1_epochs[receiver]=max(
+                        self._controlled_l1_epochs.get(receiver,0),e.mapping_epoch)
+            except (ValueError,TypeError):
+                return False
+        if (not isinstance(e,ControlledL1Evidence) or e.error is not None
+                or type(e.observation_id) is not int or e.observation_id!=183
+                or type(e.output_phase) is not int or e.output_phase!=10
+                or type(e.sequence) is not int or e.sequence<0
+                or type(e.mapping_epoch) is not int or e.mapping_epoch<1
+                or type(e.mapping_sequence) is not int or e.mapping_sequence<0
+                or not isinstance(e.receiver_identity,tuple) or not e.receiver_identity
+                or self._trial_identity(e.source_id) is None
+                or self._trial_identity(e.source_id)!=self._trial_identity(inp.control_source_id)):
+            return False
+        adopted=(_valid_number(e.mapping_adopted_at_ts)
+            if type(e.mapping_adopted_at_ts) in (int,float) else None)
+        wall=None if isinstance(inp.wall_now_ts,bool) else _valid_number(inp.wall_now_ts)
+        if adopted is None or wall is None or adopted>wall:
+            return False
+        try:
+            receiver=(self._trial_identity(e.source_id),e.receiver_identity)
+            hash(receiver)
+        except (ValueError,TypeError):
+            return False
+        high_epoch=self._controlled_l1_epochs.get(receiver,0)
+        key=(*receiver,e.mapping_epoch)
+        prior_adoption=self._controlled_l1_adoptions.get(key)
+        if (e.mapping_epoch<high_epoch or key in self._controlled_l1_withdrawn
+                or prior_adoption is not None and adopted!=prior_adoption):
+            return False
+        stamp,high=e.mapping_source_ts,e.mapping_source_highwater_ts
+        if not (stamp is None and high is None) and (
+                type(stamp) not in (int,float) or type(high) not in (int,float)
+                or _valid_number(stamp) is None or _valid_number(high) is None
+                or stamp<high or stamp>wall+5):
+            return False
+        self._controlled_l1_epochs[receiver]=max(high_epoch,e.mapping_epoch)
+        self._controlled_l1_adoptions.setdefault(key,adopted)
+        return True
+
+    def _controlled_l1_projection(self, inp: RegulatorInput) -> Optional[ControlledL1Evidence]:
+        """Validate mapped183 independently; failure withdraws credit only."""
+        if not self._controlled_l1_context(inp):
+            return None
+        e=inp.controlled_l1
+        if e.committed is not True or e.evidence_credit is not True or e.sequence<=0:
+            return None
+        numbers=tuple(_valid_number(v) if type(v) in (int,float) else None for v in
+            (e.current,e.received_at_ts,e.mapping_adopted_at_ts,inp.wall_now_ts))
+        current,receipt,adopted,wall=numbers
+        if (None in numbers or current<0 or current>40 or not adopted<receipt
+                or not 0<=wall-receipt<=self.settings.max_sensor_age_seconds):
+            return None
+        try:
+            receiver=(self._trial_identity(e.source_id),e.receiver_identity)
+            key=(*receiver,e.mapping_epoch)
+            hash(key)
+        except (ValueError,TypeError):
+            return None
+        high_epoch=self._controlled_l1_epochs.get(receiver,0)
+        if e.mapping_epoch<high_epoch:
+            return None
+        for stamp,high in ((e.source_ts,e.source_highwater_ts),
+                           (e.mapping_source_ts,e.mapping_source_highwater_ts)):
+            if stamp is None and high is None:
+                continue
+            if (type(stamp) not in (int,float) or type(high) not in (int,float)
+                    or _valid_number(stamp) is None or _valid_number(high) is None
+                    or stamp<high or stamp>wall+5):
+                return None
+        if e.source_ts is not None and wall-e.source_ts>self.settings.max_sensor_age_seconds:
+            return None
+        previous=self._controlled_l1_seen.get(key)
+        if previous is not None:
+            seq,ts,value,provider=previous
+            if (e.sequence<seq or receipt<ts or e.sequence==seq and
+                    (receipt!=ts or current!=value)
+                    or provider is not None and (e.source_ts is None or e.source_ts<provider)):
+                return None
+            if provider is not None and e.source_ts==provider and e.sequence>seq:
+                bucket=self._controlled_l1_bucket_values.get(key,(provider,{value}))[1]
+                if current==value or current in bucket:
+                    return None
+        if e.source_ts is not None:
+            old_bucket=self._controlled_l1_bucket_values.get(key)
+            values=set(old_bucket[1]) if old_bucket is not None and old_bucket[0]==e.source_ts else set()
+            values.add(current)
+            self._controlled_l1_bucket_values[key]=(e.source_ts,values)
+        self._controlled_l1_epochs[receiver]=max(high_epoch,e.mapping_epoch)
+        self._controlled_l1_seen[key]=(e.sequence,receipt,current,e.source_ts)
+        return e
+
+    @staticmethod
+    def _controlled_l1_key(e: ControlledL1Evidence) -> tuple:
+        return (e.source_id,e.receiver_identity,e.mapping_epoch)
+
+    def _controlled_l1_boundary(self, inp: RegulatorInput) -> Optional[dict]:
+        if not self._controlled_l1_context(inp):
+            return None
+        e=inp.controlled_l1
+        if (e.received_at_ts is not None and (type(e.received_at_ts) not in (int,float)
+                or _valid_number(e.received_at_ts) is None)):
+            return None
+        return dict(key=self._controlled_l1_key(e),sequence=e.sequence,
+            receipt=_valid_number(e.received_at_ts) if e.received_at_ts is not None else e.mapping_adopted_at_ts,
+            provider=e.source_ts,value=e.current,wall=inp.wall_now_ts)
+
+    def _controlled_l1_after(self, e: Optional[ControlledL1Evidence], floor: Optional[dict]) -> bool:
+        return bool(e is not None and floor is not None
+            and self._controlled_l1_key(e)==floor['key']
+            and e.sequence>floor['sequence'] and e.received_at_ts>floor['receipt']
+            and e.received_at_ts>floor['wall']
+            and (e.source_ts is None or e.source_ts>=floor['wall']-floor['wall']%1)
+            and (floor['provider'] is None or e.source_ts is not None
+                 and e.source_ts>=floor['provider']))
 
     def _get_meter_envelope_policy(self):
         if self._meter_envelope_policy is None:

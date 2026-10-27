@@ -34,7 +34,7 @@ MAX_TELEMETRY_AGE_SECONDS = 120
 OBSERVATION_FUTURE_TOLERANCE_SECONDS = 2
 NATIVE_PUBLICATION_MAX_DIVERGENCE_SECONDS = 1.0
 SNAPSHOT_OBSERVATION_IDS = (109, 182, 183, 184, 185)
-PRIVATE_TELEMETRY_OBSERVATION_IDS = frozenset({48, 96, 100, 109, 111, 112, 113, 114, 182, 183, 184, 185})
+PRIVATE_TELEMETRY_OBSERVATION_IDS = frozenset({21, 38, 48, 96, 100, 109, 110, 111, 112, 113, 114, 120, 182, 183, 184, 185})
 
 # Raw numeric modes in the audited pyeasee 0.8.17 operation-mode enum.
 # Keep terminal, fault and schedule states distinct from start-ready states.
@@ -187,6 +187,33 @@ class NativeCurrentObservation:
     publication_generation: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class NativeControlledL1Observation:
+    """Input T3 evidence under a separately bound TN N+L1 output context.
+
+    The neutral/MAX observation stays independent. A phase witness adopts a
+    mapping epoch; it never creates a current receipt or response sample.
+    """
+
+    current: float | None
+    received_at: datetime | None
+    sequence: int
+    evidence_credit: bool
+    source_identity: tuple[int, ...] = field(repr=False)
+    mapping_epoch: int
+    output_phase: int | None
+    mapping_adopted_at: datetime | None
+    mapping_sequence: int
+    source_at: datetime | None = None
+    source_highwater_at: datetime | None = None
+    mapping_source_at: datetime | None = None
+    mapping_source_highwater_at: datetime | None = None
+    error: str | None = None
+    observation_id: int = 183
+    committed: bool = False
+    current_error: str | None = None
+
+
 class EaseeCommandAdapter:
     """Version-gated access to the charger selected in the HA device registry."""
 
@@ -223,6 +250,17 @@ class EaseeCommandAdapter:
         self._native_current_seeded = False
         self._native_divergence_started: float | None = None
         self._native_publication_generation = 0
+        self._controlled_mapping_epoch = 0
+        self._controlled_mapping_mode: int | None = None
+        self._controlled_mapping_adopted: datetime | None = None
+        self._controlled_mapping_sequence = 0
+        self._controlled_mapping_floor = 0
+        self._controlled_mapping_source: datetime | None = None
+        self._controlled_mapping_highwater: datetime | None = None
+        self._controlled_mapping_bucket: set[int] = set()
+        self._controlled_mapping_error: str | None = None
+        self._controlled_mapping_bootstrap = True
+        self._controlled_mapping_broken = False
         self._closed = False
         self._request_lock = asyncio.Lock()
         self._request_starts: deque[float] = deque()
@@ -349,6 +387,10 @@ class EaseeCommandAdapter:
         connection = getattr(getattr(self._charger, "easee", None), "sr_connection", None)
         identity = self._snapshot_source_identity()
         if identity != self._native_current_identity:
+            self._break_controlled_mapping("controlled_receiver_changed", bootstrap=True)
+            self._controlled_mapping_highwater = None
+            self._controlled_mapping_source = None
+            self._controlled_mapping_bucket.clear()
             self._native_current_identity = identity
             self._native_current_values.clear()
             self._native_current_sequences = {key: 0 for key in (182, 183, 184, 185)}
@@ -365,6 +407,8 @@ class EaseeCommandAdapter:
         self._seed_native_current()
         if connection is self._hook_connection and identity == self._hook_identity:
             return
+        if self._hook_connection is not None:
+            self._break_controlled_mapping("controlled_connection_changed", bootstrap=True)
         self._hook_generation += 1
         self._hook_connection = None
         self._hook_identity = None
@@ -395,7 +439,13 @@ class EaseeCommandAdapter:
             if generation != owner._hook_generation or identity != owner._snapshot_source_identity():
                 return
             owner._receive_limit_observation(payload, charger_id)
+            mapping_changed = owner._receive_controlled_mapping(payload, charger_id)
             owner._receive_current_observations(payload, charger_id)
+            if mapping_changed and callable(owner._current_observation_callback):
+                try:
+                    owner._current_observation_callback()
+                except Exception:
+                    pass
             owner._receive_telemetry_observations(payload, charger_id)
 
         try:
@@ -431,8 +481,8 @@ class EaseeCommandAdapter:
             else:
                 try:
                     value = self._snapshot_number(record.get("value"), "invalid_diagnostic_number",
-                        integer=key in {96, 109})
-                    if not 0 <= value <= (10000 if key in {96, 109} else 1000):
+                        integer=key in {21, 38, 96, 109, 110})
+                    if not 0 <= value <= (10000 if key in {21, 38, 96, 109, 110} else 1000):
                         raise EaseeAdapterError("invalid_diagnostic_number")
                 except EaseeAdapterError:
                     value, error = None, "invalid_diagnostic_number"
@@ -473,6 +523,90 @@ class EaseeCommandAdapter:
                 continue
             self._limit_observed_values[observation_id - 111] = value
             self._limit_receipts[observation_id - 111] = _monotonic()
+
+    def _break_controlled_mapping(self, error: str, *, bootstrap: bool = False) -> None:
+        if not self._controlled_mapping_broken:
+            self._controlled_mapping_epoch += 1
+        self._controlled_mapping_broken = True
+        self._controlled_mapping_mode = None
+        self._controlled_mapping_adopted = None
+        self._controlled_mapping_floor = self._native_current_sequences.get(183, 0)
+        self._controlled_mapping_error = error
+        self._controlled_mapping_bootstrap = bootstrap
+
+    def _adopt_controlled_mapping(self, mode: int, received: datetime) -> None:
+        if self._controlled_mapping_mode != mode or self._controlled_mapping_adopted is None:
+            self._controlled_mapping_epoch += 1
+            self._controlled_mapping_adopted = received
+            self._controlled_mapping_floor = self._native_current_sequences.get(183, 0)
+        self._controlled_mapping_mode = mode
+        self._controlled_mapping_broken = False
+        self._controlled_mapping_bootstrap = False
+        self._controlled_mapping_error = (None if mode == 10 else "controlled_output_phase_unsupported")
+
+    def _receive_controlled_mapping(self, payload: Any, charger_id: str) -> bool:
+        """Consume actual mode110 before current events from the same batch.
+
+        A stable phase context does not need another event per current sample.
+        Regressed/conflicting phase data cannot revive an earlier low terminal.
+        """
+        records = payload if type(payload) is list else [payload]
+        if len(records) > 64:
+            # The bounded prefix cannot certify that mode110 did not change
+            # later in this atomic native publication. Re-adoption may use the
+            # complete native SDK context, but never this prefix's183 sample.
+            self._break_controlled_mapping("controlled_mapping_payload_truncated", bootstrap=True)
+            return True
+        selected = [item for item in records[:64] if isinstance(item, Mapping)
+                    and item.get("mid") == charger_id and type(item.get("id")) is int
+                    and item["id"] == 110]
+        if not selected:
+            return False
+        if len({(repr(item.get("dataType")), str(item.get("value")), str(item.get("timestamp")))
+                for item in selected}) != 1:
+            self._break_controlled_mapping("controlled_mapping_conflict")
+            return True
+        item, received = selected[0], datetime.now(timezone.utc)
+        try:
+            if type(item.get("dataType")) is not int or item["dataType"] != 4:
+                raise EaseeAdapterError("controlled_mapping_type_invalid")
+            mode = self._snapshot_number(item.get("value"), "controlled_mapping_value_invalid", integer=True)
+            if not 0 <= mode <= 255:
+                raise EaseeAdapterError("controlled_mapping_value_invalid")
+            stamp = None
+            if item.get("timestamp") is not None:
+                stamp, error = self._observation_timestamp(item["timestamp"], received)
+                if error:
+                    raise EaseeAdapterError("controlled_mapping_timestamp_invalid")
+            high = self._controlled_mapping_highwater
+            if stamp is not None and high is not None and stamp < high:
+                raise EaseeAdapterError("controlled_mapping_replayed")
+            if stamp is None and (
+                    high is not None and (mode != self._controlled_mapping_mode or self._controlled_mapping_broken)
+                    or self._controlled_mapping_adopted is not None and mode != self._controlled_mapping_mode):
+                raise EaseeAdapterError("controlled_mapping_timestamp_missing")
+            same_bucket = stamp is not None and stamp == high
+            if same_bucket and self._controlled_mapping_bucket and mode not in self._controlled_mapping_bucket:
+                self._controlled_mapping_bucket.add(mode)
+                raise EaseeAdapterError("controlled_mapping_bucket_conflict")
+            if same_bucket and len(self._controlled_mapping_bucket) > 1:
+                raise EaseeAdapterError("controlled_mapping_bucket_conflict")
+            if self._controlled_mapping_broken and not self._controlled_mapping_bootstrap and (
+                    stamp is None or high is not None and stamp <= high):
+                raise EaseeAdapterError("controlled_mapping_recovery_unverified")
+            changed = (mode != self._controlled_mapping_mode or self._controlled_mapping_adopted is None
+                       or stamp is not None and (high is None or stamp > high))
+            self._adopt_controlled_mapping(int(mode), received)
+            if changed:
+                self._controlled_mapping_sequence += 1
+            if stamp is not None:
+                if not same_bucket:
+                    self._controlled_mapping_bucket = {int(mode)}
+                self._controlled_mapping_source = stamp
+                self._controlled_mapping_highwater = stamp
+        except EaseeAdapterError as err:
+            self._break_controlled_mapping(str(err))
+        return True
 
     def _receive_current_observations(self, payload: Any, charger_id: str) -> None:
         """Track each conductor independently of HA aggregate-attribute fanout.
@@ -657,6 +791,57 @@ class EaseeCommandAdapter:
             native_publication_pending=pending,
             divergence_started_monotonic=self._native_divergence_started,
             publication_generation=self._native_publication_generation)
+
+    @property
+    def native_controlled_l1_observation(self) -> NativeControlledL1Observation | None:
+        """Return only a real183 receipt under the current mode10 epoch.
+
+        Bootstrap mode is explicit native context, never a default or current
+        sample. After adoption/gap/switch an independently new183 is required.
+        """
+        problem = self.telemetry_block_reason
+        if problem:
+            return None
+        identity = self._snapshot_source_identity()
+        mode = self._product_data.state.get("outputPhase")
+        sdk_mode = mode if type(mode) is int and 0 <= mode <= 255 else None
+        if self._controlled_mapping_bootstrap:
+            if sdk_mode is not None:
+                self._adopt_controlled_mapping(sdk_mode, datetime.now(timezone.utc))
+            else:
+                self._controlled_mapping_error = "controlled_mapping_unavailable"
+        elif not self._controlled_mapping_broken and sdk_mode != self._controlled_mapping_mode:
+            # A partial native publication withdraws the old epoch. Once the
+            # verified SDK context is complete it may be adopted afresh, but
+            # its cached183 cannot become the response to an earlier request.
+            self._break_controlled_mapping("controlled_mapping_publication_pending", bootstrap=True)
+        error = self._controlled_mapping_error
+        if self._controlled_mapping_mode != 10:
+            error = error or "controlled_output_phase_unsupported"
+        value = self._native_current_values.get(183)
+        receipt = self._native_current_receipts.get(183)
+        sequence = self._native_current_sequences.get(183, 0)
+        adopted = self._controlled_mapping_adopted
+        current_error = self._native_current_errors.get(183)
+        if (value is None or receipt is None or adopted is None or receipt <= adopted
+                or sequence <= self._controlled_mapping_floor):
+            current_error = current_error or "controlled_current_after_mapping_required"
+        sdk_l1 = self._product_data.state.get("inCurrentT3")
+        if (type(sdk_l1) not in (int, float) or not isfinite(sdk_l1)
+                or not 0 <= sdk_l1 <= 1000 or sdk_l1 != value):
+            current_error = current_error or "controlled_current_publication_pending"
+        credit = self._native_current_evidence_credit.get(183, False)
+        if credit is not True:
+            current_error = current_error or "controlled_current_event_unqualified"
+        return NativeControlledL1Observation(value, receipt, sequence, credit, identity,
+            self._controlled_mapping_epoch, self._controlled_mapping_mode, adopted,
+            self._controlled_mapping_sequence,
+            source_at=self._native_current_source_times.get(183),
+            source_highwater_at=self._native_current_source_highwaters.get(183),
+            mapping_source_at=self._controlled_mapping_source,
+            mapping_source_highwater_at=self._controlled_mapping_highwater,
+            error=error, committed=error is None and current_error is None,
+            current_error=current_error)
 
     @property
     def reported_limit_receipts(self) -> tuple[float | None, float | None, float | None]:
@@ -997,24 +1182,30 @@ class EaseeCommandAdapter:
         """
         problem = self._resolve_runtime()
         if problem:
-            return problem
+            return self._controlled_health_result(problem)
         state = self._product_data.state
         if state is None:
-            return "easee_telemetry_missing"
+            return self._controlled_health_result("easee_telemetry_missing")
         try:
             if state.get("signalRConnected") is not True:
-                return "easee_stream_disconnected"
+                return self._controlled_health_result("easee_stream_disconnected")
             if state.get("isOnline") is not True:
-                return "easee_charger_offline"
+                return self._controlled_health_result("easee_charger_offline")
             pulse = state.get("latestPulse")
             if not isinstance(pulse, datetime) or pulse.tzinfo is None:
-                return "easee_heartbeat_missing"
+                return self._controlled_health_result("easee_heartbeat_missing")
             age = (datetime.now(timezone.utc) - pulse).total_seconds()
             if age < -5 or age > MAX_TELEMETRY_AGE_SECONDS:
-                return "easee_heartbeat_stale"
+                return self._controlled_health_result("easee_heartbeat_stale")
         except (AttributeError, TypeError, ValueError, OverflowError):
-            return "easee_telemetry_invalid"
+            return self._controlled_health_result("easee_telemetry_invalid")
         return None
+
+    def _controlled_health_result(self, problem: str) -> str:
+        # An observed transport/online gap cannot preserve a phase-to-current
+        # capability. Legacy health checks and fallback behavior are unchanged.
+        self._break_controlled_mapping(problem, bootstrap=True)
+        return problem
 
     async def async_execute_with_dispatch(self, decision: Any, on_dispatch: Any) -> CommandSubmission:
         """Expose the exact local admission/SDK boundary to the controller."""

@@ -10,6 +10,45 @@ import test_1fuseloader_grid_confirmation as nominal
 import test_1fuseloader_meter_envelope_policy as meter
 
 
+def mapped_l1(inp,logic=meter.logic):
+    """Explicit synthetic mode-10 installation, independent of legacy MAX."""
+    return replace(inp,controlled_l1=logic.ControlledL1Evidence(
+        current=inp.charger_current,received_at_ts=inp.charger_report_ts,
+        sequence=int((inp.charger_report_ts-meter.EPOCH)*1000)+1,
+        evidence_credit=True,source_id=inp.control_source_id,
+        receiver_identity=(100,101),mapping_epoch=1,output_phase=10,
+        mapping_adopted_at_ts=meter.EPOCH-1.,mapping_sequence=1))
+
+
+class ExplicitNominalFixture:
+    """Keep the nominal oracle, adding actual dispatch and phase witnesses."""
+    regulator=nominal.GridConfirmationTests.regulator
+    running=nominal.GridConfirmationTests.running
+    assertEqual=unittest.TestCase().assertEqual
+    assertTrue=unittest.TestCase().assertTrue
+
+    def sample(self,r,now,grid,ev,*,status='charging',gt=None,et=None,accept=True,**metadata):
+        identity=metadata.pop('identity',nominal.fixtures.IDENTITY)
+        inp=nominal.logic.RegulatorInput(now_ts=now,status=status,grid_l1=grid,
+            charger_current=ev,wall_now_ts=nominal.EPOCH+now,
+            grid_report_ts=nominal.EPOCH+(now if gt is None else gt),
+            charger_report_ts=nominal.EPOCH+(now if et is None else et),
+            control_source_id=identity,**metadata)
+        inp=mapped_l1(inp,nominal.logic)
+        self.last_input=inp
+        d=r.evaluate(inp)
+        if accept and d.should_call_service:
+            self.assertTrue(r.begin_submission(d,now,inp=inp))
+            r.acknowledge(d,now)
+        return d
+
+    def pending(self,**options):
+        r=nominal.GridConfirmationTests.pending(self,accept=False,**options)
+        self.assertTrue(r.begin_submission(r._last_decision,40.2,inp=self.last_input))
+        r.acknowledge(r._last_decision,40.2)
+        return r
+
+
 class MeterElectricalHandoffReviewTests(unittest.TestCase):
     def setUp(self):
         self.fixture = automatic.AutomaticCycleTests()
@@ -20,6 +59,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
     def step(self, at, raw, ev, receipt, grid_at, *, accept=True):
         inp = self.helper.frame(at, raw, ev, et=receipt, gt=grid_at,
                                 charger_native_committed=True)
+        inp = mapped_l1(inp)
         decision = self.r.evaluate(inp)
         if accept and decision.should_call_service:
             self.assertTrue(self.r.begin_submission(decision, at, inp=inp))
@@ -80,7 +120,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
         self.assertIsNone(restored._automatic_cycle['failure_reason'])
 
     def test_genuine_peak_nominal_minimum_keeps_original_confirmation_phase(self):
-        fixture = nominal.GridConfirmationTests()
+        fixture = ExplicitNominalFixture()
         r = fixture.pending(peak_only_response=True, automatic_overload_cycles=True)
         response = fixture.sample(r, 46.5, 30.2, 7.08, gt=44.)
         self.assertEqual(r._minimum_confirmation.owner, 'nominal')
@@ -96,6 +136,7 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
                 charger_report_ts=nominal.EPOCH + 46.5,
                 control_source_id=nominal.fixtures.IDENTITY,
                 charger_native_committed=True)
+            inp = mapped_l1(inp,nominal.logic)
             decision = r.evaluate(inp)
             if decision.should_call_service:
                 self.assertTrue(r.begin_submission(decision, at, inp=inp))

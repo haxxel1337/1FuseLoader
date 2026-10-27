@@ -229,6 +229,11 @@ class OneFuseSensor(SensorEntity):
         meter_sources = {name: self.controller.source_diagnostics[name] for name in (
             "meter_envelope_control", "meter_control_health", "meter_estimate_quality",
             "meter_grid_valid", "meter_actuator_valid", "meter_ev_valid",
+            "controlled_l1_observed_current", "controlled_l1_received_at_utc",
+            "controlled_l1_source_at_utc", "controlled_l1_output_phase",
+            "controlled_l1_mapping_epoch", "controlled_l1_mapping_adopted_at_utc",
+            "controlled_l1_sequence", "controlled_l1_error", "controlled_l1_current_error",
+            "controlled_l1_committed",
         ) if name in self.controller.source_diagnostics}
         if getattr(d, "meter_envelope", False) and getattr(d, "meter_zero_cause", None) is not None:
             # A known control/delivery/storage block is distinct from the
