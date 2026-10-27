@@ -92,9 +92,11 @@
           "peak_only_response": "Lasttoppsstyrt svar (10 sekunders akutfrist endast över 28 A; aktivt tillval)",
           "grid_confirmation_seconds": "Nätbekräftelse efter minströmssvar i tid (sekunder; 0 = av, högst 30)",
           "automatic_overload_cycles": "Automatiska överlastcykler (aktivt tillval; kräver lasttoppsstyrd svarspolicy)",
-          "disconnected_readiness": "Laddberedskap när bilen är frånkopplad (aktivt tillval)"
+          "disconnected_readiness": "Laddberedskap när bilen är frånkopplad (aktivt tillval)",
+          "meter_envelope_control": "Mätarstyrd reglering (aktivt tillval)"
         },
         "data_description": {
+          "meter_envelope_control": "Avstängt som standard. Kräver den verifierade importprofilen med toppstyrt svar, automatiska överlastperioder, högst 16 A till bilen och 60 sekunders giltighetstid för vanliga gränser. Färsk last från huvudmätaren styr elskyddet; fördröjd eller motsägande bilström tar bort möjligheten att höja men stoppar inte i sig en redan accepterad och giltig gräns. Verkliga källfel, leveransfel, utgången giltighetstid, lasttoppar och sammanlagd överlast skyddas fortfarande. Tillvalet nollställer inte exponering, startar ingen ny överlastbudget, återupptar ingen manuell paus och innebär ingen verifierad avsvalningstid för säkringen.",
           "disconnected_readiness": "Avstängt som standard. När bilen är frånkopplad hålls en vanlig L1-gräns redo endast om färsk rå nätström plus hela gränsen ryms inom den vanliga bufferten. L2 och L3 förblir 0 A. Ingen bilström räknas bort och ingen överlastbudget används; inget start- eller återupptagningskommando skickas. En färsk anslutning kan överta samma giltiga, accepterade gräns utan ny återstartsfördröjning; bilens svarsklocka börjar först efter anslutning. Skydd för datakällor, kommandoleverans, sparning, giltighetstid och starkare skyddsregler gäller fortfarande. Manuell paus, behörighet och scheman åsidosätts inte."
         }
       }

@@ -226,9 +226,20 @@ class OneFuseSensor(SensorEntity):
                 diagnostics = {name: snapshot[name] for name in (
                     "last_command_attempt", "last_accepted_command", "last_accepted_limit",
                 )}
+        meter_sources = {name: self.controller.source_diagnostics[name] for name in (
+            "meter_envelope_control", "meter_control_health", "meter_estimate_quality",
+            "meter_grid_valid", "meter_actuator_valid", "meter_ev_valid",
+        ) if name in self.controller.source_diagnostics}
+        if getattr(d, "meter_envelope", False) and getattr(d, "meter_zero_cause", None) is not None:
+            # A known control/delivery/storage block is distinct from the
+            # meter or stream being unhealthy. Keep their original classes.
+            meter_sources["meter_control_health"] = "blocked"
         return self.controller.compact_state_attributes({
             **asdict(d),
             **diagnostics,
+            # Present critical control health separately from uncertain EV
+            # estimates on target/reason cards as well as Source Health.
+            **meter_sources,
             "proposed_command": d.command,
             "command_result": self.controller.last_service_result,
             "command_error": self.controller.last_service_error,

@@ -52,6 +52,7 @@ OPT_BOUNDED_NOMINAL_SHEDDING = "bounded_nominal_shedding"
 OPT_PEAK_ONLY_RESPONSE = "peak_only_response"
 OPT_AUTOMATIC_OVERLOAD_CYCLES = "automatic_overload_cycles"
 OPT_DISCONNECTED_READINESS = "disconnected_readiness"
+OPT_METER_ENVELOPE_CONTROL = "meter_envelope_control"
 OPT_ENABLE_DYNAMIC_LIMIT = "enable_dynamic_limit"
 OPT_ENABLE_SOFT_GUARD = "enable_soft_guard"
 OPT_ENABLE_PAUSE_RESUME = "enable_pause_resume"
@@ -102,6 +103,8 @@ DEFAULT_OPTIONS = {
     OPT_AUTOMATIC_OVERLOAD_CYCLES: False,
     # Keep only a normally buffered offer ready; this grants no overload authority.
     OPT_DISCONNECTED_READINESS: False,
+    # Separate meter-led controller; upgrades retain the existing policy.
+    OPT_METER_ENVELOPE_CONTROL: False,
     OPT_ENABLE_DYNAMIC_LIMIT: True,
     OPT_ENABLE_SOFT_GUARD: True,
     OPT_ENABLE_PAUSE_RESUME: True,
@@ -215,6 +218,16 @@ def validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
         or not 6 <= result[OPT_MIN_CHARGE_AMPS] <= 7 <= result[OPT_MAX_CHARGE_AMPS]
     ):
         raise ValueError("Automatic overload cycles require the 25 A main fuse / 7 A startup profile with min/max bounds including 7 A")
+    if result[OPT_METER_ENVELOPE_CONTROL] and (
+        not result[OPT_NOMINAL_IMPORT_ONLY_FALLBACK]
+        or not result[OPT_PEAK_ONLY_RESPONSE]
+        or not result[OPT_AUTOMATIC_OVERLOAD_CYCLES]
+        or not result[OPT_OVERLOAD_ENABLED]
+        or not result[OPT_ENABLE_DYNAMIC_LIMIT]
+        or result[OPT_MAX_CHARGE_AMPS] > 16
+        or result[OPT_NORMAL_TTL_SECONDS] != 60
+    ):
+        raise ValueError("Meter envelope control requires the verified import-only, peak-triggered automatic overload profile, a maximum of 16 A and a 60 second normal TTL")
     if result[OPT_OVERLOAD_ENABLED]:
         if not result[OPT_ENABLE_DYNAMIC_LIMIT]:
             raise ValueError("Experimental overload operation requires dynamic current control")
