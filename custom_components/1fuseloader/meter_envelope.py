@@ -40,7 +40,7 @@ class MeterEnvelopePolicy:
         self.legacy_normal_history=None;self.started=False;self.l1=None;self.last_ev_error=None
         self.recovered_cycle_id=None
         self.zero_permits={};self.feedback_base_cap=self.feedback_source=None
-        self.ordinary_decrease_grid=self.ordinary_decrease_cap=None
+        self.ordinary_decrease_grid=self.ordinary_decrease_cap=self.ordinary_decrease_raw=None
         self.peak_complete_grid=None
 
     def limit_due(self,r,now,cap):
@@ -324,8 +324,15 @@ class MeterEnvelopePolicy:
         if (not d.meter_overload_authority and number(d.house_load_l1) is not None
                 and d.house_load_l1+d.current_p1<=r.settings.main_fuse_amps-r.settings.buffer_amps):
             self.lease.normal_house=d.house_load_l1
-        if d.meter_ordinary_decrease: self.ordinary_decrease_grid=d.meter_basis_grid_ts;self.ordinary_decrease_cap=d.current_p1
-        elif old!=d.current_p1: self.ordinary_decrease_grid=self.ordinary_decrease_cap=None
+        normal_decrease=bool(old>d.current_p1>0 and not d.meter_overload_authority
+            and d.mode.removeprefix('dry_run_') in {'meter_normal','meter_normal_decrease'})
+        if d.meter_ordinary_decrease or normal_decrease:
+            # Only a meter sample after this actual SDK boundary can observe
+            # the lower offer. New EV telemetry alone cannot reuse its old RAW.
+            self.ordinary_decrease_grid=max(number(d.meter_basis_grid_ts) or 0.,number(dispatch.get('wall')) or 0.)
+            self.ordinary_decrease_cap=d.current_p1
+            self.ordinary_decrease_raw=number(d.grid_l1)
+        elif old!=d.current_p1: self.ordinary_decrease_grid=self.ordinary_decrease_cap=self.ordinary_decrease_raw=None
         if self.episode is not None and self.episode.unresolved and d.current_p1==7 and self.minimum_dispatch is None:
             self.minimum_dispatch=origin;self.minimum_l1_floor=deepcopy(dispatch.get('controlled_l1_floor'))
         recovery_scope_missing=bool(normal_floor and (self.recovery.normal_floor is None
@@ -717,15 +724,16 @@ class MeterEnvelopePolicy:
                     confirmation_deadline=self.confirmation_deadline,overload=peak.overload_authority and raw>s.main_fuse_amps,
                     reason='Timely genuine minimum response; waiting for the later meter inside the separate original confirmation phase.')
         cycle=r._ensure_automatic_cycle()
-        if raw<=s.main_fuse_amps:
-            self.ordinary_decrease_grid=self.ordinary_decrease_cap=None
+        if self.ordinary_decrease_grid is not None and gt>self.ordinary_decrease_grid:
+            self.ordinary_decrease_grid=self.ordinary_decrease_cap=self.ordinary_decrease_raw=None
+        if (live and peak is None and cap==self.ordinary_decrease_cap and self.ordinary_decrease_grid is not None
+                and gt<=self.ordinary_decrease_grid
+                and self.ordinary_decrease_raw is not None and raw<=self.ordinary_decrease_raw
+                and (raw<=s.main_fuse_amps or cycle['used_seconds']<s.overload_budget_seconds)):
+            return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
+                no_write_deadline=r.last_set_limit_ts+r.last_target[3],
+                reason='The same pre-decrease meter packet cannot claim another response or stop; retain only its actual finite lower lease.')
         if s.main_fuse_amps<raw<=28. and live:
-            if (cap==self.ordinary_decrease_cap and self.ordinary_decrease_grid is not None
-                    and gt<=self.ordinary_decrease_grid
-                    and cycle['used_seconds']<s.overload_budget_seconds):
-                return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
-                    no_write_deadline=r.last_set_limit_ts+r.last_target[3],
-                    reason='The same pre-decrease meter packet cannot claim another response or stop; retain only its actual finite lower lease.')
             if (status=='charging' and self.ev_estimate(r,inp)
                     and r._controlled_l1_after(self.l1,self.accepted_l1_floor)):
                 house=max(0.,raw-ev)

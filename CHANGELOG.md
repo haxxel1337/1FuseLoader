@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- After an accepted normal decrease, retain only that original lower lease
+  while the meter still represents the pre-dispatch sample. A later EV report
+  alone must not count the same meter excess twice or renew the lease.
+- A stronger measured load, new source/critical fault, original lease expiry
+  or electrical episode still takes precedence. A genuinely later meter
+  sample permits the next normal allocation.
+- This scoped correction does not change telemetry freshness, overload
+  permission or physical charger behavior; it does not establish the cause
+  of separate pilot-zero interruptions.
+
 ## 0.4.0b43
 
 - Bind missing or changed mapped-phase provenance at a later actual accepted
