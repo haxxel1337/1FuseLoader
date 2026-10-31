@@ -40,7 +40,7 @@ class MeterEnvelopePolicy:
         self.legacy_normal_history=None;self.started=False;self.l1=None;self.last_ev_error=None
         self.recovered_cycle_id=None
         self.zero_permits={};self.feedback_base_cap=self.feedback_source=None
-        self.ordinary_decrease_grid=self.ordinary_decrease_cap=None
+        self.ordinary_decrease_grid=self.ordinary_decrease_cap=self.ordinary_decrease_raw=None
         self.peak_complete_grid=None
 
     def limit_due(self,r,now,cap):
@@ -292,6 +292,27 @@ class MeterEnvelopePolicy:
             origin=now-(wall-gt);self.episode=ElectricalEpisode(self.next_episode_id,inp.control_source_id,origin,origin+r.settings.overload_response_seconds,gt,self.upper)
             self.next_episode_id+=1
 
+    def quiet_normal_bound(self,r,inp):
+        """Independent whole-RAW proof, never stale EV subtraction or restart."""
+        if not r._meter_settings_valid(r.settings):
+            return None
+        now,wall,gt,raw=map(number,(inp.now_ts,inp.wall_now_ts,inp.grid_report_ts,inp.grid_l1))
+        if (None in (now,wall,gt,raw) or self.critical_error(r,inp) is not None
+                or not 0<=wall-gt<=min(15.,r.settings.max_sensor_age_seconds)
+                or not self.lease.live(now) or self.lease.cap<=0
+                or self.recovery.required or self.operational_fault or self.episode is not None
+                or self.cold_unknown_pending or not r.settings.active_control or r.settings.dry_run
+                or not r.settings.enable_dynamic_limit
+                or (inp.status or '').strip().lower() not in {'charging','start_charging','ready_to_charge','awaiting_start',
+                    'awaiting_load_balancing','connected','buffering'}
+                or self.lease.source_id!=inp.control_source_id):
+            return None
+        upper=max(self.upper,self.lease.cap,*(cap for cap,expiry in self.possible_positive.values() if expiry>now))
+        budget=min(23.,r.settings.main_fuse_amps-r.settings.buffer_amps)
+        if raw+upper>budget:
+            return None
+        return upper,budget
+
     def note_dispatch(self,r,d,record):
         if d.command=='set_limit' and d.current_p1>0:
             self.zero_l1_floor=None;self.lease.zero_dispatch=None
@@ -324,8 +345,15 @@ class MeterEnvelopePolicy:
         if (not d.meter_overload_authority and number(d.house_load_l1) is not None
                 and d.house_load_l1+d.current_p1<=r.settings.main_fuse_amps-r.settings.buffer_amps):
             self.lease.normal_house=d.house_load_l1
-        if d.meter_ordinary_decrease: self.ordinary_decrease_grid=d.meter_basis_grid_ts;self.ordinary_decrease_cap=d.current_p1
-        elif old!=d.current_p1: self.ordinary_decrease_grid=self.ordinary_decrease_cap=None
+        normal_decrease=bool(old>d.current_p1>0 and not d.meter_overload_authority
+            and d.mode.removeprefix('dry_run_') in {'meter_normal','meter_normal_decrease'})
+        if d.meter_ordinary_decrease or normal_decrease:
+            # Only a meter sample after this actual SDK boundary can observe
+            # the lower offer. New EV telemetry alone cannot reuse its old RAW.
+            self.ordinary_decrease_grid=max(number(d.meter_basis_grid_ts) or 0.,number(dispatch.get('wall')) or 0.)
+            self.ordinary_decrease_cap=d.current_p1
+            self.ordinary_decrease_raw=number(d.grid_l1)
+        elif old!=d.current_p1: self.ordinary_decrease_grid=self.ordinary_decrease_cap=self.ordinary_decrease_raw=None
         if self.episode is not None and self.episode.unresolved and d.current_p1==7 and self.minimum_dispatch is None:
             self.minimum_dispatch=origin;self.minimum_l1_floor=deepcopy(dispatch.get('controlled_l1_floor'))
         recovery_scope_missing=bool(normal_floor and (self.recovery.normal_floor is None
@@ -597,6 +625,20 @@ class MeterEnvelopePolicy:
         if status in manual:
             return self.decision(r,inp,'meter_wait',cap,
                 reason='Charger/user pause, authorization or schedule owns the session; no positive write or resume.')
+        if inp.meter_product_data_quiet:
+            bound=self.quiet_normal_bound(r,inp)
+            if bound is None:
+                return self.supervisor.zero(self,r,inp,C.ACTUATOR_INVALID,
+                    detail='Product data is quiet and independent whole-meter normal retention is unavailable.')
+            if (cap==self.ordinary_decrease_cap and self.ordinary_decrease_grid is not None
+                    and gt<=self.ordinary_decrease_grid):
+                return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
+                    no_write_deadline=self.lease.expires,
+                    reason='The old pre-decrease meter packet retains only its original finite lower lease; quiet data grants no renewal.')
+            return replace(self.decision(r,inp,'meter_quiet_normal',cap,command='set_limit',house=raw,
+                basis='whole_raw_quiet_normal_retention',normal_retention=True,
+                reason='Product data is quiet; fresh whole-meter load plus all possible current fits the normal budget. Renewing only the existing normal cap.'),
+                meter_quiet_normal_retention=True,meter_quiet_upper_amps=bound[0],meter_quiet_normal_budget_amps=bound[1])
         if self.recovering and cap==0:
             candidate=int(floor(min(s.max_charge_amps,s.main_fuse_amps-s.buffer_amps-raw)))
             if raw>s.main_fuse_amps or candidate<r.startup_current:
@@ -717,15 +759,16 @@ class MeterEnvelopePolicy:
                     confirmation_deadline=self.confirmation_deadline,overload=peak.overload_authority and raw>s.main_fuse_amps,
                     reason='Timely genuine minimum response; waiting for the later meter inside the separate original confirmation phase.')
         cycle=r._ensure_automatic_cycle()
-        if raw<=s.main_fuse_amps:
-            self.ordinary_decrease_grid=self.ordinary_decrease_cap=None
+        if self.ordinary_decrease_grid is not None and gt>self.ordinary_decrease_grid:
+            self.ordinary_decrease_grid=self.ordinary_decrease_cap=self.ordinary_decrease_raw=None
+        if (live and peak is None and cap==self.ordinary_decrease_cap and self.ordinary_decrease_grid is not None
+                and gt<=self.ordinary_decrease_grid
+                and self.ordinary_decrease_raw is not None and raw<=self.ordinary_decrease_raw
+                and (raw<=s.main_fuse_amps or cycle['used_seconds']<s.overload_budget_seconds)):
+            return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
+                no_write_deadline=r.last_set_limit_ts+r.last_target[3],
+                reason='The same pre-decrease meter packet cannot claim another response or stop; retain only its actual finite lower lease.')
         if s.main_fuse_amps<raw<=28. and live:
-            if (cap==self.ordinary_decrease_cap and self.ordinary_decrease_grid is not None
-                    and gt<=self.ordinary_decrease_grid
-                    and cycle['used_seconds']<s.overload_budget_seconds):
-                return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
-                    no_write_deadline=r.last_set_limit_ts+r.last_target[3],
-                    reason='The same pre-decrease meter packet cannot claim another response or stop; retain only its actual finite lower lease.')
             if (status=='charging' and self.ev_estimate(r,inp)
                     and r._controlled_l1_after(self.l1,self.accepted_l1_floor)):
                 house=max(0.,raw-ev)

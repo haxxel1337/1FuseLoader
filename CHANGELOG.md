@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0b44
+
+- After an accepted normal decrease, retain only that original lower lease
+  while the meter still represents the pre-dispatch sample. A later EV report
+  alone must not count the same meter excess twice or renew the lease.
+- A stronger measured load, new source/critical fault, original lease expiry
+  or electrical episode still takes precedence. A genuinely later meter
+  sample permits the next normal allocation.
+- Distinguish quiet ProductUpdate data from actual transport, online, runtime
+  or clock faults. Selected meter control may renew only an already live,
+  accepted normal cap when fresh whole-meter load plus all possible positive
+  authority fits the normal budget. Quiet data cannot start, raise, resume,
+  recover a fault or grant overload authority; legacy freshness stays strict.
+- Retain generation-scoped latest diagnostic fields separately from the event
+  ring, including reason-for-no-current and the charger-level dynamic limit.
+  Preserve provider and receipt clocks and label repeated or regressed events;
+  a pilot-zero context is not physical response or causal command proof.
+- Preserve overload limits, electrical deadlines, budget and incident history.
+  These corrections do not establish the cause of separate interruptions
+  where Easee's pilot/output reaches zero before a controller zero command.
+
 ## 0.4.0b43
 
 - Bind missing or changed mapped-phase provenance at a later actual accepted

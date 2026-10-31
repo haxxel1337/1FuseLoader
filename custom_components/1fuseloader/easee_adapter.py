@@ -130,6 +130,7 @@ class NativeTelemetryObservation:
     batch_sequence: int
     receiver_generation: int
     error: str | None = None
+    origin: str = "unknown"
 
     def public(self) -> dict[str, Any]:
         # No mid, serial, site, account, headers or raw provider payload.
@@ -137,7 +138,10 @@ class NativeTelemetryObservation:
                 "source_at_utc": self.source_at_utc, "received_at_utc": self.received_at_utc,
                 "received_monotonic": self.received_monotonic,
                 "batch_sequence": self.batch_sequence, "receiver_generation": self.receiver_generation,
-                "error": self.error, "scope": "native_event_receipt_not_physical_acquisition"}
+                "error": self.error,
+                "origin": (self.origin if self.origin == "signalr_product_update_callback" else "unknown"),
+                "control_evidence": False,
+                "scope": "callback_receipt_may_contain_cached_provider_data_not_physical_or_control_proof"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,7 +450,8 @@ class EaseeCommandAdapter:
                     owner._current_observation_callback()
                 except Exception:
                     pass
-            owner._receive_telemetry_observations(payload, charger_id)
+            owner._receive_telemetry_observations(payload, charger_id,
+                origin="signalr_product_update_callback")
 
         try:
             connection.on("CommandResponse", received)
@@ -457,7 +462,7 @@ class EaseeCommandAdapter:
         self._hook_connection = connection
         self._hook_identity = identity
 
-    def _receive_telemetry_observations(self, payload: Any, charger_id: str) -> None:
+    def _receive_telemetry_observations(self, payload: Any, charger_id: str, *, origin: str = "unknown") -> None:
         callback = self._telemetry_callback
         if not callable(callback):
             return
@@ -492,7 +497,7 @@ class EaseeCommandAdapter:
                 error = error or source_error
             events.append(NativeTelemetryObservation(key, value,
                 source.isoformat() if source is not None else None, received.isoformat(),
-                _monotonic(), self._telemetry_batch_sequence, self._hook_generation, error))
+                _monotonic(), self._telemetry_batch_sequence, self._hook_generation, error, origin))
         if events:
             try:
                 callback(tuple(events))
@@ -968,9 +973,9 @@ class EaseeCommandAdapter:
             self._product_data,
         )
 
-    def _require_same_runtime(self, identity: tuple[Any, ...], *, healthy: bool) -> None:
+    def _require_same_runtime(self, identity: tuple[Any, ...], *, healthy: bool, allow_product_quiet: bool = False) -> None:
         """Reject results or follow-up commands across an integration reload."""
-        problem = self.telemetry_block_reason if healthy else self._resolve_runtime()
+        problem = (self.transport_block_reason if allow_product_quiet else self.telemetry_block_reason) if healthy else self._resolve_runtime()
         if problem:
             raise EaseeAdapterError(problem)
         current = self._runtime_identity()
@@ -1160,6 +1165,14 @@ class EaseeCommandAdapter:
         problem = self.telemetry_block_reason
         if problem:
             return problem
+        return self.offline_fallback_block_reason
+
+    @property
+    def offline_fallback_block_reason(self) -> str | None:
+        """Actual transport and offline limits, independent of product silence."""
+        problem = self.transport_block_reason
+        if problem:
+            return problem
         for phase in (1, 2, 3):
             value = self._product_data.state.get(f"offlineMaxCircuitCurrentP{phase}")
             if isinstance(value, bool):
@@ -1173,13 +1186,8 @@ class EaseeCommandAdapter:
         return None
 
     @property
-    def telemetry_block_reason(self) -> str | None:
-        """Use stream health, since unchanged status/current entities can be old.
-
-        Easee sets latestPulse locally when ProductUpdate data arrives. It is
-        not the transport's own ping clock or a physical acquisition timestamp.
-        Missing recent product data conservatively blocks positive commands.
-        """
+    def transport_block_reason(self) -> str | None:
+        """Hard selected-source faults; ProductUpdate silence is separate."""
         problem = self._resolve_runtime()
         if problem:
             return self._controlled_health_result(problem)
@@ -1195,11 +1203,42 @@ class EaseeCommandAdapter:
             if not isinstance(pulse, datetime) or pulse.tzinfo is None:
                 return self._controlled_health_result("easee_heartbeat_missing")
             age = (datetime.now(timezone.utc) - pulse).total_seconds()
-            if age < -5 or age > MAX_TELEMETRY_AGE_SECONDS:
+            if age < -5:
                 return self._controlled_health_result("easee_heartbeat_stale")
         except (AttributeError, TypeError, ValueError, OverflowError):
             return self._controlled_health_result("easee_telemetry_invalid")
         return None
+
+    @property
+    def product_data_quiet(self) -> bool:
+        if self.transport_block_reason is not None:
+            return False
+        return (datetime.now(timezone.utc)-self._product_data.state["latestPulse"]).total_seconds()>MAX_TELEMETRY_AGE_SECONDS
+
+    @property
+    def telemetry_block_reason(self) -> str | None:
+        """Legacy strict data gate. Silence alone never destroys phase scope."""
+        problem=self.transport_block_reason
+        if problem:
+            return problem
+        return "easee_heartbeat_stale" if self.product_data_quiet else None
+
+    @staticmethod
+    def _quiet_normal_permit(decision: Any) -> bool:
+        """Only a controller-revalidated same normal offer may use this lane."""
+        if getattr(decision,"meter_quiet_normal_retention",False) is not True:
+            return False
+        cap=getattr(decision,"current_p1",None)
+        raw=getattr(decision,"grid_l1",None)
+        upper=getattr(decision,"meter_quiet_upper_amps",None)
+        budget=getattr(decision,"meter_quiet_normal_budget_amps",None)
+        return bool(getattr(decision,"meter_envelope",False) is True
+            and decision.command=="set_limit" and decision.mode=="meter_quiet_normal"
+            and type(cap) is int and cap>0 and decision.committed_current_p1==cap
+            and decision.current_p2==decision.current_p3==0
+            and getattr(decision,"meter_overload_authority",False) is False
+            and all(type(v) in (int,float) and isfinite(v) for v in (raw,upper,budget))
+            and 0<=raw and cap<=upper<=40 and 0<budget<=23 and raw+upper<=budget)
 
     def _controlled_health_result(self, problem: str) -> str:
         # An observed transport/online gap cannot preserve a phase-to-current
@@ -1223,6 +1262,9 @@ class EaseeCommandAdapter:
         if problem:
             raise CommandNotSent(problem)
         command = decision.command
+        quiet_permit=self._quiet_normal_permit(decision)
+        if getattr(decision,"meter_quiet_normal_retention",False) and (not quiet_permit or not callable(on_dispatch)):
+            raise CommandNotSent("quiet_normal_dispatch_proof_required")
         if command in {"set_limit", "resume"}:
             currents = (decision.current_p1, decision.current_p2, decision.current_p3)
             if any(type(value) is not int or not 0 <= value <= 40 for value in currents):
@@ -1239,7 +1281,7 @@ class EaseeCommandAdapter:
             if command == "resume" and (currents[0] < 6 or currents[1:] != (0, 0)):
                 raise CommandNotSent("resume_requires_safe_l1_cap")
             if any(currents) or command == "resume":
-                health_problem = self.telemetry_block_reason
+                health_problem = self.transport_block_reason if quiet_permit else self.telemetry_block_reason
                 if health_problem:
                     raise CommandNotSent(health_problem)
         elif command != "pause":
@@ -1261,7 +1303,9 @@ class EaseeCommandAdapter:
                     # throttler) consumes the same deadline. No detached task
                     # may continue writing after cancellation or close.
                     self._require_same_runtime(identity, healthy=command == "resume" or
-                                               (command == "set_limit" and any(currents)))
+                                               (command == "set_limit" and any(currents)), allow_product_quiet=quiet_permit)
+                    if quiet_permit and self.offline_fallback_block_reason:
+                        raise CommandNotSent(self.offline_fallback_block_reason)
                     if command in {"set_limit", "resume"}:
                         previous = getattr(decision, "committed_current_p1", None)
                         protective = bool(command == "set_limit"
