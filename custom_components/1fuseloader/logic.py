@@ -196,6 +196,7 @@ class RegulatorInput:
     meter_grid_health: Optional[SourceHealth] = None
     meter_actuator_health: Optional[SourceHealth] = None
     meter_ev_health: Optional[SourceHealth] = None
+    meter_product_data_quiet: bool = False
     controlled_l1: Optional[ControlledL1Evidence] = None
 
 
@@ -453,6 +454,9 @@ class RegulatorDecision:
     meter_overload_authority: bool = False
     meter_ordinary_decrease: bool = False
     meter_basis_grid_ts: Optional[float] = None
+    meter_quiet_normal_retention: bool = False
+    meter_quiet_upper_amps: Optional[float] = None
+    meter_quiet_normal_budget_amps: Optional[float] = None
     controlled_l1_current: Optional[float] = None
     controlled_l1_used: bool = False
     meter_control_state: Optional[str] = None
@@ -6295,6 +6299,15 @@ class OneFuseRegulator:
             return False
         if planned.control_source_id != latest.control_source_id:
             return False
+        if decision.meter_quiet_normal_retention and not dispatched:
+            shadow=deepcopy(self)
+            engine=shadow._get_meter_envelope_policy()
+            fresh=engine.evaluate(shadow,latest)
+            bound=self._get_meter_envelope_policy().quiet_normal_bound(self,latest)
+            return bool(fresh.meter_zero_cause is None and fresh.command=='set_limit'
+                and fresh.current_p1==decision.current_p1 and bound is not None
+                and decision.command=='set_limit' and decision.current_p1==engine.lease.cap
+                and decision.current_p2==decision.current_p3==0)
         if dispatched:
             self._get_meter_envelope_policy().observe_inflight(self, latest, decision)
         shadow = deepcopy(self)

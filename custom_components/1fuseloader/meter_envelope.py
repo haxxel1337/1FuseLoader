@@ -292,6 +292,27 @@ class MeterEnvelopePolicy:
             origin=now-(wall-gt);self.episode=ElectricalEpisode(self.next_episode_id,inp.control_source_id,origin,origin+r.settings.overload_response_seconds,gt,self.upper)
             self.next_episode_id+=1
 
+    def quiet_normal_bound(self,r,inp):
+        """Independent whole-RAW proof, never stale EV subtraction or restart."""
+        if not r._meter_settings_valid(r.settings):
+            return None
+        now,wall,gt,raw=map(number,(inp.now_ts,inp.wall_now_ts,inp.grid_report_ts,inp.grid_l1))
+        if (None in (now,wall,gt,raw) or self.critical_error(r,inp) is not None
+                or not 0<=wall-gt<=min(15.,r.settings.max_sensor_age_seconds)
+                or not self.lease.live(now) or self.lease.cap<=0
+                or self.recovery.required or self.operational_fault or self.episode is not None
+                or self.cold_unknown_pending or not r.settings.active_control or r.settings.dry_run
+                or not r.settings.enable_dynamic_limit
+                or (inp.status or '').strip().lower() not in {'charging','start_charging','ready_to_charge','awaiting_start',
+                    'awaiting_load_balancing','connected','buffering'}
+                or self.lease.source_id!=inp.control_source_id):
+            return None
+        upper=max(self.upper,self.lease.cap,*(cap for cap,expiry in self.possible_positive.values() if expiry>now))
+        budget=min(23.,r.settings.main_fuse_amps-r.settings.buffer_amps)
+        if raw+upper>budget:
+            return None
+        return upper,budget
+
     def note_dispatch(self,r,d,record):
         if d.command=='set_limit' and d.current_p1>0:
             self.zero_l1_floor=None;self.lease.zero_dispatch=None
@@ -604,6 +625,20 @@ class MeterEnvelopePolicy:
         if status in manual:
             return self.decision(r,inp,'meter_wait',cap,
                 reason='Charger/user pause, authorization or schedule owns the session; no positive write or resume.')
+        if inp.meter_product_data_quiet:
+            bound=self.quiet_normal_bound(r,inp)
+            if bound is None:
+                return self.supervisor.zero(self,r,inp,C.ACTUATOR_INVALID,
+                    detail='Product data is quiet and independent whole-meter normal retention is unavailable.')
+            if (cap==self.ordinary_decrease_cap and self.ordinary_decrease_grid is not None
+                    and gt<=self.ordinary_decrease_grid):
+                return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
+                    no_write_deadline=self.lease.expires,
+                    reason='The old pre-decrease meter packet retains only its original finite lower lease; quiet data grants no renewal.')
+            return replace(self.decision(r,inp,'meter_quiet_normal',cap,command='set_limit',house=raw,
+                basis='whole_raw_quiet_normal_retention',normal_retention=True,
+                reason='Product data is quiet; fresh whole-meter load plus all possible current fits the normal budget. Renewing only the existing normal cap.'),
+                meter_quiet_normal_retention=True,meter_quiet_upper_amps=bound[0],meter_quiet_normal_budget_amps=bound[1])
         if self.recovering and cap==0:
             candidate=int(floor(min(s.max_charge_amps,s.main_fuse_amps-s.buffer_amps-raw)))
             if raw>s.main_fuse_amps or candidate<r.startup_current:

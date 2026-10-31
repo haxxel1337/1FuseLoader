@@ -28,7 +28,7 @@ from .const import (
     CONF_L3_ENTITY, CONF_STATUS_ENTITY, CONF_CONTROLLED_PHASE, DEFAULT_OPTIONS,
     DOMAIN, PLATFORMS, validate_options,
 )
-from .easee_adapter import CommandNotSent, EaseeCommandAdapter, NativeTelemetryObservation
+from .easee_adapter import CommandNotSent, EaseeCommandAdapter, NativeTelemetryObservation, PRIVATE_TELEMETRY_OBSERVATION_IDS
 from .command_delivery import CommandDeliveryTracker
 from .bmw_context import BMWContext
 from .logic import (
@@ -81,6 +81,7 @@ _SOURCE_METADATA_FIELDS = frozenset({
     "reported_circuit_reported_at_utc", "easee_source_health",
     "meter_envelope_control", "meter_control_health", "meter_estimate_quality",
     "meter_grid_valid", "meter_actuator_valid", "meter_ev_valid",
+    "easee_product_data_quiet",
     "meter_state", "meter_zero_cause",
     "meter_control_state", "meter_episode_id", "meter_operational_fault",
     "meter_recovery_stage",
@@ -327,6 +328,8 @@ class OneFuseLoaderController:
         self._current_observation_unsub = None
         self._telemetry_unsub = None
         self._native_telemetry_events: deque[dict[str, Any]] = deque(maxlen=128)
+        self._native_diagnostic_generation: int | None = None
+        self._native_diagnostics_by_id: dict[int, dict[str, Any]] = {}
         self._transport_events: deque[dict[str, Any]] = deque(maxlen=32)
         self._pilot_zero_observations: deque[dict[str, Any]] = deque(maxlen=8)
         self._last_pilot_output: tuple[int, float] | None = None
@@ -811,13 +814,24 @@ class OneFuseLoaderController:
         if self._stopped or not isinstance(observations, tuple):
             return
         urgent = False
-        recorded = False
+        recorded = []
         for event in observations[:64]:
-            if not isinstance(event, NativeTelemetryObservation):
+            if (not isinstance(event, NativeTelemetryObservation)
+                    or type(event.observation_id) is not int
+                    or event.observation_id not in PRIVATE_TELEMETRY_OBSERVATION_IDS
+                    or type(event.receiver_generation) is not int or event.receiver_generation < 1):
                 continue
             item = event.public()
             self._native_telemetry_events.append(item)
-            recorded = True
+            relation = self._retain_passive_diagnostic(event, item)
+            recorded.append((event, item, relation))
+        # Freeze end-of-batch context so a rare reason/limit occurring after
+        # output114 in the same payload is retained too. This is not a claim
+        # that those values were measured simultaneously or caused the zero.
+        context = self._passive_diagnostic_context()
+        for event, item, relation in recorded:
+            if event.receiver_generation != self._native_diagnostic_generation:
+                continue
             if event.observation_id != 114 or event.error is not None or type(event.value) not in (int, float):
                 continue
             previous = (self._last_pilot_output[1] if self._last_pilot_output is not None
@@ -831,6 +845,8 @@ class OneFuseLoaderController:
                     "last_attempt": _limit_receipt_summary(self.last_command_attempt)
                         if self.last_command_attempt else None,
                     "last_mode": self.last_decision.mode if self.last_decision else None,
+                    "source_relation": relation,
+                    "diagnostic_context": deepcopy(context),
                     "scope": "pilot_zero_observed_not_measured_EV_current_or_causal_command_proof"})
                 urgent = True
         if not recorded:
@@ -852,6 +868,49 @@ class OneFuseLoaderController:
                 self._queue_incident_journal()
 
             self._passive_journal_unsub = async_call_later(self.hass, 5., flush)
+
+    def _retain_passive_diagnostic(self, event: NativeTelemetryObservation, item: dict[str, Any]) -> str:
+        """Bounded private provenance only; never supply controller evidence."""
+        generation = event.receiver_generation
+        if self._native_diagnostic_generation is None or generation > self._native_diagnostic_generation:
+            self._native_diagnostics_by_id.clear()
+            self._native_diagnostic_generation = generation
+        elif generation < self._native_diagnostic_generation:
+            return "retired_receiver_generation"
+        previous = self._native_diagnostics_by_id.get(event.observation_id, {})
+        highwater = previous.get("provider_highwater")
+        source = self._utc_time(event.source_at_utc)
+        received = self._utc_time(event.received_at_utc)
+        previous_source = self._utc_time(highwater.get("source_at_utc")) if highwater else None
+        advanced = False
+        if item.get("origin") != "signalr_product_update_callback":
+            relation = "unknown_event_origin"
+        elif event.error is not None:
+            relation = "invalid_observation"
+        elif source is None:
+            relation = "missing_provider_timestamp"
+        elif previous_source is None or source > previous_source:
+            relation = "first_provider_timestamp" if previous_source is None else "advancing_provider_timestamp"
+            highwater = dict(item)
+            advanced = True
+        elif source < previous_source:
+            relation = "regressed_provider_timestamp"
+        else:
+            relation = ("duplicate_provider_timestamp" if item["value"] == highwater["value"]
+                else "same_provider_timestamp_changed_value")
+        self._native_diagnostics_by_id[event.observation_id] = {
+            "last_received": dict(item), "provider_highwater": highwater,
+            "source_relation": relation, "highwater_receipt_advanced": advanced,
+            "provider_age_at_receipt_seconds": (received-source).total_seconds()
+                if received is not None and source is not None else None,
+            "control_evidence": False,
+        }
+        return relation
+
+    def _passive_diagnostic_context(self) -> dict[str, Any]:
+        return {"receiver_generation": self._native_diagnostic_generation,
+            "observations": {str(key): deepcopy(value) for key, value in sorted(self._native_diagnostics_by_id.items())},
+            "scope": "latest_per_id_at_received_batch_end_not_synchronized_or_control_proof"}
 
     def _cancel_passive_journal_flush(self) -> None:
         if self._passive_journal_unsub is not None:
@@ -1380,11 +1439,14 @@ class OneFuseLoaderController:
         # Easee states are event-driven: a stable value may be hours old. Its
         # adapter verifies source heartbeat/online health instead of entity age.
         health_error = "easee_source_unverified"
+        product_data_quiet = False
         if self._adapter is None:
             errors.append("Easee source health has not been verified.")
             actuator_errors.append("Easee source health has not been verified.")
         else:
-            health_error = self._adapter.telemetry_block_reason
+            product_data_quiet = getattr(self._adapter,"product_data_quiet",False) is True
+            health_error = (getattr(self._adapter,"transport_block_reason","easee_source_unverified")
+                if self.settings.meter_envelope_control and product_data_quiet else self._adapter.telemetry_block_reason)
             if health_error:
                 errors.append(str(health_error))
                 actuator_errors.append(str(health_error))
@@ -1392,6 +1454,14 @@ class OneFuseLoaderController:
             grid_state, current_state, status_state, health_error, errors,
             grid_value=grid_value, grid_report_ts=grid_report_ts,
         )
+        if self.settings.meter_envelope_control and product_data_quiet:
+            quiet_reason="ProductUpdate data is quiet; only independently whole-meter-bounded normal retention is eligible. Cached EV data is not fresh."
+            prior_reason=(self.source_diagnostics.get("source_health_reason","")+" "
+                if self.source_diagnostics.get("source_health")!="healthy" else "")
+            self.source_diagnostics.update(
+                source_health="degraded" if self.source_diagnostics.get("source_health")=="healthy" else "unhealthy",
+                easee_source_health="easee_product_data_quiet",
+                source_health_reason=prior_reason+quiet_reason)
         self.source_diagnostics.update({
             "grid_source_kind": "currently_one_validated_mqtt" if self._l1_source_config or self._l1_source_error else "ha_entity_report",
             "grid_state_reported_at_utc": (self._utc_time(getattr(grid_state, "last_reported", None)).isoformat()
@@ -1743,6 +1813,8 @@ class OneFuseLoaderController:
             if event_source_known and (event_source_ts is None
                     or not -2 <= wall_now - event_source_ts <= self.settings.max_sensor_age_seconds):
                 ev_errors.append("Charger current provider event is old or invalid.")
+            if product_data_quiet:
+                ev_errors.append("ProductUpdate data is quiet; cached EV readings grant no response or increase credit.")
             grid_health = SourceHealth(not grid_errors, " ".join(dict.fromkeys(grid_errors)) or None)
             actuator_health = SourceHealth(not actuator_errors, " ".join(dict.fromkeys(actuator_errors)) or None)
             ev_health = SourceHealth(not ev_errors, " ".join(dict.fromkeys(ev_errors)) or None)
@@ -1756,6 +1828,7 @@ class OneFuseLoaderController:
                 "meter_ev_valid": ev_health.valid,
                 "meter_control_health": "healthy" if grid_health.valid and actuator_health.valid else "unhealthy",
                 "meter_estimate_quality": "usable" if ev_health.valid else "unavailable_for_increase",
+                "easee_product_data_quiet": product_data_quiet,
                 "meter_source_scope": "validated_RAW_and_actuator_faults_are_critical;EV_estimate_quality_controls_increase_credit",
             })
         controlled_l1 = None
@@ -1855,6 +1928,7 @@ class OneFuseLoaderController:
             meter_grid_health=grid_health,
             meter_actuator_health=actuator_health,
             meter_ev_health=ev_health,
+            meter_product_data_quiet=product_data_quiet,
             controlled_l1=controlled_l1,
         )
 
@@ -2301,6 +2375,11 @@ class OneFuseLoaderController:
                            meter_actuator_health=SourceHealth(False, reason))
         return replace(inp, data_valid=False, data_error=reason)
 
+    def _runtime_offline_problem(self, inp: RegulatorInput) -> str | None:
+        if self.settings.meter_envelope_control and inp.meter_product_data_quiet:
+            return getattr(self._adapter,"offline_fallback_block_reason","offline_fallback_unverified")
+        return getattr(self._adapter,"overload_block_reason","offline_fallback_unverified")
+
     async def _checkpoint_unsent_cleanup(self, decision: Any) -> None:
         """Remove only a proven unsent intent, preserving all old exposure."""
         if not self.regulator.reject_unsubmitted(decision, self.hass.loop.time()):
@@ -2347,6 +2426,7 @@ class OneFuseLoaderController:
                 inp.charger_observation_report_times,
                 inp.charger_observation_sequences, inp.charger_observation_evidence_credit,
                 inp.meter_grid_health, inp.meter_actuator_health, inp.meter_ev_health,
+                inp.meter_product_data_quiet,
                 inp.controlled_l1 if self.settings.meter_envelope_control else None,
                 age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
@@ -2384,7 +2464,7 @@ class OneFuseLoaderController:
             self._budget_error_type = self._budget_store.last_error_type
             self._budget_retry_at = self.hass.loop.time() + EXPOSURE_STORE_RETRY_SECONDS
         if self.settings.overload_enabled or self.settings.meter_envelope_control:
-            offline_problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
+            offline_problem = self._runtime_offline_problem(inp)
             budget_fault = self._budget_error if self._budget_error != "overload_budget_save_pending" else None
             if offline_problem or budget_fault:
                 inp = self._critical_runtime_input(inp, budget_fault or offline_problem)
@@ -2771,7 +2851,7 @@ class OneFuseLoaderController:
             # lease renewal. A new hard load/fault can require zero instead.
             latest = self._read_input()
             if self.settings.overload_enabled or self.settings.meter_envelope_control:
-                problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
+                problem = self._runtime_offline_problem(latest)
                 pending_safe = self._pending_checkpoint_allows_normal(decision, latest)
                 budget_fault = self._budget_error if not pending_safe else None
                 if problem or budget_fault:
@@ -2833,6 +2913,12 @@ class OneFuseLoaderController:
                     or self._dispatch_superseded):
                 return False
             latest = self._read_input()
+            if decision.meter_quiet_normal_retention:
+                if (self._protective_zero_pending or self._delivery.unresolved_correlated_zero
+                        or self._budget_error not in {None,"overload_budget_save_pending"}
+                        or self._runtime_offline_problem(latest)
+                        or not self.regulator.can_continue_meter_dispatch(inp,latest,decision)):
+                    return False
             if positive_submission and self._input_revision(latest) != self._input_revision(inp):
                 ready = decision.mode.removeprefix("dry_run_") == "disconnected_ready"
                 if self.settings.meter_envelope_control:
@@ -3067,7 +3153,7 @@ class OneFuseLoaderController:
                 # do not wait for another periodic tick or replay this offer.
                 latest = self._read_input()
                 if self.settings.overload_enabled or self.settings.meter_envelope_control:
-                    problem = getattr(self._adapter, "overload_block_reason", "offline_fallback_unverified")
+                    problem = self._runtime_offline_problem(latest)
                     budget_fault = (self._budget_error
                         if self._budget_error != "overload_budget_save_pending" else None)
                     if problem or budget_fault:
@@ -3114,6 +3200,7 @@ class OneFuseLoaderController:
             "commands": [dict(item) for item in self._recent_commands],
             "stops": [dict(item) for item in self._recent_stop_contexts],
             "native_events": [dict(item) for item in self._native_telemetry_events],
+            "native_latest_diagnostics": self._passive_diagnostic_context(),
             "transport_events": [dict(item) for item in self._transport_events],
             "pilot_zero_observations": [dict(item) for item in self._pilot_zero_observations],
         }

@@ -50,6 +50,30 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Quiet product data during an existing normal allocation (b44)
+
+Easee's `latestPulse` records receipt of application ProductUpdate data. It is
+separate from transport connection state and physical measurement time. When
+only that application clock becomes quiet, selected meter control can retain
+and renew an existing accepted normal cap if fresh whole-meter load plus the
+largest still-possible positive authority fits the normal fuse-minus-buffer
+budget. The finite circuit lease and normal renewal cadence remain in force.
+This exception cannot start or raise an allocation, resume a session, clear
+recovery or use overload permission. Offline, disconnected, invalid clocks,
+identity changes, unknown delivery and electrical episodes remain separate
+protective conditions. Old EV data never supplies additional current credit.
+
+An accepted normal decrease also waits for a post-dispatch meter sample before
+another adjustment: a later EV report cannot repeatedly shed against the same
+old meter packet. A stronger raw load still preempts that finite hold.
+
+The private incident journal keeps generation-scoped latest diagnostic fields
+outside its bounded event ring. Original provider and local receipt clocks
+remain visible, including repeated, conflicting or regressed provider data.
+Pilot-zero snapshots include the end-of-batch diagnostic context; this is
+neither synchronized physical acquisition nor proof of which command caused
+the interruption. No extra polling or charger commands populate that context.
+
 ### Late phase identification during normal recovery (b43)
 
 The first normal command can precede the charger's valid phase identification.
