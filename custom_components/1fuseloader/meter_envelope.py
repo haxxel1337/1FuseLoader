@@ -796,6 +796,14 @@ class MeterEnvelopePolicy:
         if coherent:
             self.feedback_base_cap=self.feedback_source=None
             desired=int(floor(min(s.max_charge_amps,s.main_fuse_amps-s.buffer_amps-(raw-ev))))
+            if raw<=s.main_fuse_amps-s.buffer_amps:
+                # Ordered receipts are not simultaneous physical samples:
+                # a delayed ramp report must not turn already-normal RAW
+                # into a spurious house-load step and repeated down/up caps.
+                # Retain only the actual live authority, still clamped by an
+                # explicit lower maximum. EV-based new increases keep their
+                # independent post-dispatch eligibility checks below.
+                desired=max(desired,min(cap,s.max_charge_amps))
             if r._controlled_l1_after(self.l1,self.accepted_l1_floor):
                 self.upper=max(cap,ev)
                 if cap==minimum and ev<=minimum+.5:
