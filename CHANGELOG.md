@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0b45
+
+- Keep the actual accepted normal cap when the measured grid total is already
+  within the buffered normal budget. Ordered but physically asynchronous EV
+  ramp reports must not manufacture house-load steps and unnecessary down/up
+  limit commands. An explicit lower configured maximum still takes effect.
+- Use one measured-normal continuation guard for pure ProductUpdate silence,
+  local retention and queued dispatch. Only the same actually accepted finite
+  ordinary allocation can renew, with fresh normal grid data and a healthy
+  control connection. Older unexpired higher command authority still blocks it.
+- Track normal admission from the actual SDK acknowledgement, never from
+  persisted history, a proposed cap, an old physical estimate or a mapping
+  update. An expired higher command cannot keep a lower normal cap blocked.
+- A properly readmitted normal cap may continue while recovery awaits vehicle
+  response after the previous authority has retired. Keep the unresolved fault,
+  recovery state, consumed budget and history; this grants no overload credit.
+- Quiet data cannot start, raise, resume or prove physical response. Active
+  unknown delivery, storage failure, invalid/stale grid, real transport/offline
+  faults, finite lease expiry and original electrical deadlines still preempt.
+- Preserve the 25/29/38 A profile, response and grid-confirmation intervals,
+  cumulative exposure and automatic rearm rules. This does not establish the
+  cause of separate circuit/pilot-zero interruptions following positive API
+  submissions, nor does HTTP acceptance prove physical delivery or device TTL.
+
 ## 0.4.0b44
 
 - After an accepted normal decrease, retain only that original lower lease

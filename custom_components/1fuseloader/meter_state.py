@@ -54,6 +54,9 @@ class LeaseState:
     minimum_verified: bool = False
     normal_house: Optional[float] = None
     normal_origin: Optional[float] = None
+    # Runtime proof of an actual accepted ordinary allocation. Persisted
+    # history, a proposed cap and a mapping update cannot manufacture it.
+    normal_admitted: bool = False
 
     def live(self, now):
         return self.cap > 0 and self.origin is not None and self.expires is not None and self.origin <= now < self.expires

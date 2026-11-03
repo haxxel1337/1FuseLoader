@@ -147,12 +147,17 @@ class B44QuietSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(d.meter_zero_cause,d)
         self.assert_no_positive()
 
-    async def test_normal_whole_offer_bound_does_not_use_old_ev_subtraction(self):
+    async def test_measured_normal_total_retains_same_cap_without_old_ev_credit(self):
         await self.prepare_quiet()
-        d=await self.tick(315.,8.)
-        # RAW8 + accepted16 exceeds normal23. Old EV16 is not house credit.
-        self.assertIsNotNone(d.meter_zero_cause,d)
-        self.assert_no_positive()
+        d=await self.tick(340.,18.1)
+        # B45 aligns pure application silence with ordinary unavailable-EV
+        # feedback: RAW already includes the draw. No old EV is subtracted,
+        # and only the actual accepted normal16A lease may renew.
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertTrue(self.plant.sdk_calls)
+        self.assertTrue(all(row['cap']==16 and row['ttl']==60 for row in self.plant.sdk_calls))
+        self.assertFalse(d.meter_overload_authority)
+        self.plant.sdk_charger.resume.assert_not_awaited()
 
     async def test_old_larger_possible_offer_counts_after_a_lower_normal_ack(self):
         p=self.plant
@@ -259,7 +264,7 @@ class B44QuietSafetyTests(unittest.IsolatedAsyncioTestCase):
                 'This oracle must exercise a queued positive normal renewal')
             self.assertFalse(p.sdk_calls)
             p.now=339. if kind=='monotonic' else 341.
-            p.grid(8. if kind=='raw' else 3.,
+            p.grid(23.1 if kind=='raw' else 3.,
                 335. if kind=='grid_clock' else p.now)
             if kind=='transport': p.product.state['signalRConnected']=False
         finally:
@@ -269,7 +274,7 @@ class B44QuietSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(p.controller.regulator.meter_control_diagnostics()['operational_fault'],
                             'unknown_delivery')
 
-    async def test_whole_raw_bound_is_rechecked_after_waiting_for_adapter_lock(self):
+    async def test_measured_normal_bound_is_rechecked_after_waiting_for_adapter_lock(self):
         await self.queued_quiet_change('raw')
 
     async def test_real_transport_is_rechecked_after_waiting_for_adapter_lock(self):

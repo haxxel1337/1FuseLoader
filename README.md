@@ -50,18 +50,48 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
-### Quiet product data during an existing normal allocation (b44)
+### Stable normal feedback and quiet continuation (b45)
+
+A fresh measured grid total already includes the car. While that total fits
+the buffered normal budget, a delayed vehicle ramp report must not lower an
+actually accepted live normal cap merely because subtracting the asynchronous
+values suggests a larger house load. The explicit configured maximum still
+applies. Genuine measured excess, critical sources and electrical deadlines
+retain their independent authority; qualified EV evidence is still required
+for an EV-based increase.
+
+Pure ProductUpdate silence removes vehicle-observation credit. It need not
+stop the same finite normal allocation when the actual control connection is
+healthy and fresh measured total remains within the normal budget. The shared
+continuation guard runs for the policy, retention and actual queued dispatch.
+It requires real normal SDK admission, the same live cap and source, no larger
+unexpired possible command, no cold or unresolved electrical episode and valid clocks.
+Historical measured current is not new command authority. This cannot start,
+raise, resume, use overload headroom or manufacture physical response evidence.
+
+An already readmitted normal cap can also continue in `await_normal_response`
+after the old authority has retired. Recovery, the unresolved operational fault
+and budget are preserved. Active delivery or persistence failures still block
+through their runtime guards. Missing/stale grid and a real offline/transport
+fault remain protective. A settled, verified minimum-hold episode can retain
+only an actually readmitted normal 7 A cap; it gains no new response window or
+overload authority. The sixty-second lease and existing renewal schedule
+are unchanged; an API acknowledgement does not prove a device renewed its TTL.
+
+The earlier B44 whole-RAW-plus-cap quiet rule is superseded by this measured
+normal-continuation rule. Legacy freshness and deliberate overload permission
+are unchanged. Separate circuit/pilot-zero events after positive submissions
+still require delivery and physical evidence; these fixes are not proof that
+every interruption has the same cause.
+
+### Earlier quiet-data handling (b44)
 
 Easee's `latestPulse` records receipt of application ProductUpdate data. It is
-separate from transport connection state and physical measurement time. When
-only that application clock becomes quiet, selected meter control can retain
-and renew an existing accepted normal cap if fresh whole-meter load plus the
-largest still-possible positive authority fits the normal fuse-minus-buffer
-budget. The finite circuit lease and normal renewal cadence remain in force.
-This exception cannot start or raise an allocation, resume a session, clear
-recovery or use overload permission. Offline, disconnected, invalid clocks,
-identity changes, unknown delivery and electrical episodes remain separate
-protective conditions. Old EV data never supplies additional current credit.
+separate from transport connection state and physical measurement time. B44
+introduced a narrow whole-meter-plus-possible-authority quiet exception; B45
+replaces that bound with the shared measured-normal guard described above.
+The finite circuit lease and normal renewal cadence remain in force. Old EV
+data never supplies additional current or physical-response credit.
 
 An accepted normal decrease also waits for a post-dispatch meter sample before
 another adjustment: a later EV report cannot repeatedly shed against the same

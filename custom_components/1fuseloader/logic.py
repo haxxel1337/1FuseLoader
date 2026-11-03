@@ -455,6 +455,7 @@ class RegulatorDecision:
     meter_ordinary_decrease: bool = False
     meter_basis_grid_ts: Optional[float] = None
     meter_quiet_normal_retention: bool = False
+    meter_normal_continuation_proven: bool = False
     meter_quiet_upper_amps: Optional[float] = None
     meter_quiet_normal_budget_amps: Optional[float] = None
     controlled_l1_current: Optional[float] = None
@@ -6303,7 +6304,7 @@ class OneFuseRegulator:
             shadow=deepcopy(self)
             engine=shadow._get_meter_envelope_policy()
             fresh=engine.evaluate(shadow,latest)
-            bound=self._get_meter_envelope_policy().quiet_normal_bound(self,latest)
+            bound=self._get_meter_envelope_policy().normal_continuation_bound(self,latest)
             return bool(fresh.meter_zero_cause is None and fresh.command=='set_limit'
                 and fresh.current_p1==decision.current_p1 and bound is not None
                 and decision.command=='set_limit' and decision.current_p1==engine.lease.cap
