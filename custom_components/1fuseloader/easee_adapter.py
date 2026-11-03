@@ -1233,12 +1233,13 @@ class EaseeCommandAdapter:
         upper=getattr(decision,"meter_quiet_upper_amps",None)
         budget=getattr(decision,"meter_quiet_normal_budget_amps",None)
         return bool(getattr(decision,"meter_envelope",False) is True
+            and getattr(decision,"meter_normal_continuation_proven",False) is True
             and decision.command=="set_limit" and decision.mode=="meter_quiet_normal"
             and type(cap) is int and cap>0 and decision.committed_current_p1==cap
             and decision.current_p2==decision.current_p3==0
             and getattr(decision,"meter_overload_authority",False) is False
             and all(type(v) in (int,float) and isfinite(v) for v in (raw,upper,budget))
-            and 0<=raw and cap<=upper<=40 and 0<budget<=23 and raw+upper<=budget)
+            and 0<=raw<=budget and cap==upper and 0<budget<=23)
 
     def _controlled_health_result(self, problem: str) -> str:
         # An observed transport/online gap cannot preserve a phase-to-current

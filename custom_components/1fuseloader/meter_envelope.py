@@ -151,11 +151,14 @@ class MeterEnvelopePolicy:
     def import_boundary(self,r,snapshot):
         accepted=snapshot.get('accepted') if snapshot else None
         if accepted is not None and (self.lease.origin is None or accepted['origin']>=self.lease.origin):
+            same_admission=bool(self.lease.normal_admitted and self.lease.cap==accepted['cap']
+                and self.lease.origin==accepted['origin'] and self.lease.source_id==accepted['source_id'])
             same_normal=(self.lease.cap==accepted['cap'] and self.lease.source_id==accepted['source_id']
                 and self.lease.normal_origin==accepted.get('normal_origin') and self.accepted_l1_floor is not None
                 and accepted['floor'] is not None and self.accepted_l1_floor['key']==accepted['floor']['key'])
             self.lease.cap=accepted['cap'];self.lease.origin=accepted['origin'];self.lease.expires=accepted['expires']
             self.lease.source_id=accepted['source_id']
+            self.lease.normal_admitted=same_admission
             if not same_normal: self.accepted_l1_floor=deepcopy(accepted['floor'])
             self.lease.normal_origin=accepted.get('normal_origin')
             self.upper=max(self.upper,accepted['cap'])
@@ -292,26 +295,57 @@ class MeterEnvelopePolicy:
             origin=now-(wall-gt);self.episode=ElectricalEpisode(self.next_episode_id,inp.control_source_id,origin,origin+r.settings.overload_response_seconds,gt,self.upper)
             self.next_episode_id+=1
 
-    def quiet_normal_bound(self,r,inp):
-        """Independent whole-RAW proof, never stale EV subtraction or restart."""
+    def normal_continuation_bound(self,r,inp):
+        """Measured normal continuation of one actual accepted finite cap.
+
+        RAW already includes vehicle draw. Application-data silence withdraws
+        EV credit; it cannot alone turn that normal measured total into a new
+        stop. This predicate grants no startup, rise, response or overload
+        permission, and is rerun at retention and the actual SDK boundary.
+        """
         if not r._meter_settings_valid(r.settings):
             return None
         now,wall,gt,raw=map(number,(inp.now_ts,inp.wall_now_ts,inp.grid_report_ts,inp.grid_l1))
+        episode=self.episode
+        ordinary_minimum=bool(episode is not None and not episode.unresolved
+            and episode.phase==ControlState.MINIMUM_HOLD and self.minimum_verified
+            and self.lease.cap==r.startup_current)
         if (None in (now,wall,gt,raw) or self.critical_error(r,inp) is not None
                 or not 0<=wall-gt<=min(15.,r.settings.max_sensor_age_seconds)
-                or not self.lease.live(now) or self.lease.cap<=0
-                or self.recovery.required or self.operational_fault or self.episode is not None
+                or not self.lease.live(now) or self.lease.cap<=0 or not self.lease.normal_admitted
+                or self.lease.cap>r.settings.max_charge_amps
+                or episode is not None and not ordinary_minimum
                 or self.cold_unknown_pending or not r.settings.active_control or r.settings.dry_run
                 or not r.settings.enable_dynamic_limit
                 or (inp.status or '').strip().lower() not in {'charging','start_charging','ready_to_charge','awaiting_start',
                     'awaiting_load_balancing','connected','buffering'}
                 or self.lease.source_id!=inp.control_source_id):
             return None
-        upper=max(self.upper,self.lease.cap,*(cap for cap,expiry in self.possible_positive.values() if expiry>now))
+        if self.recovery.required or self.operational_fault:
+            # An actually accepted normal restart may continue while waiting
+            # for vehicle proof. Silence does not clear that separate fault,
+            # refill budget or grant any overload authority. Active unknown
+            # delivery/persistence is checked by runtime and dispatch gates;
+            # a historical fault name alone is not a new current fault.
+            recovery=self.recovery
+            if (not recovery.required or recovery.stage!='await_normal_response'
+                    or recovery.normal_dispatch is None or recovery.normal_cap!=self.lease.cap
+                    or self.lease.origin<recovery.normal_dispatch
+                    or recovery.old_authority_until is None or now<recovery.old_authority_until):
+                return None
+        possible=max((cap for cap,expiry in self.possible_positive.values() if expiry>now),default=0.)
+        upper=max(self.lease.cap,possible)
         budget=min(23.,r.settings.main_fuse_amps-r.settings.buffer_amps)
-        if raw+upper>budget:
+        # This is command authority, not a stale measured-current estimate.
+        # An earlier larger request counts until its original finite horizon;
+        # historical `upper` cannot keep it alive forever after that expiry.
+        if possible>self.lease.cap or raw>budget:
             return None
         return upper,budget
+
+    def quiet_normal_bound(self,r,inp):
+        """Compatibility name; there is one normal-continuation predicate."""
+        return self.normal_continuation_bound(r,inp)
 
     def note_dispatch(self,r,d,record):
         if d.command=='set_limit' and d.current_p1>0:
@@ -324,8 +358,14 @@ class MeterEnvelopePolicy:
 
     def acknowledge(self,r,d,now,dispatch):
         origin=dispatch['now'];old=self.lease.cap
+        same_normal=bool(self.lease.normal_admitted and old==d.current_p1
+            and self.lease.source_id==dispatch.get('source_id'))
         r.last_action_ts=now;r.last_set_limit_ts=origin;r.last_command='set_limit';r.last_target=(d.current_p1,0,0,d.ttl_seconds)
         self.lease.cap=d.current_p1;self.lease.origin=origin;self.lease.expires=origin+d.ttl_seconds
+        mode=d.mode.removeprefix('dry_run_')
+        self.lease.normal_admitted=bool(d.current_p1>0 and not d.meter_overload_authority
+            and (mode in {'meter_normal','meter_normal_decrease','meter_ready'}
+                or mode=='meter_quiet_normal' and same_normal))
         if d.current_p1<=0: return
         self.lease.source_id=dispatch.get('source_id');r._accepted_control_source_id=self.lease.source_id
         startup_proved=bool(self.start_since is not None and origin-self.start_since>=r.settings.restart_stable_seconds
@@ -583,6 +623,8 @@ class MeterEnvelopePolicy:
             and p.operational_fault is None and not p.recovery.required)
         if d.meter_zero_cause or (not episode_hold and (not d.meter_normal_retention or d.meter_overload_authority)):
             return None
+        if inp.meter_product_data_quiet and p.normal_continuation_bound(shadow,inp) is None:
+            return None
         template=proposed or d
         return replace(template,mode='meter_normal_hold',reason='Retaining only the actual live meter-envelope lease during local I/O; no command or renewal.',
             command=None,service=None,should_call_service=False,current_p1=cap,current_p2=0,current_p3=0,
@@ -626,19 +668,20 @@ class MeterEnvelopePolicy:
             return self.decision(r,inp,'meter_wait',cap,
                 reason='Charger/user pause, authorization or schedule owns the session; no positive write or resume.')
         if inp.meter_product_data_quiet:
-            bound=self.quiet_normal_bound(r,inp)
+            bound=self.normal_continuation_bound(r,inp)
             if bound is None:
                 return self.supervisor.zero(self,r,inp,C.ACTUATOR_INVALID,
-                    detail='Product data is quiet and independent whole-meter normal retention is unavailable.')
+                    detail='Product data is quiet and the actual finite normal allocation cannot continue under fresh meter supervision.')
             if (cap==self.ordinary_decrease_cap and self.ordinary_decrease_grid is not None
                     and gt<=self.ordinary_decrease_grid):
                 return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
                     no_write_deadline=self.lease.expires,
                     reason='The old pre-decrease meter packet retains only its original finite lower lease; quiet data grants no renewal.')
             return replace(self.decision(r,inp,'meter_quiet_normal',cap,command='set_limit',house=raw,
-                basis='whole_raw_quiet_normal_retention',normal_retention=True,
-                reason='Product data is quiet; fresh whole-meter load plus all possible current fits the normal budget. Renewing only the existing normal cap.'),
-                meter_quiet_normal_retention=True,meter_quiet_upper_amps=bound[0],meter_quiet_normal_budget_amps=bound[1])
+                basis='measured_normal_continuation',normal_retention=True,
+                reason='Product data is quiet; fresh measured total remains within the normal budget. Renewing only the actual accepted finite normal cap, without EV or overload credit.'),
+                meter_quiet_normal_retention=True,meter_normal_continuation_proven=True,
+                meter_quiet_upper_amps=bound[0],meter_quiet_normal_budget_amps=bound[1])
         if self.recovering and cap==0:
             candidate=int(floor(min(s.max_charge_amps,s.main_fuse_amps-s.buffer_amps-raw)))
             if raw>s.main_fuse_amps or candidate<r.startup_current:
