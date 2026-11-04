@@ -93,6 +93,9 @@ _SOURCE_METADATA_FIELDS = frozenset({
     "controlled_l1_output_phase", "controlled_l1_mapping_epoch",
     "controlled_l1_mapping_adopted_at_utc", "controlled_l1_sequence",
     "controlled_l1_error", "controlled_l1_current_error", "controlled_l1_committed",
+    "last_attempt_started_at_utc", "last_attempt_completed_at_utc",
+    "last_attempt_current_p1", "last_attempt_result", "last_attempt_http_status",
+    "last_limit_accepted_at_utc", "last_limit_current_p1", "last_limit_http_status",
 })
 
 
@@ -2123,6 +2126,14 @@ class OneFuseLoaderController:
 
     def diagnostic_attributes(self) -> dict[str, Any]:
         accepted = self.last_accepted_limit
+        attempt = self.last_command_attempt or {}
+        accepted_receipt = accepted or {}
+        attempt_delivery = attempt.get("delivery")
+        accepted_delivery = accepted_receipt.get("delivery")
+        if not isinstance(attempt_delivery, dict):
+            attempt_delivery = {}
+        if not isinstance(accepted_delivery, dict):
+            accepted_delivery = {}
         reported = tuple(self.source_diagnostics.get(f"reported_circuit_p{phase}") for phase in (1, 2, 3))
         comparison = None
         post_acceptance = None
@@ -2198,6 +2209,17 @@ class OneFuseLoaderController:
             "last_command_attempt": dict(self.last_command_attempt) if self.last_command_attempt else None,
             "last_accepted_command": dict(self.last_accepted_command) if self.last_accepted_command else None,
             "last_accepted_limit": dict(accepted) if accepted else None,
+            # Keep the latest local receipts inspectable even when nested
+            # incident context exceeds Recorder's compact view. These remain
+            # HTTP/local evidence, never physical response or device TTL proof.
+            "last_attempt_started_at_utc": attempt.get("started_at_utc"),
+            "last_attempt_completed_at_utc": attempt.get("completed_at_utc"),
+            "last_attempt_current_p1": attempt.get("target_p1"),
+            "last_attempt_result": attempt.get("result"),
+            "last_attempt_http_status": attempt_delivery.get("http_status"),
+            "last_limit_accepted_at_utc": accepted_receipt.get("completed_at_utc"),
+            "last_limit_current_p1": accepted_receipt.get("target_p1"),
+            "last_limit_http_status": accepted_delivery.get("http_status"),
             "last_stop_context": stop,
             "recent_command_journal": [_limit_receipt_summary(item) for item in list(self._recent_commands)[-2:]],
             "recent_stop_contexts": stop_summaries,
@@ -2913,7 +2935,7 @@ class OneFuseLoaderController:
                     or self._dispatch_superseded):
                 return False
             latest = self._read_input()
-            if decision.meter_quiet_normal_retention:
+            if decision.meter_quiet_normal_retention or decision.meter_feedback_curtailment:
                 if (self._protective_zero_pending or self._delivery.unresolved_correlated_zero
                         or self._budget_error not in {None,"overload_budget_save_pending"}
                         or self._runtime_offline_problem(latest)

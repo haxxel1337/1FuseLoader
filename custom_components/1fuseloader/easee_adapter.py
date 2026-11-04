@@ -1239,7 +1239,34 @@ class EaseeCommandAdapter:
             and decision.current_p2==decision.current_p3==0
             and getattr(decision,"meter_overload_authority",False) is False
             and all(type(v) in (int,float) and isfinite(v) for v in (raw,upper,budget))
-            and 0<=raw<=budget and cap==upper and 0<budget<=23)
+            and 0<=raw<=budget and cap==upper
+            and 0<budget<=(25 if cap==7 else 23))
+
+    @staticmethod
+    def _feedback_decrease_permit(decision: Any) -> bool:
+        """Shape of a callback-revalidated monotone meter-feedback decrease.
+
+        This withdraws existing authority. It does not claim a synchronized
+        house-load estimate, a physical response or extra overload permission.
+        The actual source, lease, meter age and prior authority are checked by
+        the controller callback immediately before SDK entry.
+        """
+        if getattr(decision, 'meter_feedback_curtailment', False) is not True:
+            return False
+        cap = getattr(decision, 'current_p1', None)
+        previous = getattr(decision, 'committed_current_p1', None)
+        raw = getattr(decision, 'grid_l1', None)
+        budget = getattr(decision, 'meter_feedback_budget_amps', None)
+        return bool(getattr(decision, 'meter_envelope', False) is True
+            and decision.command == 'set_limit'
+            and decision.mode == 'meter_normal_decrease'
+            and getattr(decision, 'meter_ordinary_decrease', False) is True
+            and type(cap) is int and type(previous) is int and 7 <= cap < previous <= 16
+            and decision.current_p2 == decision.current_p3 == 0
+            and getattr(decision, 'meter_overload_authority', False) is False
+            and all(type(v) in (int, float) and isfinite(v) for v in (raw, budget))
+            and 0 < budget <= 23 and budget < raw <= 28
+            and cap <= max(7, previous - ceil(raw - budget)))
 
     def _controlled_health_result(self, problem: str) -> str:
         # An observed transport/online gap cannot preserve a phase-to-current
@@ -1263,9 +1290,13 @@ class EaseeCommandAdapter:
         if problem:
             raise CommandNotSent(problem)
         command = decision.command
-        quiet_permit=self._quiet_normal_permit(decision)
+        feedback_permit = self._feedback_decrease_permit(decision)
+        quiet_permit=self._quiet_normal_permit(decision) or feedback_permit
         if getattr(decision,"meter_quiet_normal_retention",False) and (not quiet_permit or not callable(on_dispatch)):
             raise CommandNotSent("quiet_normal_dispatch_proof_required")
+        if getattr(decision, 'meter_feedback_curtailment', False) and (
+                not feedback_permit or not callable(on_dispatch)):
+            raise CommandNotSent('feedback_decrease_dispatch_proof_required')
         if command in {"set_limit", "resume"}:
             currents = (decision.current_p1, decision.current_p2, decision.current_p3)
             if any(type(value) is not int or not 0 <= value <= 40 for value in currents):

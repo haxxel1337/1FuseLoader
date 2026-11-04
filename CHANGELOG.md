@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0b46
+
+- Use one ordinary operating permission across planning, retained authority,
+  checkpoint revalidation and queued SDK admission. A fresh measured excursion
+  can curtail an existing normal cap without stale EV subtraction or an old
+  recovery label requesting an immediate zero.
+- Preserve known acknowledged decrease-chain horizons. Advancing normal meter
+  feedback may renew the same lower cap before its predecessor expires; the
+  same pre-SDK packet cannot trigger another decrease or renewal. Unknown or
+  differently bound higher authority remains a veto.
+- Keep coherent EV evidence's stricter ordinary allocation and distinguish
+  provisional feedback from overload permission. Spent budgets and the existing
+  finite-lease reserve still apply above nominal; accepted minimum continuation
+  can use the nominal fuse envelope without creating extra overload credit.
+- Qualify operational recovery from a fixed actual post-barrier normal ACK and
+  continuous advancing buffered-normal meter feedback. Retain accepted dispatch
+  provenance across buffer excursions; retain historical failures and exposure.
+- Keep latest local attempt and accepted-limit timestamps/caps/HTTP statuses
+  visible through diagnostic compaction. They do not verify physical delivery.
+- Preserve source, delivery, storage, original electrical deadlines and overload
+  accounting protections. Separate unexplained native pilot-zero events still
+  require current history and physical verification.
+
 ## 0.4.0b45
 
 - Keep the actual accepted normal cap when the measured grid total is already

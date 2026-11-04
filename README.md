@@ -50,6 +50,45 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### One ordinary operating permission (b46)
+
+The selected meter controller uses one ordinary permission calculation at
+planning, finite retention, checkpoint revalidation and actual SDK entry.
+An old recovery label cannot turn a fresh ordinary meter excursion directly
+into a zero when a live, normally admitted allocation can first be curtailed.
+For example, a 16 A allocation beside 25.4 A measured total can request 13 A
+when EV telemetry is too old for subtraction. This is provisional feedback,
+not proof that household load plus 13 A is below the buffered target. All
+actual time above 25 A still contributes to exposure. Coherent current evidence
+retains its independently stricter ordinary calculation.
+
+The same pre-dispatch meter packet cannot repeatedly lower the cap or renew
+its lease. After advancing feedback, the same lower normal cap can renew while
+known, actually acknowledged own higher commands retain their original finite
+horizons. Unknown, unacknowledged, imported or differently bound higher authority
+cannot use this exception. Quiet product data uses the same bounded ordinary
+curtailment path; it supplies no EV-response credit, increase, start or resume.
+At the accepted 7 A minimum, continuation may use the nominal 25 A envelope;
+the 23 A buffered target and below-23 A cooling observation remain separate.
+Above nominal, a new provisional lease requires the existing 90-second reserve
+and cannot use a spent budget. Continued overload at minimum still requires
+the actual overload policy.
+
+Operational recovery observes advancing normal meter frames for the configured
+restart interval after a real normal SDK acceptance and retirement of previous
+larger possible authority. Identical renewals cannot restart this observation;
+a buffer excursion can break stability without deleting the actual accepted
+dispatch. This qualifies operational normality, not a response to a particular
+command. Historical failures, cycle identity, used exposure and exhaustion are
+preserved. Actual electrical episodes, grid/control faults, unknown delivery,
+completed storage failures and finite lease expiry still preempt ordinary work.
+
+Flat latest-attempt/accepted-limit timestamps, caps and HTTP statuses survive
+diagnostic compaction. They remain local/cloud receipts, not proof of physical
+vehicle response or device TTL renewal. The 25/29/38 A profile, original 10-second
+peak response, selected post-minimum grid confirmation and automatic budget
+re-arm rules are unchanged.
+
 ### Stable normal feedback and quiet continuation (b45)
 
 A fresh measured grid total already includes the car. While that total fits

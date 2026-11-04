@@ -12,6 +12,23 @@ class ControlState(str, Enum):
     STOP_RECOVERY = 'STOP_RECOVERY'
 
 
+@dataclass(frozen=True)
+class OperatingPermission:
+    """One measured-feedback action for an actual admitted normal lease.
+
+    A decrease is provisional curtailment, not a household/EV subtraction
+    certificate. A hold cannot submit a command or extend any lease.
+    """
+    kind: str
+    cap: int
+    accepted_cap: int
+    raw: float
+    normal_budget: float
+    lease_expires: float
+    source_id: object
+    hold_until: Optional[float] = None
+
+
 @dataclass
 class ElectricalEpisode:
     episode_id: int
@@ -57,6 +74,10 @@ class LeaseState:
     # Runtime proof of an actual accepted ordinary allocation. Persisted
     # history, a proposed cap and a mapping update cannot manufacture it.
     normal_admitted: bool = False
+    # Actual ACKs only. A known own decrease may retain its preceding possible
+    # command horizons; imported or unacknowledged authority is not a chain.
+    normal_commands: dict = field(default_factory=dict)
+    feedback_parents: dict = field(default_factory=dict)
 
     def live(self, now):
         return self.cap > 0 and self.origin is not None and self.expires is not None and self.origin <= now < self.expires
@@ -73,3 +94,12 @@ class RecoveryState:
     normal_floor: Optional[dict] = None
     candidate_plan: Optional[int] = None
     old_authority_until: Optional[float] = None
+    operating_since: Optional[float] = None
+    operating_grid_since: Optional[float] = None
+    operating_last_grid: Optional[float] = None
+    operating_origin: Optional[float] = None
+    operating_source: object = None
+    operating_dispatch: Optional[float] = None
+    operating_dispatch_wall: Optional[float] = None
+    operating_cap: Optional[int] = None
+    operating_binding: object = None
