@@ -9,7 +9,7 @@ This is a **soft load balancer** for an Easee charger where a BMW is effectively
 ## Target
 
 - Home Assistant Core: **2026.10.1** (minimum and CI target)
-- Compatibility adapter: **Easee 0.9.74 / pyeasee 0.8.17 or 0.8.19**; unsupported versions block writes. The audited upstream revision with 0.8.19 is `397eaedd1a56a95e81bfa37d45130349ba3de7a8` (the version label alone does not identify this revision).
+- Compatibility adapter: **Easee 2026.11.0 / pyeasee 0.8.22**, plus the existing **Easee 0.9.74 / pyeasee 0.8.17 or 0.8.19** contracts. Only these exact validated pairs can write. The audited 0.9.74 revision with 0.8.19 is `397eaedd1a56a95e81bfa37d45130349ba3de7a8`; the new 2026.11.0 revision is `57e6881a0c705a9d8b5df6e004f43a701947b58f`. A version label alone does not identify the older audited revision.
 - HACS/custom repository layout
 - UI setup through config flow
 - Runtime tuning through options flow and Number/Switch entities
@@ -49,6 +49,24 @@ These defaults match the original installation and can be changed in the setup U
 The Easee `device_id` is **not** hard-coded because it is specific to each Home Assistant installation. Enter your own Easee device ID during setup.
 
 ## Logic
+
+### New Easee runtime compatibility (b47)
+
+The adapter accepts the audited 2026.11.0/0.8.22 pair alongside its two
+existing legacy pairs. Missing, unknown or mixed unsupported pairs remain
+blocked. The native integration still owns its objects, connection and
+reconnect lifecycle; 1FuseLoader does not import/start it or replace its
+handlers. Loaded native/SDK versions and the pair-support result are exposed
+as bounded Source Health diagnostics even when control is blocked. Those
+fields do not override independent source, transport or electrical faults.
+
+CI loads pinned real native Easee sources with each matching real SDK, in
+addition to the existing controller and safety suites. It verifies the direct
+circuit payload and finite TTL, runtime ownership, online/offline ordering and
+raw-observation behavior. Native service-layer TTL comparison changes do not
+prove a change to 1FuseLoader's direct circuit command path. All b46 measured
+curtailment, finite authority, original deadlines and exposure accounting
+remain in place.
 
 ### One ordinary operating permission (b46)
 
@@ -1447,6 +1465,7 @@ python -m compileall -q .\custom_components\1fuseloader
 
 The standalone suites use simulated inputs and adapters. CI additionally
 installs Home Assistant 2026.10.1, 2026.10.2, 2026.10.3 and 2026.10.4 on Python 3.14 with
-both supported pyeasee versions to test actual imports, selectors, entity
+the three supported pyeasee versions and their pinned matching native Easee
+sources to test actual imports, runtime contracts, selectors, entity
 construction and config/options flows. Passing these tests does not establish
 physical charging acceptance.

@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from collections import deque
 from copy import deepcopy
@@ -96,6 +97,7 @@ _SOURCE_METADATA_FIELDS = frozenset({
     "last_attempt_started_at_utc", "last_attempt_completed_at_utc",
     "last_attempt_current_p1", "last_attempt_result", "last_attempt_http_status",
     "last_limit_accepted_at_utc", "last_limit_current_p1", "last_limit_http_status",
+    "easee_loaded_version", "pyeasee_loaded_version", "easee_runtime_pair_supported",
 })
 
 
@@ -2087,6 +2089,25 @@ class OneFuseLoaderController:
             "reported_circuit_source": None,
             "reported_circuit_available": False,
         }
+        # Publish the actual already-loaded compatibility pair even when its
+        # gate blocks control. This is diagnostic only, never health or write
+        # authority, and it must not expose arbitrary adapter/object data.
+        contract_reader = getattr(self._adapter, "runtime_contract_diagnostics", None)
+        if callable(contract_reader):
+            try:
+                contract = contract_reader()
+                if isinstance(contract, dict):
+                    for key in ("easee_loaded_version", "pyeasee_loaded_version"):
+                        value = contract.get(key)
+                        diagnostics[key] = (value if type(value) is str and len(value) <= 32
+                            and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}(?:(?:a|b|rc)[0-9]+)?", value)
+                            else None)
+                    supported = contract.get("easee_runtime_pair_supported")
+                    diagnostics["easee_runtime_pair_supported"] = supported if type(supported) is bool else None
+            except Exception:
+                # Exception text can contain private data; control health was
+                # evaluated independently and remains authoritative.
+                pass
         for name, state in (("grid", grid), ("charger_current", current), ("charger_status", status)):
             reported = (datetime.fromtimestamp(grid_report_ts, timezone.utc)
                         if name == "grid" and grid_report_ts is not None

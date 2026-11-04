@@ -10,14 +10,33 @@ permissions:
 
 jobs:
   test-logic:
+    name: test-logic (${{ matrix.homeassistant }}, ${{ matrix.pyeasee }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
         homeassistant: ["2026.10.1", "2026.10.2", "2026.10.3", "2026.10.4"]
-        pyeasee: ["0.8.17", "0.8.19"]
+        pyeasee: ["0.8.17", "0.8.19", "0.8.22"]
+        include:
+          - pyeasee: "0.8.17"
+            easee: "0.9.74"
+            native_sha: "0a95d0dcc1fb90d182ee625e7bcc5f795460c95a"
+          - pyeasee: "0.8.19"
+            easee: "0.9.74"
+            native_sha: "397eaedd1a56a95e81bfa37d45130349ba3de7a8"
+          - pyeasee: "0.8.22"
+            easee: "2026.11.0"
+            native_sha: "57e6881a0c705a9d8b5df6e004f43a701947b58f"
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
+
+      - name: Check out the exact audited native Easee integration
+        uses: actions/checkout@v7
+        with:
+          repository: nordicopen/easee_hass
+          ref: ${{ matrix.native_sha }}
+          path: .ci/native-easee
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -34,6 +53,11 @@ jobs:
         env:
           ONEFUSE_REQUIRE_HOMEASSISTANT: "1"
           ONEFUSE_REQUIRE_PYEASEE_CONTRACT: "1"
+          ONEFUSE_REQUIRE_NATIVE_EASEE: "1"
+          ONEFUSE_EXPECT_PYEASEE_VERSION: ${{ matrix.pyeasee }}
+          ONEFUSE_EXPECT_NATIVE_EASEE_VERSION: ${{ matrix.easee }}
+          ONEFUSE_EXPECT_NATIVE_EASEE_SHA: ${{ matrix.native_sha }}
+          ONEFUSE_NATIVE_EASEE_ROOT: ${{ github.workspace }}/.ci/native-easee
         run: |
           result=0
           for test_script in test_1fuseloader_*.py; do
