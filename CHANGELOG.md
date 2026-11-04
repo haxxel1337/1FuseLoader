@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0b47
+
+- Add audited support for Easee 2026.11.0 with pyeasee 0.8.22 while retaining
+  the existing 0.9.74/0.8.17 and 0.9.74/0.8.19 pairs. Unknown versions and
+  unsupported mixed pairs remain blocked before command submission.
+- Publish bounded already-loaded Easee/SDK versions and the compatibility-pair
+  result through Source Health, including blocked and compacted diagnostics.
+  Compatibility metadata supplies no independent control or physical-response
+  authority.
+- Exercise pinned real native Easee sources and matching SDKs in the HA CI
+  matrix, including online/offline and asynchronous observation contracts.
+- Include all b46 ordinary measured-feedback curtailment and operational
+  recovery changes. Preserve finite TTL, source/transport/storage guards,
+  original electrical deadlines, exposure budget and incident history.
+
 ## 0.4.0b46
 
 - Use one ordinary operating permission across planning, retained authority,

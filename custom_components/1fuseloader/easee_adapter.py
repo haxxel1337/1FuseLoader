@@ -1,9 +1,10 @@
 """Narrow compatibility adapter for the audited Easee/pyeasee versions.
 
-Easee 0.9.74 drops identical service calls before they reach pyeasee, so its
-services cannot renew a finite circuit TTL. Reuse its authenticated public
-pyeasee objects instead. Never read, copy, log, or persist their credentials.
-An HTTP acceptance is submission to the cloud, not physical charger feedback.
+Easee 0.9.74 drops identical service calls before they reach pyeasee, so that
+version's services cannot renew a finite circuit TTL. Keep one direct public
+SDK path across the explicitly audited native/SDK version pairs. Never read,
+copy, log, or persist their credentials. An HTTP acceptance is submission to
+the cloud, not physical charger feedback.
 """
 
 from __future__ import annotations
@@ -25,7 +26,15 @@ _monotonic = time.monotonic
 
 SUPPORTED_EASEE_VERSION = "0.9.74"
 SUPPORTED_PYEASEE_VERSION = "0.8.17"
-SUPPORTED_PYEASEE_VERSIONS = frozenset({"0.8.17", "0.8.19"})
+# Membership is a pair contract, not permission to mix every known version.
+# Keep the two legacy aliases above for existing fixtures and callers.
+SUPPORTED_RUNTIME_PAIRS = frozenset({
+    (SUPPORTED_EASEE_VERSION, SUPPORTED_PYEASEE_VERSION),
+    (SUPPORTED_EASEE_VERSION, "0.8.19"),
+    ("2026.11.0", "0.8.22"),
+})
+SUPPORTED_EASEE_VERSIONS = frozenset(native for native, _ in SUPPORTED_RUNTIME_PAIRS)
+SUPPORTED_PYEASEE_VERSIONS = frozenset(sdk for _, sdk in SUPPORTED_RUNTIME_PAIRS)
 NONZERO_ADMISSION_LIMIT = 8
 PROTECTIVE_NONZERO_ADMISSION_LIMIT = 11
 ADMISSION_PERIOD_SECONDS = 60.01
@@ -279,6 +288,25 @@ class EaseeCommandAdapter:
         """Recheck on every use so an Easee reload cannot leave stale objects."""
         return self._resolve_runtime()
 
+    @staticmethod
+    def _diagnostic_version(value: Any) -> str | None:
+        """Allow only bounded version text, never arbitrary object/error data."""
+        if (type(value) is str and len(value) <= 32
+                and re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}(?:(?:a|b|rc)[0-9]+)?", value)):
+            return value
+        return None
+
+    def runtime_contract_diagnostics(self) -> dict[str, Any]:
+        """Describe already loaded versions without importing or starting them."""
+        native = getattr(sys.modules.get("custom_components.easee.const"), "VERSION", None)
+        sdk = getattr(sys.modules.get("pyeasee"), "__version__", None)
+        return {
+            "easee_loaded_version": self._diagnostic_version(native),
+            "pyeasee_loaded_version": self._diagnostic_version(sdk),
+            "easee_runtime_pair_supported": (type(native) is str and type(sdk) is str
+                and (native, sdk) in SUPPORTED_RUNTIME_PAIRS),
+        }
+
     def _resolve_runtime(self) -> str | None:
         if self._closed:
             return "easee_adapter_closed"
@@ -288,10 +316,14 @@ class EaseeCommandAdapter:
         # ensures normal setup order; a missing integration stays blocked.
         easee_const = sys.modules.get("custom_components.easee.const")
         pyeasee = sys.modules.get("pyeasee")
-        if getattr(easee_const, "VERSION", None) != SUPPORTED_EASEE_VERSION:
+        native_version = getattr(easee_const, "VERSION", None)
+        sdk_version = getattr(pyeasee, "__version__", None)
+        if type(native_version) is not str or native_version not in SUPPORTED_EASEE_VERSIONS:
             return "unsupported_or_unloaded_easee_version"
-        if getattr(pyeasee, "__version__", None) not in SUPPORTED_PYEASEE_VERSIONS:
+        if type(sdk_version) is not str or sdk_version not in SUPPORTED_PYEASEE_VERSIONS:
             return "unsupported_or_unloaded_pyeasee_version"
+        if (native_version, sdk_version) not in SUPPORTED_RUNTIME_PAIRS:
+            return "unsupported_easee_pyeasee_combination"
         if not self.device_id:
             return "missing_easee_device"
 
@@ -1059,7 +1091,7 @@ class EaseeCommandAdapter:
                 timestamp_values[observation_id] = observation.get("timestamp")
             if set(values) != set(SNAPSHOT_OBSERVATION_IDS):
                 raise EaseeAdapterError("easee_snapshot_missing_or_invalid")
-            # Match Easee 0.9.74's current sensor: max of all input terminals.
+            # Match the audited Easee current sensor: max of all input terminals.
             # Offered pilot current (observation114) is deliberately absent.
             terminal_currents = []
             for observation_id in SNAPSHOT_OBSERVATION_IDS[1:]:

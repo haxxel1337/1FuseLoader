@@ -76,7 +76,7 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         self.charger = self.circuit.get_chargers()[0]
 
     async def test_exact_target_version_and_real_ownership_links(self):
-        self.assertIn(pyeasee.__version__, {"0.8.17", "0.8.19"})
+        self.assertIn(pyeasee.__version__, {"0.8.17", "0.8.19", "0.8.22"})
         expected = os.environ.get("ONEFUSE_EXPECT_PYEASEE_VERSION")
         if expected:
             self.assertEqual(pyeasee.__version__, expected)
@@ -158,7 +158,7 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
             await self.circuit.set_dynamic_current(0, 0, 0, 1)
 
     async def test_raw_state_get_uses_public_endpoint_and_mapping_contract(self):
-        if pyeasee.__version__ == "0.8.19":
+        if pyeasee.__version__ in {"0.8.19", "0.8.22"}:
             self.assertFalse(hasattr(self.charger, "get_state"))
             return  # The audited new SDK removes this deprecated endpoint.
         state = await self.charger.get_state(raw=True)
@@ -184,6 +184,8 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         sys.modules["pyeasee"].__version__ = pyeasee.__version__
+        sys.modules["custom_components.easee.const"].VERSION = (
+            "2026.11.0" if pyeasee.__version__ == "0.8.22" else "0.9.74")
         fixture.product.product = self.charger
         fixture.controller.get_chargers.return_value = [self.charger]
         fixture.device.identifiers = {("easee", self.charger.id)}
@@ -236,7 +238,7 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         self.transport.post.assert_not_awaited()
 
     async def test_default_state_converts_mode_while_raw_preserves_numeric_mode(self):
-        if pyeasee.__version__ == "0.8.19":
+        if pyeasee.__version__ in {"0.8.19", "0.8.22"}:
             self.assertFalse(hasattr(self.charger, "get_state"))
             return
         for mode, expected in ((0, "OFFLINE"), (4, "COMPLETED"), (5, "ERROR"), (106, "AWAITING_SCHEDULED_START"), (160, "ERROR_OVERCURRENT")):
@@ -251,7 +253,7 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         self.transport.post.assert_not_awaited()
 
     async def test_raw_state_get_server_failure_returns_none(self):
-        if pyeasee.__version__ == "0.8.19":
+        if pyeasee.__version__ in {"0.8.19", "0.8.22"}:
             self.assertFalse(hasattr(self.charger, "get_state"))
             return
         self.transport.get.side_effect = ServerFailureException("offline test")
@@ -259,7 +261,7 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         self.transport.post.assert_not_awaited()
 
     async def test_raw_state_get_other_failures_and_cancellation_propagate(self):
-        if pyeasee.__version__ == "0.8.19":
+        if pyeasee.__version__ in {"0.8.19", "0.8.22"}:
             self.assertFalse(hasattr(self.charger, "get_state"))
             return
         for error in (BadRequestException({"title": "Offline contract failure"}), asyncio.CancelledError()):
@@ -280,11 +282,13 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         sys.modules["pyeasee"].__version__ = pyeasee.__version__
+        sys.modules["custom_components.easee.const"].VERSION = (
+            "2026.11.0" if pyeasee.__version__ == "0.8.22" else "0.9.74")
         fixture.product.product = self.charger
         fixture.controller.get_chargers.return_value = [self.charger]
         fixture.device.identifiers = {("easee", self.charger.id)}
         with patch.object(adapter_tests.adapter, "REQUEST_TIMEOUT_SECONDS", 0.02):
-            if pyeasee.__version__ == "0.8.19":
+            if pyeasee.__version__ in {"0.8.19", "0.8.22"}:
                 with self.assertRaisesRegex(adapter_tests.adapter.EaseeAdapterError, "TimeoutError"):
                     await fixture.client.async_execute(adapter_tests.decision(amps=0))
                 self.assertEqual(self.transport.post.await_count, 12)
@@ -300,6 +304,9 @@ class RealPyeaseeContractTests(unittest.IsolatedAsyncioTestCase):
         fixture = adapter_tests.AdapterTests(methodName="runTest")
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
+        sys.modules["pyeasee"].__version__ = pyeasee.__version__
+        sys.modules["custom_components.easee.const"].VERSION = (
+            "2026.11.0" if pyeasee.__version__ == "0.8.22" else "0.9.74")
         connection = SignalRClient("https://example.invalid/hub")
         native = AsyncMock(return_value=None)
         connection.on("CommandResponse", native)

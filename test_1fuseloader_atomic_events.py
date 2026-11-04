@@ -14,6 +14,7 @@ import asyncio
 from dataclasses import replace
 import os
 import struct
+import sys
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -160,6 +161,9 @@ class SDKPublicationOrderTests(unittest.IsolatedAsyncioTestCase):
     advance = raw.ConductorClockTests.advance
 
     async def asyncSetUp(self):
+        sys.modules['pyeasee'].__version__ = REAL_SDK_VERSION
+        sys.modules['custom_components.easee.const'].VERSION = (
+            '2026.11.0' if REAL_SDK_VERSION == '0.8.22' else '0.9.74')
         self.signal = SignalRClient('https://offline.invalid/hub')
         self.sdk = object.__new__(Easee)
         self.sdk.sr_connection = self.signal
@@ -278,7 +282,7 @@ class SDKPublicationOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(self.planner.last_decision.current_p1, 0, self.planner.last_decision)
 
     async def test_supported_real_sdk_matches_matrix_pin(self):
-        self.assertIn(REAL_SDK_VERSION, {'0.8.17', '0.8.19'})
+        self.assertIn(REAL_SDK_VERSION, {'0.8.17', '0.8.19', '0.8.22'})
         expected = os.environ.get('ONEFUSE_EXPECT_PYEASEE_VERSION')
         if expected:
             self.assertEqual(REAL_SDK_VERSION, expected)
