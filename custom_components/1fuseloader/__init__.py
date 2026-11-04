@@ -241,6 +241,7 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             "budget_storage_error", "budget_storage_error_type", "budget_verification_pending",
             "budget_latest_state_durable", "budget_checkpoint_verified_at_utc",
             "recent_command_journal_count", "recent_stop_contexts_count", "recent_command_deliveries_count",
+            "recent_command_journal", "recent_stop_contexts", "recent_command_deliveries",
             "last_command_attempt", "last_accepted_command", "last_accepted_limit",
             "diagnostics_scope", "diagnostics_truncated", "diagnostics_omitted_fields_count",
             "source_metadata_omitted_fields",
@@ -275,14 +276,31 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
                     high = middle - 1
             return text[:low] + " [truncated]"
         last_stop = view.get("last_stop_context")
+        # Optional rings can become empty, but their public collection shape
+        # remains stable across this and a second sensor-publication pass.
+        ring_shapes = {key: [] for key in (
+            "recent_command_journal", "recent_stop_contexts", "recent_command_deliveries",
+        ) if key in view}
         view = {key: (view[key] if key in _SOURCE_METADATA_FIELDS
                       or key == "source_metadata_omitted_fields" else scalar(view[key]))
                 for key in essential if key in view}
+        view.update(ring_shapes)
         if isinstance(last_stop, dict):
             view["last_stop_context"] = {key: scalar(last_stop[key]) for key in (
                 "plan_utc", "reason", "mode", "grid_l1", "charger_current", "status",
                 "command_result", "command_error", "overload_failure_reason",
             ) if key in last_stop}
+            receipts = last_stop.get("preceding_positive_limit_receipts")
+            if isinstance(receipts, list):
+                # Preserve the bounded detached receipt structure, not large
+                # ancillary descriptions. These are historical HTTP receipts,
+                # never a claim of physical response or device TTL renewal.
+                view["last_stop_context"]["preceding_positive_limit_receipts"] = [
+                    {key: ({name: scalar(value) for name, value in item.items()}
+                           if key == "delivery" and isinstance(item, dict) else scalar(item))
+                     for key, item in _limit_receipt_summary(record).items()}
+                    for record in receipts[-4:] if isinstance(record, dict)
+                ]
         publication_flags()
         if size() > DIAGNOSTIC_ATTRIBUTE_BUDGET_BYTES:
             view = {key: view[key] for key in (
@@ -290,6 +308,7 @@ def _compact_state_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
                 "source_health_reason", "last_stop_context", "overload_lifetime_used_seconds",
                 "overload_historical_failure_reason", "overload_trial_state", "overload_trial_used_seconds",
                 "overload_trial_remaining_seconds", "recent_command_journal_count", "recent_stop_contexts_count",
+                "recent_command_journal", "recent_stop_contexts", "recent_command_deliveries",
                 "diagnostics_truncated", "diagnostics_scope", "diagnostics_omitted_fields_count",
                 "source_metadata_omitted_fields",
             ) + tuple(_SOURCE_METADATA_FIELDS) if key in view}
@@ -2212,14 +2231,18 @@ class OneFuseLoaderController:
             # Keep the latest local receipts inspectable even when nested
             # incident context exceeds Recorder's compact view. These remain
             # HTTP/local evidence, never physical response or device TTL proof.
-            "last_attempt_started_at_utc": attempt.get("started_at_utc"),
-            "last_attempt_completed_at_utc": attempt.get("completed_at_utc"),
-            "last_attempt_current_p1": attempt.get("target_p1"),
-            "last_attempt_result": attempt.get("result"),
-            "last_attempt_http_status": attempt_delivery.get("http_status"),
-            "last_limit_accepted_at_utc": accepted_receipt.get("completed_at_utc"),
-            "last_limit_current_p1": accepted_receipt.get("target_p1"),
-            "last_limit_http_status": accepted_delivery.get("http_status"),
+            **({
+                "last_attempt_started_at_utc": attempt.get("started_at_utc"),
+                "last_attempt_completed_at_utc": attempt.get("completed_at_utc"),
+                "last_attempt_current_p1": attempt.get("target_p1"),
+                "last_attempt_result": attempt.get("result"),
+                "last_attempt_http_status": attempt_delivery.get("http_status"),
+            } if attempt else {}),
+            **({
+                "last_limit_accepted_at_utc": accepted_receipt.get("completed_at_utc"),
+                "last_limit_current_p1": accepted_receipt.get("target_p1"),
+                "last_limit_http_status": accepted_delivery.get("http_status"),
+            } if accepted_receipt else {}),
             "last_stop_context": stop,
             "recent_command_journal": [_limit_receipt_summary(item) for item in list(self._recent_commands)[-2:]],
             "recent_stop_contexts": stop_summaries,

@@ -434,10 +434,15 @@ class B40ControlledPhaseControllerTests(unittest.IsolatedAsyncioTestCase):
         positives=[row for row in self.sdk_calls if row['cap']>0]
         self.assertTrue(positives,self.controller.last_decision)
         self.assertEqual(positives[0]['cap'],9)
+        self.assertGreaterEqual(positives[0]['at'],215.+r.settings.restart_stable_seconds)
         self.assertLessEqual(positives[0]['at'],400.)
         after=r.export_overload_state()
         self.assertEqual(after['failure_reason'],before['failure_reason'])
-        self.assertEqual(after['automatic_cycle']['state'],'blocked')
+        # B46 can qualify an actually accepted normal9A offer through its own
+        # continuous advancing normal meter interval. Zero acknowledgements
+        # still supply no positive authority, EV response or budget refund.
+        self.assertEqual(after['automatic_cycle']['state'],'ready')
+        self.assertEqual(after['automatic_cycle']['cycle_id'],before['automatic_cycle']['cycle_id'])
         self.assertEqual(after['automatic_cycle']['failure_reason'],
                          before['automatic_cycle']['failure_reason'])
         self.assertGreaterEqual(after['used_seconds'],before['used_seconds'])
@@ -446,6 +451,15 @@ class B40ControlledPhaseControllerTests(unittest.IsolatedAsyncioTestCase):
                          cooled['automatic_cycle']['used_seconds'])
         self.assertGreaterEqual(len(positives),6)
         self.assertFalse(any(row['phases'][1:]!=(0,0) or row['ttl']!=60 for row in self.sdk_calls))
+        diag=r.meter_control_diagnostics()
+        self.assertFalse(diag['recovery_required'])
+        self.assertIsNone(diag['operational_fault'])
+        self.assertEqual(diag['recovery_stage'],'complete')
+        history=after['meter_control']['history']
+        identity=lambda event:(event['reason'],event.get('episode_id'),event['cycle_id'],event['used_seconds'])
+        self.assertTrue({identity(event) for event in before['meter_control']['history']}
+                        <= {identity(event) for event in history})
+        self.assertTrue(all(event['resolved'] for event in history))
 
     async def test_postzero_pause_bad_headroom_and_source_fault_never_restart(self):
         for problem in ('paused','scheduled','headroom','source'):
@@ -473,6 +487,7 @@ class B40ControlledPhaseControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((r.last_target,r.last_set_limit_ts),previous)
         unknown=next(row for row in reversed(self.sdk_calls) if row['cap']==7)
         self.assertEqual(unknown['ttl'],60)
+        failed=deepcopy(r.export_overload_state())
         self.sdk_failure=None
         self.sdk_calls.clear()
         for at in range(205,401,5):
@@ -490,19 +505,28 @@ class B40ControlledPhaseControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(13.3+9.,r.settings.main_fuse_amps-r.settings.buffer_amps)
         self.assertTrue(any(row['cap']==0 for row in self.sdk_calls))
         self.assertEqual(r.last_target[0],9)
-        # ACK of normal9 still cannot release the operational fault without
-        # a NEW mapped phase response followed by later coherent RAW.
+        # B46's later continuous normal meter qualification belongs only to
+        # the separately accepted9A lease. It cannot retroactively ACK the
+        # unknown7A request or move its original earliest retirement barrier.
         diag=r.meter_control_diagnostics()
-        self.assertTrue(diag['recovery_required'])
-        self.assertIsNotNone(diag['operational_fault'])
+        self.assertFalse(diag['recovery_required'])
+        self.assertIsNone(diag['operational_fault'])
+        self.assertEqual(diag['recovery_stage'],'complete')
         self.assertFalse(self.controller.last_decision.meter_overload_authority)
         saved=r.export_overload_state()
         self.assertEqual(saved['automatic_cycle']['cycle_id'],before['automatic_cycle']['cycle_id'])
         self.assertGreaterEqual(saved['automatic_cycle']['used_seconds'],before['automatic_cycle']['used_seconds'])
         self.assertGreaterEqual(saved['used_seconds'],before['used_seconds'])
-        self.assertEqual(saved['automatic_cycle']['state'],'blocked')
+        self.assertEqual(saved['automatic_cycle']['state'],'ready')
         self.assertIsNotNone(saved['automatic_cycle']['failure_reason'])
-        self.assertTrue(any(not event['resolved'] for event in saved['meter_control']['history']))
+        self.assertEqual(saved['automatic_cycle']['failure_reason'],failed['automatic_cycle']['failure_reason'])
+        self.assertEqual(saved['failure_reason'],failed['failure_reason'])
+        history=saved['meter_control']['history']
+        identity=lambda event:(event['reason'],event.get('episode_id'),event['cycle_id'],event['used_seconds'])
+        self.assertTrue({identity(event) for event in failed['meter_control']['history']}
+                        <= {identity(event) for event in history})
+        self.assertTrue(any(event['reason']=='unknown_delivery' for event in history))
+        self.assertTrue(all(event['resolved'] for event in history))
 
 
 if __name__=='__main__':
