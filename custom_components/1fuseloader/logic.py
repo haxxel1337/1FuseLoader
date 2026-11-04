@@ -453,6 +453,8 @@ class RegulatorDecision:
     meter_normal_retention: bool = False
     meter_overload_authority: bool = False
     meter_ordinary_decrease: bool = False
+    meter_feedback_curtailment: bool = False
+    meter_feedback_budget_amps: Optional[float] = None
     meter_basis_grid_ts: Optional[float] = None
     meter_quiet_normal_retention: bool = False
     meter_normal_continuation_proven: bool = False
@@ -6300,6 +6302,22 @@ class OneFuseRegulator:
             return False
         if planned.control_source_id != latest.control_source_id:
             return False
+        if decision.meter_feedback_curtailment and not dispatched:
+            # A provisional meter-feedback reduction is neither EV subtraction
+            # proof nor overload permission. Re-admit the same strict lower
+            # request against the actual live lease and newest meter packet.
+            shadow = deepcopy(self)
+            engine = shadow._get_meter_envelope_policy()
+            fresh = engine.evaluate(shadow, latest)
+            permit = self._get_meter_envelope_policy().operating_permission(self, latest)
+            return bool(permit is not None and permit.kind == 'decrease'
+                and fresh.meter_zero_cause is None
+                and decision.command == fresh.command == 'set_limit'
+                and fresh.current_p1 == decision.current_p1 == permit.cap
+                and decision.committed_current_p1 == permit.accepted_cap
+                and 0 < decision.current_p1 < permit.accepted_cap
+                and decision.current_p2 == decision.current_p3 == 0
+                and not decision.meter_overload_authority)
         if decision.meter_quiet_normal_retention and not dispatched:
             shadow=deepcopy(self)
             engine=shadow._get_meter_envelope_policy()

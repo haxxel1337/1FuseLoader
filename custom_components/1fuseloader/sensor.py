@@ -226,6 +226,8 @@ class OneFuseSensor(SensorEntity):
                 diagnostics = {name: snapshot[name] for name in (
                     "last_command_attempt", "last_accepted_command", "last_accepted_limit",
                 )}
+                diagnostics.update({name: value for name, value in snapshot.items()
+                    if name.startswith("last_attempt_") or name.startswith("last_limit_")})
         meter_sources = {name: self.controller.source_diagnostics[name] for name in (
             "meter_envelope_control", "meter_control_health", "meter_estimate_quality",
             "meter_grid_valid", "meter_actuator_valid", "meter_ev_valid",

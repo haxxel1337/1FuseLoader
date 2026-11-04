@@ -170,12 +170,28 @@ class B44QuietSafetyTests(unittest.IsolatedAsyncioTestCase):
         lower=await self.tick(309.,24.5)
         self.assertIsNone(lower.meter_zero_cause,lower)
         self.assertEqual(p.controller.regulator.last_target[0],14)
+        policy=p.controller.regulator._get_meter_envelope_policy()
+        parent={key:value for key,value in policy.possible_positive.items()
+                if value[0]>14 and value[1]>p.now}
+        self.assertTrue(parent)
+        original_expiry=policy.lease.expires
+        native=deepcopy(p.adapter.native_current_observation)
         p.sdk_calls.clear()
         d=await self.tick(312.,8.)
-        # 8+14 fits23, but a still possible16 does not. Do not erase that
-        # earlier authority merely because a lower HTTP request was accepted.
-        self.assertIsNotNone(d.meter_zero_cause,d)
-        self.assert_no_positive()
+        # B46 keeps known own ACK ancestors on their finite horizons while
+        # continuing only the actual lower cap under a later normal meter.
+        # This does not erase16A authority or create EV-response credit.
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertEqual(p.controller.regulator.last_target[0],14)
+        self.assertEqual(p.sdk_calls,[])
+        self.assertEqual(policy.lease.expires,original_expiry)
+        for key,value in parent.items():
+            if value[1]>p.now:
+                self.assertEqual(policy.possible_positive.get(key),value)
+            else:
+                self.assertNotIn(key,policy.possible_positive)
+        self.assertEqual(p.adapter.native_current_observation.received_at,native.received_at)
+        self.assertFalse(d.meter_overload_authority)
 
     async def test_quiet_product_cannot_create_a_cold_positive_offer(self):
         p=self.plant

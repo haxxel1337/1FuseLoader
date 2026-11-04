@@ -169,10 +169,17 @@ class B40PolicyTests(unittest.TestCase):
         self.assertEqual(fault.meter_zero_cause,'peak_response_timeout')
         saved=deepcopy(r.export_overload_state())
         original_cold=r._get_meter_envelope_policy().cold_upper_until
+        original_positive_until=r._get_meter_envelope_policy().authority_deadline(20.)
         restart=None
+        cooled=None
+        positive_submissions=[]
         for at in range(25,251,5):
             inp,d=self.f.sample(r,float(at),13.3,0.,receipt=at-.2,sequence=at,
                 controlled_missing=True)
+            if cooled is None:
+                cooled=deepcopy(r.export_overload_state())
+            if d.should_call_service and d.current_p1>0:
+                positive_submissions.append((at,d.current_p1,d.current_p2,d.current_p3,d.ttl_seconds))
             if at in (50,80) and r.last_target[0]==0:
                 zero=r.meter_envelope_fault(inp,logic.ElectricalStopCause.PEAK_RESPONSE_TIMEOUT)
                 self.assertTrue(zero.should_call_service)
@@ -182,12 +189,32 @@ class B40PolicyTests(unittest.TestCase):
                 restart=at
                 self.assertEqual(r.last_target[0],9)
         self.assertIsNotNone(restart)
+        self.assertGreaterEqual(restart,max(original_positive_until,25.+r.settings.restart_stable_seconds))
         self.assertLessEqual(restart,90)
+        self.assertTrue(positive_submissions)
+        self.assertTrue(all(cap==9 and p2==p3==0 and ttl==60
+                            for _,cap,p2,p3,ttl in positive_submissions))
+        self.assertLessEqual(13.3+9.,r.settings.main_fuse_amps-r.settings.buffer_amps)
         self.assertEqual(r._get_meter_envelope_policy().cold_upper_until,original_cold)
         current=r.export_overload_state()
-        self.assertEqual(current['automatic_cycle']['state'],'blocked')
+        # B46 retires the operational fault only after an actual new normal
+        # offer and a separate continuous normal meter interval. The earlier
+        # zero renewals never manufacture acceptance or cooling credit.
+        self.assertEqual(current['automatic_cycle']['state'],'ready')
+        self.assertEqual(current['automatic_cycle']['cycle_id'],saved['automatic_cycle']['cycle_id'])
         self.assertEqual(current['automatic_cycle']['failure_reason'],saved['automatic_cycle']['failure_reason'])
         self.assertEqual(current['failure_reason'],saved['failure_reason'])
+        self.assertGreaterEqual(current['used_seconds'],saved['used_seconds'])
+        self.assertEqual(current['used_seconds'],cooled['used_seconds'])
+        self.assertEqual(current['automatic_cycle']['used_seconds'],cooled['automatic_cycle']['used_seconds'])
+        diag=r.meter_control_diagnostics()
+        self.assertFalse(diag['recovery_required'])
+        self.assertIsNone(diag['operational_fault'])
+        history=current['meter_control']['history']
+        identity=lambda event:(event['reason'],event.get('episode_id'),event['cycle_id'],event['used_seconds'])
+        self.assertTrue({identity(event) for event in saved['meter_control']['history']}
+                        <= {identity(event) for event in history})
+        self.assertTrue(all(event['resolved'] for event in history))
 
     def test_new_actual_positive_dispatch_expiry_survives_ambiguous_result(self):
         r=self.f.live(7)

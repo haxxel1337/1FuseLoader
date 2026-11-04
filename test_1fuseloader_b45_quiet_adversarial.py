@@ -55,11 +55,19 @@ class B45QuietAdversarialTests(unittest.IsolatedAsyncioTestCase):
         p.sdk_charger.pause.assert_not_awaited()
         p.sdk_charger.resume.assert_not_awaited()
 
-    async def test_actual_post_dispatch_fresher_total_above_buffer_refuses_quiet_renewal(self):
-        await self.quiet()
+    async def test_actual_post_dispatch_fresher_total_above_buffer_requires_strict_decrease(self):
+        pulse,native=await self.quiet()
         d = await self.tick(315.,23.001)
-        self.assertIsNotNone(d.meter_zero_cause,d)
-        self.assert_no_positive()
+        # B46 withdraws one ampere of existing authority. The old same-cap
+        # quiet exception does not turn the buffer boundary into a stop.
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertEqual([row['cap'] for row in self.p.sdk_calls],[15])
+        self.assertTrue(all(row['ttl']==60 for row in self.p.sdk_calls))
+        self.assertFalse(d.meter_overload_authority)
+        self.assertIsNone(d.nominal_response_deadline_ts)
+        self.assertEqual(self.p.product.state['latestPulse'],pulse)
+        self.assertEqual(self.p.adapter.native_current_observation.received_at,native.received_at)
+        self.p.sdk_charger.resume.assert_not_awaited()
 
     async def test_earlier_larger_possible_lease_is_not_erased_by_lower_ack(self):
         p = self.p
@@ -70,12 +78,30 @@ class B45QuietAdversarialTests(unittest.IsolatedAsyncioTestCase):
         lower = await self.tick(309.,24.5)
         self.assertIsNone(lower.meter_zero_cause,lower)
         self.assertEqual(p.controller.regulator.last_target[0],14)
+        policy=p.controller.regulator._get_meter_envelope_policy()
+        parent={key:value for key,value in policy.possible_positive.items()
+                if value[0]>14 and value[1]>p.now}
+        self.assertTrue(parent)
+        original_expiry=policy.lease.expires
+        before=deepcopy(p.controller.regulator.export_overload_state())
+        native=deepcopy(p.adapter.native_current_observation)
         p.sdk_calls.clear()
         d = await self.tick(312.,8.)
-        # RAW is normal and the newest14A lease is real, but earlier16A
-        # authority is still possible. HTTP acceptance cannot retire it.
-        self.assertIsNotNone(d.meter_zero_cause,d)
-        self.assert_no_positive()
+        # B46 preserves the earlier actual own ACK as possible authority,
+        # while a later normal total retains only the actual lower cap.
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertEqual(p.controller.regulator.last_target[0],14)
+        self.assertEqual(p.sdk_calls,[])
+        self.assertEqual(policy.lease.expires,original_expiry)
+        for key,value in parent.items():
+            if value[1]>p.now:
+                self.assertEqual(policy.possible_positive.get(key),value)
+            else:
+                self.assertNotIn(key,policy.possible_positive)
+        self.assertEqual(p.adapter.native_current_observation.received_at,native.received_at)
+        self.assertEqual(p.controller.regulator.export_overload_state()['used_seconds'],
+                         before['used_seconds'])
+        self.assertFalse(d.meter_overload_authority)
 
     async def test_missing_or_future_grid_clock_does_not_acquire_quiet_permission(self):
         for reported in (100.,316.):
@@ -219,10 +245,23 @@ class B45QuietAdversarialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p.controller._budget_error,'overload_budget_save_failed')
 
     async def test_new_high_load_during_recovery_does_not_gain_overload_permission(self):
-        await self.normal_recovery_without_vehicle_response('peak_response_timeout')
+        before=await self.normal_recovery_without_vehicle_response('peak_response_timeout')
+        native=deepcopy(self.p.adapter.native_current_observation)
         d = await self.tick(295.,28.,status='charging')
-        self.assertIsNotNone(d.meter_zero_cause,d)
-        self.assert_no_positive()
+        # B46 can withdraw5A of an actually readmitted16A offer without
+        # granting an overload period or clearing historical recovery.
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertEqual([row['cap'] for row in self.p.sdk_calls],[11])
+        self.assertFalse(d.meter_overload_authority)
+        self.assertIsNone(d.nominal_response_deadline_ts)
+        self.assertEqual(self.p.adapter.native_current_observation.received_at,native.received_at)
+        after=self.p.controller.regulator.export_overload_state()
+        self.assertEqual(after['automatic_cycle']['cycle_id'],before['automatic_cycle']['cycle_id'])
+        self.assertGreaterEqual(after['automatic_cycle']['used_seconds'],
+                                before['automatic_cycle']['used_seconds'])
+        self.assertEqual(after['failure_reason'],before['failure_reason'])
+        self.assertEqual(after['meter_control']['history'],before['meter_control']['history'])
+        self.p.sdk_charger.resume.assert_not_awaited()
 
     async def confirmed_minimum_hold(self):
         p = self.p
