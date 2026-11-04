@@ -195,6 +195,10 @@ class RealNativeEaseeTests(unittest.IsolatedAsyncioTestCase):
         self.sdk = object.__new__(self.sdk_module.Easee)
         self.sdk.sr_connection = self.signal
         self.sdk.sr_subscriptions = {self.charger.id: self.native_controller.async_stream_callback}
+        # Keep the real SDK SignalR dispatcher, but terminate every HTTP call
+        # at the offline transport even after binding the charger to this SDK.
+        self.sdk.get = self.transport.get
+        self.sdk.post = self.transport.post
         self.charger.easee = self.sdk
         self.signal.on('ProductUpdate', self.sdk._sr_product_update_cb)
         device = SimpleNamespace(identifiers={('easee', self.charger.id)})
@@ -241,6 +245,8 @@ class RealNativeEaseeTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_native_initial_poll_does_not_grant_positive_authority(self):
         self.assertEqual(self.client.telemetry_block_reason, 'easee_telemetry_missing')
         await self.product.async_refresh()
+        self.transport.get.assert_awaited_once_with(
+            '/state/OFFLINE_NATIVE/observations?ids=109,182,183,184,185')
         if self.sdk_version in {'0.8.19', '0.8.22'}:
             self.assertIs(self.product.state['isOnline'], False)
         self.assertIsNotNone(self.client.telemetry_block_reason)
