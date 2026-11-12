@@ -129,7 +129,7 @@ class GracefulRestartBridge:
         if self._store is not None:
             return
         from homeassistant.helpers.storage import Store
-        self._store = Store(self.c.hass, 1, self.storage_key)
+        self._store = Store(self.c.hass, 1, self.storage_key, atomic_writes=True)
         self._read_back = lambda: Store(self.c.hass, 1, self.storage_key, read_only=True).async_load()
 
     async def _read_raw(self):
