@@ -96,6 +96,7 @@ class RegulatorSettings:
     # Explicit post-response observation tolerance; zero preserves legacy timing.
     grid_confirmation_seconds: int = 0
     meter_envelope_control: bool = False
+    graceful_restart_bridge: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1933,6 +1934,8 @@ class OneFuseRegulator:
             raise ValueError("Automatic overload cycles must be a boolean")
         if type(settings.disconnected_readiness) is not bool:
             raise ValueError("Disconnected readiness must be a boolean")
+        if type(settings.graceful_restart_bridge) is not bool:
+            raise ValueError("Graceful restart bridge must be a boolean")
         if settings.automatic_overload_cycles and not settings.meter_envelope_control and (not settings.peak_only_response
                 or settings.main_fuse_amps != 25 or settings.startup_charge_amps != 7
                 or not 6 <= settings.min_charge_amps <= 7 <= settings.max_charge_amps):
@@ -1957,6 +1960,11 @@ class OneFuseRegulator:
         if previous_settings == settings:
             if settings.meter_envelope_control or settings.automatic_overload_cycles:
                 self._ensure_automatic_cycle()
+            return
+        if replace(previous_settings, graceful_restart_bridge=settings.graceful_restart_bridge) == settings:
+            # Selecting a future shutdown allowance is not an electrical
+            # transition, a new lease or a new cooling observation period.
+            self.settings = settings
             return
         if settings.meter_envelope_control:
             boundary=self._meter_handoff_snapshot() if not previous_settings.meter_envelope_control else None

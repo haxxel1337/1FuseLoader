@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0b48
+
+- Validate HA 2026.11.0 and 2026.11.1 alongside the minimum and previous current
+  HA versions, retaining the three exact audited native Easee/SDK pairs. Add
+  a real Store shared-load cancellation contract for the November storage path.
+- Add an explicit, default-off graceful-shutdown bridge for the selected
+  25 A / 2 A buffer meter-control profile: at most 7/0/0 A for five minutes,
+  eligible only from healthy normal operation. Preparation precedes teardown
+  and requires physical lower-current and later grid evidence as well as
+  verified, one-use persistent handoff metadata.
+- Retain only the original finite permission through bootstrap and ordinary
+  fresh-source recovery; take over through a real normal submission. New
+  faults, expiry, changed selection and failed storage remain protective.
+  Reboot, retry and late results cannot refill the handoff or overload budget.
+- Preserve ordinary TTL, zero offline fallback, electrical guards, exposure
+  and historical faults. This optional blind interval cannot guarantee
+  uninterrupted charging or active balancing while HA is unavailable.
+
 ## 0.4.0b47
 
 - Add audited support for Easee 2026.11.0 with pyeasee 0.8.22 while retaining

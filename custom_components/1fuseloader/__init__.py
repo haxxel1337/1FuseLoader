@@ -39,6 +39,7 @@ from .logic import (
 )
 from .overload_persistence import OverloadBudgetStore
 from .mqtt_freshness import MqttL1Config, MqttL1Source
+from .restart_bridge import GracefulRestartBridge
 
 _LOGGER = logging.getLogger(__name__)
 ACTION_TIMEOUT_SECONDS = 20
@@ -83,6 +84,9 @@ _SOURCE_METADATA_FIELDS = frozenset({
     "meter_envelope_control", "meter_control_health", "meter_estimate_quality",
     "meter_grid_valid", "meter_actuator_valid", "meter_ev_valid",
     "easee_product_data_quiet",
+    "restart_bridge_state", "restart_bridge_expires_at_utc",
+    "restart_bridge_remaining_seconds", "restart_bridge_last_error",
+    "restart_bridge_preparing", "restart_bridge_unobserved_seconds",
     "meter_state", "meter_zero_cause",
     "meter_control_state", "meter_episode_id", "meter_operational_fault",
     "meter_recovery_stage",
@@ -467,6 +471,9 @@ class OneFuseLoaderController:
         self._trial_action_error: str | None = None
         self._unsub_deadline = None
         self._deadline_token: object | None = None
+        self._shutdown_job_unsub = None
+        self._shutdown_job_registered = False
+        self._restart_bridge = GracefulRestartBridge(self)
         if command_adapter is not None:
             self.control_block_reason = command_adapter.control_block_reason
 
@@ -518,6 +525,20 @@ class OneFuseLoaderController:
                 and self._configured_control_identity() == self._applied_control_binding):
             # No await separates this comparison from return. A repeated UI
             # value grants no reason to cancel a live request or phase.
+            return
+        if key == "graceful_restart_bridge":
+            # This future-shutdown preference changes neither the live offer
+            # nor electrical policy. Wait for an ordinary SDK call to finish
+            # instead of canceling it and creating an avoidable unknown result.
+            async with self._lock:
+                options = dict(self.entry.options or {})
+                options[key] = value
+                options = validate_options(options)
+                self.hass.config_entries.async_update_entry(self.entry, options=options)
+                self._reload_settings_locked()
+                self.notify()
+                if not self._stopped:
+                    self._handle_source_change(None)
             return
         self._generation += 1
         self._cancel_positive_dispatch()
@@ -740,6 +761,10 @@ class OneFuseLoaderController:
                 self._telemetry_unsub = subscribe_telemetry(self._handle_passive_telemetry)
             self._applied_control_binding = self._configured_control_identity()
             self._applied_control_selection = self._electrical_selection()
+            await self._restart_bridge.async_restore()
+            if self._stopped:
+                return
+            self._register_shutdown_bridge_job()
             await self._async_tick_locked()
             # async_stop marks stopped before waiting for this lock. It may
             # already have removed listeners while any startup await yielded;
@@ -982,6 +1007,11 @@ class OneFuseLoaderController:
         """One coalesced refresh follows the newest local/Easee telemetry."""
         if self._stopped:
             return
+        if self._restart_bridge.preparing:
+            # The early shutdown job owns its bounded submission. Native and
+            # meter callbacks still update their records and can abort it;
+            # ordinary planning must not overwrite its finite bridge lease.
+            self._restart_bridge.source_changed()
         if self._dispatch_positive and self._dispatch_input is not None:
             latest = self._read_input()
             try:
@@ -1010,6 +1040,10 @@ class OneFuseLoaderController:
                     or latest.control_source_id != self._dispatch_input.control_source_id or rising_load)
             if rejected:
                 self._cancel_positive_dispatch()
+        if self._restart_bridge.preparing:
+            # Preserve the existing cancellation checks above even while the
+            # shutdown job waits for an earlier ordinary request to finish.
+            return
         self._pending_refresh = True
         if self._refresh_task is None or self._refresh_task.done():
             self._refresh_task = self.hass.async_create_task(self._async_process_refreshes())
@@ -1026,6 +1060,32 @@ class OneFuseLoaderController:
         finally:
             self._refresh_task = None
 
+    def _register_shutdown_bridge_job(self) -> None:
+        """Run before HA stops MQTT/native HTTP, never on an entry reload."""
+        register = getattr(self.hass, "async_add_shutdown_job", None)
+        if self._shutdown_job_registered or not callable(register):
+            return
+        # Keep the standalone offline harness independent of HA's job helper.
+        from homeassistant.core import HassJob
+        self._shutdown_job_unsub = register(HassJob(
+            self._async_prepare_shutdown_bridge, "1FuseLoader graceful shutdown bridge"))
+        self._shutdown_job_registered = True
+
+    async def _async_prepare_shutdown_bridge(self) -> bool:
+        if self._stopped or not self.settings.graceful_restart_bridge:
+            return False
+        try:
+            # HA's entire early shutdown stage has a twenty-second budget.
+            # The bridge reserves time for its usual listener/adapter cleanup.
+            async with asyncio.timeout(18):
+                armed = await self._restart_bridge.async_prepare_shutdown()
+                if armed:
+                    await self.async_stop()
+                return armed
+        except Exception as err:
+            _LOGGER.warning("1FuseLoader shutdown bridge could not arm (%s)", type(err).__name__)
+            return False
+
     async def async_stop(self) -> None:
         # Mark stopped before waiting for a currently running request. Poll ticks
         # coalesce instead of queuing; none can submit after this method returns.
@@ -1033,6 +1093,11 @@ class OneFuseLoaderController:
         self._budget_pending_token = None
         self._generation += 1
         self._cancel_positive_dispatch()
+        if self._shutdown_job_unsub is not None:
+            self._shutdown_job_unsub()
+            self._shutdown_job_unsub = None
+        self._shutdown_job_registered = False
+        await self._restart_bridge.async_close()
         if self._delivery_unsub is not None:
             self._delivery_unsub()
             self._delivery_unsub = None
@@ -2158,6 +2223,7 @@ class OneFuseLoaderController:
             diagnostics["reported_circuit_source"] = "cached_readback_unavailable"
         diagnostics["easee_product_update_received_at_utc"] = diagnostics["easee_stream_pulse_utc"]
         diagnostics["easee_product_update_clock_scope"] = "native_local_ProductUpdate_receipt_not_transport_ping_or_physical_acquisition"
+        diagnostics.update(self._restart_bridge.diagnostics())
         self.source_diagnostics = diagnostics
 
     @staticmethod
@@ -2497,6 +2563,8 @@ class OneFuseLoaderController:
                 age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
     async def _async_tick_locked(self) -> None:
+        if self._restart_bridge.preparing:
+            return
         generation = self._generation
         # Recheck public identity metadata as well as entry updates. A renamed,
         # rebound or removed source cannot leave an old MQTT subscription live.
@@ -2567,9 +2635,17 @@ class OneFuseLoaderController:
                 "shared_confirmation_owner_before": confirmation.owner if confirmation is not None else None,
                 "owner_clock_scope": "monotonic_seconds_not_utc",
             }
-        decision = None
+        decision = await self._restart_bridge.async_tick_override(inp)
+        if decision is not None and not decision.should_call_service:
+            # This separately bounded owner retains only the previous runtime's
+            # verified bridge. It supplies no new SDK lease or source evidence.
+            self.last_decision = decision
+            self.last_service_result = "not_sent"
+            self._schedule_overload_deadline(decision)
+            self.notify()
+            return
         pending_proposal = self._meter_checkpoint_proposal
-        if pending_proposal is not None:
+        if pending_proposal is not None and decision is None:
             # A verified write can take longer than the caller's bounded I/O
             # wait. Re-evaluating and saving a moving exposure counter on every
             # completion would make that successful checkpoint obsolete before
@@ -3196,6 +3272,8 @@ class OneFuseLoaderController:
             return
         attempt["delivery"] = receipt_record.public()
         attempt["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+        self._restart_bridge.note_submission(
+            decision, accepted=attempt["result"] == "submitted_unverified")
         journal_record = {
             **attempt, "mode": decision.mode, "reason": decision.reason,
             "grid_l1": decision.grid_l1, "charger_current": decision.charger_current,
