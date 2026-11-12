@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        homeassistant: ["2026.10.1", "2026.10.2", "2026.10.3", "2026.10.4"]
+        homeassistant: ["2026.10.1", "2026.10.4", "2026.11.0", "2026.11.1"]
         pyeasee: ["0.8.17", "0.8.19", "0.8.22"]
         include:
           - pyeasee: "0.8.17"

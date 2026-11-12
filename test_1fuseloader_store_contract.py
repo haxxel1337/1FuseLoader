@@ -1,6 +1,6 @@
 """Storage contract tests using actual Home Assistant Store and temporary files.
 
-Run on HA 2026.10.1 and 2026.10.2 with Python 3.14. No broker, live Home
+Run on the audited HA 2026.10/2026.11 matrix with Python 3.14. No broker, live Home
 Assistant, network, charger or household configuration is accessed. Private HA
 implementation functions are patched only for fault injection in these tests;
 the integration uses the public Store API.
@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from importlib.metadata import version
 import importlib.util
 import os
 from pathlib import Path
@@ -160,6 +161,63 @@ class RealStoreContractTests(unittest.IsolatedAsyncioTestCase):
         last = await self.fresh_read()
         self.assertNotEqual(first["checkpoint_revision"], last["checkpoint_revision"])
         self.assertEqual(last["regulator"], changed)
+
+    async def test_cancelled_shared_load_waiter_preserves_surviving_read_and_checkpoint(self):
+        state = exposure(used_seconds=321.5, failure_reason="response_timeout")
+        await self.wrapper.async_save(state)
+        previous = await self.fresh_read()
+        reader = self.storage.Store(self.hass, 1, self.key, read_only=True)
+        entered = asyncio.Event()
+        release = threading.Event()
+        original_load = self.storage.json_util.load_json
+        tasks = []
+
+        def blocked_read(*args, **kwargs):
+            self.hass.loop.call_soon_threadsafe(entered.set)
+            if not release.wait(10):
+                raise RuntimeError("Test did not release its temporary disk read")
+            return original_load(*args, **kwargs)
+
+        with patch.object(self.storage.json_util, "load_json", side_effect=blocked_read) as disk_read, \
+                patch.object(self.storage, "write_utf8_file_atomic") as disk_write:
+            try:
+                primary = asyncio.create_task(reader.async_load())
+                tasks.append(primary)
+                await asyncio.wait_for(entered.wait(), 5)
+                waiter = asyncio.create_task(reader.async_load())
+                tasks.append(waiter)
+                # Let the second public load join the already running read.
+                await asyncio.sleep(0)
+                self.assertFalse(waiter.done())
+                self.assertEqual(disk_read.call_count, 1)
+
+                ha_release = tuple(int(part) for part in version("homeassistant").split(".")[:2])
+                # HA 2026.11 shields its shared load future internally. The
+                # older supported Store needs an explicitly shielded consumer;
+                # our persistence transactions retain their own shield on both.
+                cancellation_target = (waiter if ha_release >= (2026, 11)
+                                       else asyncio.shield(waiter))
+                cancellation_target.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await cancellation_target
+                self.assertFalse(primary.done())
+                release.set()
+
+                loaded = await asyncio.wait_for(primary, 5)
+                self.assertEqual(loaded, previous)
+                self.assertEqual(loaded["regulator"], state)
+                self.assertEqual(disk_read.call_count, 1)
+                disk_write.assert_not_called()
+                if ha_release < (2026, 11):
+                    self.assertEqual(await asyncio.wait_for(waiter, 5), previous)
+                else:
+                    self.assertTrue(waiter.cancelled())
+            finally:
+                release.set()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        self.assertEqual(await self.fresh_read(), previous)
+        self.assertTrue(self.wrapper.state_is_durable(state))
 
     async def test_actual_store_swallows_writeerror_but_wrapper_detects_old_disk_revision(self):
         # Keep semantic state and saved_at identical: a nonce is necessary to
