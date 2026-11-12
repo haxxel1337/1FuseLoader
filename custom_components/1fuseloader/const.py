@@ -53,6 +53,7 @@ OPT_PEAK_ONLY_RESPONSE = "peak_only_response"
 OPT_AUTOMATIC_OVERLOAD_CYCLES = "automatic_overload_cycles"
 OPT_DISCONNECTED_READINESS = "disconnected_readiness"
 OPT_METER_ENVELOPE_CONTROL = "meter_envelope_control"
+OPT_GRACEFUL_RESTART_BRIDGE = "graceful_restart_bridge"
 OPT_ENABLE_DYNAMIC_LIMIT = "enable_dynamic_limit"
 OPT_ENABLE_SOFT_GUARD = "enable_soft_guard"
 OPT_ENABLE_PAUSE_RESUME = "enable_pause_resume"
@@ -105,6 +106,8 @@ DEFAULT_OPTIONS = {
     OPT_DISCONNECTED_READINESS: False,
     # Separate meter-led controller; upgrades retain the existing policy.
     OPT_METER_ENVELOPE_CONTROL: False,
+    # Explicit bounded shutdown permission, not an offline fallback change.
+    OPT_GRACEFUL_RESTART_BRIDGE: False,
     OPT_ENABLE_DYNAMIC_LIMIT: True,
     OPT_ENABLE_SOFT_GUARD: True,
     OPT_ENABLE_PAUSE_RESUME: True,
@@ -228,6 +231,14 @@ def validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
         or result[OPT_NORMAL_TTL_SECONDS] != 60
     ):
         raise ValueError("Meter envelope control requires dynamic control, the 25 A main fuse / 7 A startup profile, a maximum of 16 A and a 60 second normal TTL")
+    if result[OPT_GRACEFUL_RESTART_BRIDGE] and (
+        not result[OPT_METER_ENVELOPE_CONTROL]
+        or not result[OPT_NOMINAL_IMPORT_ONLY_FALLBACK]
+        or result[OPT_MAIN_FUSE_AMPS] != 25
+        or result[OPT_BUFFER_AMPS] != 2
+        or not result[OPT_MIN_CHARGE_AMPS] <= 7 <= result[OPT_MAX_CHARGE_AMPS]
+    ):
+        raise ValueError("Graceful restart bridge requires meter envelope control, verified import-only fallback and the 25 A / 2 A buffer profile with min/max bounds including 7 A; turn the bridge off before disabling its prerequisites")
     if result[OPT_OVERLOAD_ENABLED]:
         if not result[OPT_ENABLE_DYNAMIC_LIMIT]:
             raise ValueError("Experimental overload operation requires dynamic current control")

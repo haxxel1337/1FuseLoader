@@ -25,6 +25,7 @@ SWITCH_DESCRIPTIONS = [
     OneFuseSwitchDescription(key="automatic_overload_cycles", option_key="automatic_overload_cycles", name="Automatic Overload Cycles", icon="mdi:autorenew"),
     OneFuseSwitchDescription(key="disconnected_readiness", option_key="disconnected_readiness", name="Charging Readiness While Disconnected", icon="mdi:ev-plug-type2"),
     OneFuseSwitchDescription(key="meter_envelope_control", option_key="meter_envelope_control", name="Meter Envelope Control", icon="mdi:meter-electric-outline"),
+    OneFuseSwitchDescription(key="graceful_restart_bridge", option_key="graceful_restart_bridge", name="Graceful Restart Bridge (7 A / 5 min)", icon="mdi:restart"),
     OneFuseSwitchDescription(key="enable_dynamic_limit", option_key="enable_dynamic_limit", name="Enable Dynamic Limit", icon="mdi:ev-station"),
     OneFuseSwitchDescription(key="enable_soft_guard", option_key="enable_soft_guard", name="Enable Soft Guard", icon="mdi:shield-half-full"),
     OneFuseSwitchDescription(key="enable_pause_resume", option_key="enable_pause_resume", name="Enable Pause Resume", icon="mdi:pause-play"),

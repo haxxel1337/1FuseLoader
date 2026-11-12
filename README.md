@@ -50,6 +50,43 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Finite continuation during graceful shutdown (b48, explicit opt-in)
+
+`graceful_restart_bridge` is off by default. With the selected meter-led,
+verified import-only 25 A fuse / 2 A buffer profile, it can prepare at most
+7 A on L1 for at most five minutes before an orderly Home Assistant shutdown.
+It also runs for a graceful power-off: HA's early shutdown hook cannot reliably
+distinguish those intentions. Ordinary integration reloads and unexpected
+crashes do not prepare a bridge.
+
+Preparation requires healthy normal operation, a genuinely accepted live normal
+offer, durable exposure state, verified zero offline fallback and no unresolved
+peak, overload response, recovery or delivery problem. Higher current must be
+observed at no more than 7 A after the bridge submission, followed by a normal
+grid report, before the handoff can arm. HTTP acceptance alone is insufficient.
+The finite grant is recorded through verified checkpoints with a fixed expiry
+and a one-use identity before MQTT and the native connection shut down.
+
+The next runtime can retain only that verified grant while first reports and
+ordinary restart qualification arrive. This is a no-write hold: no repeated
+boot, old measurement, delayed ACK or timer can supply another five minutes.
+Real new invalid data, excessive load, control loss, changed binding/settings,
+storage failure or expiry still preempts. Ordinary control takes over through
+an actual newly accepted finite command, without a synthetic zero between
+startup phases. The old grant is not a new native receipt or a restored normal
+lease. Historical exposure, faults and cycle allowance are preserved; downtime
+does not qualify as observed cooling.
+
+This explicitly permits a short **unmonitored interval**: while HA is down,
+it cannot react to another household load. The 0/0/0 offline fallback and
+ordinary sixty-second leases remain unchanged. A failed preparation, cloud
+delivery problem, slow restart or a real fault can still stop charging. An
+independent controller is required for active load balancing throughout an HA
+outage. HA gives the entire early shutdown stage twenty seconds, so the bridge
+must refuse when its physical and persistence checks cannot finish in time.
+See [Easee TTL and fallback](https://developer.easee.com/docs/load-balancing)
+and [HA shutdown jobs](https://github.com/home-assistant/core/blob/2026.11.1/homeassistant/core.py).
+
 ### New Easee runtime compatibility (b47)
 
 The adapter accepts the audited 2026.11.0/0.8.22 pair alongside its two
@@ -1464,7 +1501,7 @@ python -m compileall -q .\custom_components\1fuseloader
 ```
 
 The standalone suites use simulated inputs and adapters. CI additionally
-installs Home Assistant 2026.10.1, 2026.10.2, 2026.10.3 and 2026.10.4 on Python 3.14 with
+installs Home Assistant 2026.10.1, 2026.10.4, 2026.11.0 and 2026.11.1 on Python 3.14 with
 the three supported pyeasee versions and their pinned matching native Easee
 sources to test actual imports, runtime contracts, selectors, entity
 construction and config/options flows. Passing these tests does not establish
