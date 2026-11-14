@@ -198,7 +198,18 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         """
         r = self.controller.regulator
         mono = self.hass.loop.time()
+        # A freshly booted CI host can have less than 75 seconds of monotonic
+        # uptime. Such a host has no valid negative historical dispatch time:
+        # begin_submission correctly rejects it. Wait on the genuine clock
+        # once per process, rather than forging a lease or the Core clock.
+        if mono < 76.:
+            await asyncio.sleep(76.-mono)
+            mono = self.hass.loop.time()
+        self.assertGreaterEqual(mono-75., 0., 'Historical dispatch must be nonnegative')
         wall = datetime.now(timezone.utc).timestamp()
+        # The optional genuine uptime wait must not age the synthetic device
+        # receipts that will be acquired by the actual runtime below.
+        self.current_wall, self.grid_wall = wall-.2, wall-.1
         for index, offset in enumerate((-75., -40., -10., -1.), 1):
             charging = offset == -1.
             inp = self.frame(mono+offset, wall+offset,
@@ -208,7 +219,9 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
             decision = r.evaluate(inp)
             if decision.should_call_service:
                 self.assertEqual(decision.current_p1, 16, decision)
-                self.assertTrue(r.begin_submission(decision, mono+offset, inp=inp))
+                self.assertTrue(r.begin_submission(decision, mono+offset, inp=inp),
+                    {'history_offset': offset, 'dispatch_ts': mono+offset,
+                     'decision': decision, 'meter': r.meter_control_diagnostics()})
                 r.acknowledge(decision, mono+offset+.001)
         self.assertEqual(r.last_target, (16, 0, 0, 60))
         await self.controller._budget_store.async_save(r.export_overload_state())
