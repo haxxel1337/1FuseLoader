@@ -150,9 +150,17 @@ class ProfileMigrationRealHATests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.entry.options["overload_margin_amps"],4.)
 
     async def test_real_core_minor_dispatch_invokes_migration_once_before_controller_setup(self):
-        integration=SimpleNamespace(domain="1fuseloader",
+        from homeassistant.helpers import frame
+        from homeassistant.loader import DATA_CUSTOM_COMPONENTS
+        integration=SimpleNamespace(domain="1fuseloader",is_built_in=False,
             async_get_component=AsyncMock(return_value=self.component))
-        with patch.object(self.manager._store,"async_delay_save"):
+        # Normal HA startup initializes the frame helper and registers this
+        # custom integration. November Core consults both when accepting its
+        # supported legacy boolean migration result; keep that real dispatcher.
+        with patch.object(frame._hass,"hass",None), \
+                patch.dict(self.hass.data,{DATA_CUSTOM_COMPONENTS:{"1fuseloader":integration}}), \
+                patch.object(self.manager._store,"async_delay_save"):
+            frame.async_setup(self.hass)
             self.manager.async_update_entry(self.entry,
                 options={**dict(self.entry.options),**selected_options(overload_margin_amps=4.)})
             with patch("homeassistant.config_entries.loader.async_get_integration",
