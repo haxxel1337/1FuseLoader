@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.0b50
+
+- Serialize real Home Assistant ConfigEntry data through a plain mapping copy
+  when binding the finite restart marker. A read-only mappingproxy previously
+  raised TypeError before the prepared marker or bridge request could exist.
+- Quiesce controller callbacks, timers and ordinary planning after every early
+  shutdown outcome, including disabled/refused/exceptional preparation. Share
+  one cancellation-shielded cleanup transaction across repeated stop callers.
+  Retire the executing shutdown job without changing Core's live job list
+  while its eager iterator is scheduling other integrations.
+- Pin the first genuinely new minimum-current response for the independent
+  grid confirmation. Later conflicting conductor observations can withdraw
+  it, including adverse partial data that earns no positive response credit.
+  Keep the original bounded preparation window and 7 A / 300 s allowance;
+  expose phase-specific refusal, elapsed time and physical/grid timestamps.
+- Permit only a protective withdrawal from known live higher authority to
+  exactly 7 A when product data is quiet but critical meter/transport sources
+  remain healthy. The actual dispatch revalidates source, mapped boundary,
+  lease origin, profile and original electrical deadlines. Genuine new
+  minimum feedback still resolves the response; no freshness, subtraction,
+  increase permission or new overload window is manufactured.
+- Match the adapter's feedback-decrease ceiling to the validated profile,
+  including explicitly retained 29 A profiles. The selected installation's
+  28 A setting and all budget/cooling, hard/source/delivery/storage guards
+  remain unchanged.
+- Cover actual HA ConfigEntry, atomic Store and Core shutdown alongside
+  repeated EV frames, independently delayed grid data, partial adverse
+  observations, cleanup cancellation and actual quiet-data SDK admission.
+  An activation restart still runs the outgoing version's shutdown code;
+  this optional cloud-dependent handoff is not an unconditional guarantee
+  against interruptions, crashes or unavailable source feedback.
+
 ## 0.4.0b49
 
 - Separate a measured RAW excursion from the vehicle reduction episode.

@@ -87,6 +87,9 @@ _SOURCE_METADATA_FIELDS = frozenset({
     "restart_bridge_state", "restart_bridge_expires_at_utc",
     "restart_bridge_remaining_seconds", "restart_bridge_last_error",
     "restart_bridge_preparing", "restart_bridge_unobserved_seconds",
+    "restart_bridge_prepare_phase", "restart_bridge_failed_phase", "restart_bridge_error_type",
+    "restart_bridge_prepare_deadline_utc", "restart_bridge_prepare_elapsed_seconds",
+    "restart_bridge_physical_response_at_utc", "restart_bridge_grid_response_at_utc",
     "meter_state", "meter_zero_cause",
     "meter_control_state", "meter_episode_id", "meter_operational_fault",
     "meter_recovery_stage",
@@ -475,6 +478,7 @@ class OneFuseLoaderController:
         self._deadline_token: object | None = None
         self._shutdown_job_unsub = None
         self._shutdown_job_registered = False
+        self._stop_cleanup_task = None
         self._restart_bridge = GracefulRestartBridge(self)
         if command_adapter is not None:
             self.control_block_reason = command_adapter.control_block_reason
@@ -699,6 +703,9 @@ class OneFuseLoaderController:
             self.notify()
 
     async def async_start(self) -> None:
+        if self._stop_cleanup_task is not None:
+            await asyncio.shield(self._stop_cleanup_task)
+            self._stop_cleanup_task = None
         async with self._lock:
             self._stopped = False
             self._reload_settings_locked()
@@ -1075,26 +1082,51 @@ class OneFuseLoaderController:
             return
         # Keep the standalone offline harness independent of HA's job helper.
         from homeassistant.core import HassJob
+
+        async def shutdown_job() -> None:
+            # Core may start this coroutine eagerly while iterating its job
+            # list. Do not remove the currently executing job from that list;
+            # doing so can skip the next integration's shutdown job.
+            unsubscribe = self._shutdown_job_unsub
+            self._shutdown_job_unsub = None
+            self._shutdown_job_registered = False
+            try:
+                await self._async_prepare_shutdown_bridge()
+            finally:
+                # Retire the consumed job after Core finishes iterating, even
+                # when a stopped controller returned without another await.
+                await asyncio.sleep(0)
+                if unsubscribe is not None:
+                    unsubscribe()
+
         self._shutdown_job_unsub = register(HassJob(
-            self._async_prepare_shutdown_bridge, "1FuseLoader graceful shutdown bridge"))
+            shutdown_job, "1FuseLoader graceful shutdown bridge"))
         self._shutdown_job_registered = True
 
     async def _async_prepare_shutdown_bridge(self) -> bool:
-        if self._stopped or not self.settings.graceful_restart_bridge:
+        if self._stopped:
             return False
+        armed = False
         try:
             # HA's entire early shutdown stage has a twenty-second budget.
             # The bridge reserves time for its usual listener/adapter cleanup.
             async with asyncio.timeout(18):
-                armed = await self._restart_bridge.async_prepare_shutdown()
-                if armed:
+                try:
+                    if self.settings.graceful_restart_bridge:
+                        armed = await self._restart_bridge.async_prepare_shutdown()
+                finally:
+                    # HA's Core stop does not unload every config entry. A
+                    # refused/disabled bridge must also cease ordinary work
+                    # before MQTT and native HTTP enter their stop stages.
                     await self.async_stop()
-                return armed
         except Exception as err:
-            _LOGGER.warning("1FuseLoader shutdown bridge could not arm (%s)", type(err).__name__)
-            return False
+            _LOGGER.warning("1FuseLoader shutdown preparation or cleanup failed (%s)", type(err).__name__)
+        return armed
 
     async def async_stop(self) -> None:
+        if self._stop_cleanup_task is not None:
+            await asyncio.shield(self._stop_cleanup_task)
+            return
         # Mark stopped before waiting for a currently running request. Poll ticks
         # coalesce instead of queuing; none can submit after this method returns.
         self._stopped = True
@@ -1105,7 +1137,6 @@ class OneFuseLoaderController:
             self._shutdown_job_unsub()
             self._shutdown_job_unsub = None
         self._shutdown_job_registered = False
-        await self._restart_bridge.async_close()
         if self._delivery_unsub is not None:
             self._delivery_unsub()
             self._delivery_unsub = None
@@ -1142,6 +1173,15 @@ class OneFuseLoaderController:
         if self._unsub_deadline:
             self._unsub_deadline()
             self._unsub_deadline = None
+        # Remove all admission paths before the first I/O await. Even a slow
+        # final Store/SDK close cannot re-open ordinary planning during stop.
+        self._stop_cleanup_task = self.hass.async_create_task(
+            self._async_finish_stop(snapshot_task, asyncio.current_task()))
+        await asyncio.shield(self._stop_cleanup_task)
+
+    async def _async_finish_stop(self, snapshot_task, stop_caller) -> None:
+        """One idempotent close transaction survives a cancelled stop caller."""
+        await self._restart_bridge.async_close()
         async with self._lock:
             pass
         close = getattr(self._adapter, "async_close", None)
@@ -1154,9 +1194,9 @@ class OneFuseLoaderController:
             # A new controller must await it before reading or writing ledger.
             _LOGGER.warning("1FuseLoader exposure transaction remains pending or failed during unload")
         pending = self._refresh_task
-        if pending is not None and pending is not asyncio.current_task():
+        if pending is not None and pending not in (asyncio.current_task(), stop_caller):
             await pending
-        if snapshot_task is not None and snapshot_task is not asyncio.current_task():
+        if snapshot_task is not None and snapshot_task not in (asyncio.current_task(), stop_caller):
             try:
                 await snapshot_task
             except asyncio.CancelledError:
@@ -3084,7 +3124,7 @@ class OneFuseLoaderController:
                     and self.hass.loop.time() >= raw_excursion_deadline):
                 return False
             if (decision.meter_quiet_normal_retention or decision.meter_feedback_curtailment
-                    or decision.meter_quiet_minimum_retention):
+                    or decision.meter_quiet_minimum_retention or decision.meter_quiet_peak_reduction):
                 if (self._protective_zero_pending or self._delivery.unresolved_correlated_zero
                         or self._budget_error not in {None,"overload_budget_save_pending"}
                         or self._runtime_offline_problem(latest)

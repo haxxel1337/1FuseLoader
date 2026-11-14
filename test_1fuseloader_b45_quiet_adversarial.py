@@ -401,7 +401,7 @@ class B45QuietAdversarialTests(unittest.IsolatedAsyncioTestCase):
         p.sdk_charger.pause.assert_not_awaited()
         p.sdk_charger.resume.assert_not_awaited()
 
-    async def test_unresolved_peak_does_not_acquire_the_resolved_hold_exception(self):
+    async def test_normal_raw_retains_known_minimum_without_resolving_the_peak(self):
         p = self.p
         await p.boot()
         p.sdk_circuit.set_dynamic_current.side_effect = self.fixture.quiet_sdk
@@ -412,9 +412,18 @@ class B45QuietAdversarialTests(unittest.IsolatedAsyncioTestCase):
         deadline = peak.nominal_response_deadline_ts
         p.sdk_calls.clear()
         d = await self.tick(312.,3.)
-        self.assertIsNotNone(d.meter_zero_cause,d)
-        self.assert_no_positive()
+        # Missing advisory EV data cannot justify0 when independently measured
+        # RAW is normal. This grants no response proof or replacement window.
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertEqual(d.current_p1,7)
+        self.assertFalse(p.sdk_calls)
+        engine=p.controller.regulator._get_meter_envelope_policy()
+        self.assertIsNone(engine.response_ts)
+        self.assertIsNone(engine.minimum_certificate)
         self.assertEqual(p.controller.regulator.meter_control_diagnostics()['response_deadline'],deadline)
+        d=await self.tick(deadline+1.,27.5)
+        self.assertEqual(d.meter_zero_cause,'peak_response_timeout')
+        self.assert_no_positive()
 
     async def queued_change(self, kind):
         await self.quiet()

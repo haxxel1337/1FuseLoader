@@ -456,6 +456,7 @@ class RegulatorDecision:
     meter_ordinary_decrease: bool = False
     meter_feedback_curtailment: bool = False
     meter_feedback_budget_amps: Optional[float] = None
+    meter_feedback_ceiling_amps: Optional[float] = None
     meter_basis_grid_ts: Optional[float] = None
     meter_quiet_normal_retention: bool = False
     meter_normal_continuation_proven: bool = False
@@ -471,6 +472,9 @@ class RegulatorDecision:
     meter_raw_excursion_deadline_ts: Optional[float] = None
     meter_quiet_minimum_retention: bool = False
     meter_minimum_continuation_ceiling: Optional[float] = None
+    meter_quiet_peak_reduction: bool = False
+    meter_peak_reduction_ceiling_amps: Optional[float] = None
+    meter_peak_reduction_lease_origin_ts: Optional[float] = None
 
 
 class OneFuseRegulator:
@@ -6313,6 +6317,22 @@ class OneFuseRegulator:
             return False
         if planned.control_source_id != latest.control_source_id:
             return False
+        if decision.meter_quiet_peak_reduction and not dispatched:
+            shadow = deepcopy(self)
+            fresh = shadow._get_meter_envelope_policy().evaluate(shadow, latest)
+            return bool(fresh.meter_zero_cause is None
+                and fresh.meter_quiet_peak_reduction is True
+                and fresh.meter_peak_reduction_ceiling_amps == decision.meter_peak_reduction_ceiling_amps
+                    == self.settings.main_fuse_amps+self.settings.overload_margin_amps
+                and fresh.meter_peak_reduction_lease_origin_ts == decision.meter_peak_reduction_lease_origin_ts
+                and fresh.committed_current_p1 == decision.committed_current_p1
+                and fresh.mode == decision.mode
+                and fresh.meter_overload_authority == decision.meter_overload_authority
+                and fresh.nominal_response_deadline_ts == decision.nominal_response_deadline_ts
+                and fresh.meter_raw_excursion_deadline_ts == decision.meter_raw_excursion_deadline_ts
+                and fresh.command == decision.command == 'set_limit'
+                and fresh.current_p1 == decision.current_p1 == 7
+                and decision.current_p2 == decision.current_p3 == 0)
         if decision.meter_quiet_minimum_retention and not dispatched:
             shadow = deepcopy(self)
             engine = shadow._get_meter_envelope_policy()
@@ -6336,6 +6356,8 @@ class OneFuseRegulator:
             permit = self._get_meter_envelope_policy().operating_permission(self, latest)
             return bool(permit is not None and permit.kind == 'decrease'
                 and fresh.meter_zero_cause is None
+                and decision.meter_feedback_ceiling_amps == fresh.meter_feedback_ceiling_amps
+                    == self.settings.main_fuse_amps+self.settings.overload_margin_amps
                 and decision.command == fresh.command == 'set_limit'
                 and fresh.current_p1 == decision.current_p1 == permit.cap
                 and decision.committed_current_p1 == permit.accepted_cap

@@ -35,8 +35,17 @@ class B44QuietDispatchTests(unittest.IsolatedAsyncioTestCase):
         pulse,clock=await self.prepare_quiet()
         p=self.plant
         epoch=p.adapter._controlled_mapping_epoch
-        await self.tick(315.,5.9)
-        self.assertIsNone(p.adapter.native_controlled_l1_observation)
+        context=p.adapter.native_controlled_l1_observation
+        self.assertIsNotNone(context)
+        d=await self.tick(315.,5.9)
+        # Healthy transport preserves unchanged phase context, not a new
+        # current receipt, response proof or permission to subtract stale EV.
+        self.assertEqual(p.adapter.native_controlled_l1_observation,context)
+        inp=p.controller._read_input()
+        self.assertIsNone(p.controller.regulator._controlled_l1_projection(inp))
+        self.assertFalse(d.controlled_l1_used)
+        self.assertEqual(d.house_load_l1,5.9)
+        self.assertEqual(d.current_p1,d.committed_current_p1)
         self.assertEqual(p.adapter._controlled_mapping_epoch,epoch)
         self.assertEqual(p.product.state['latestPulse'],pulse)
         self.assertEqual(p.adapter.native_current_observation.received_at,clock.received_at)
