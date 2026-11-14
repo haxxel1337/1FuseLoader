@@ -468,6 +468,9 @@ class RegulatorDecision:
     meter_operational_fault: Optional[str] = None
     meter_recovery_stage: Optional[str] = None
     meter_episode_retention: bool = False
+    meter_raw_excursion_deadline_ts: Optional[float] = None
+    meter_quiet_minimum_retention: bool = False
+    meter_minimum_continuation_ceiling: Optional[float] = None
 
 
 class OneFuseRegulator:
@@ -6310,6 +6313,19 @@ class OneFuseRegulator:
             return False
         if planned.control_source_id != latest.control_source_id:
             return False
+        if decision.meter_quiet_minimum_retention and not dispatched:
+            shadow = deepcopy(self)
+            engine = shadow._get_meter_envelope_policy()
+            fresh = engine.evaluate(shadow, latest)
+            return bool(fresh.meter_zero_cause is None
+                and fresh.meter_quiet_minimum_retention is True
+                and fresh.meter_minimum_continuation_ceiling == decision.meter_minimum_continuation_ceiling
+                and fresh.mode == decision.mode
+                and fresh.meter_overload_authority == decision.meter_overload_authority
+                and fresh.meter_raw_excursion_deadline_ts == decision.meter_raw_excursion_deadline_ts
+                and fresh.command == decision.command == 'set_limit'
+                and fresh.current_p1 == decision.current_p1 == decision.committed_current_p1 == 7
+                and decision.current_p2 == decision.current_p3 == 0)
         if decision.meter_feedback_curtailment and not dispatched:
             # A provisional meter-feedback reduction is neither EV subtraction
             # proof nor overload permission. Re-admit the same strict lower
@@ -6340,6 +6356,11 @@ class OneFuseRegulator:
         shadow = deepcopy(self)
         engine = shadow._get_meter_envelope_policy()
         fresh = engine.evaluate(shadow, latest)
+        if dispatched:
+            # A new load episode can begin while the existing SDK request
+            # holds the controller lock. This observation schedules its real
+            # electrical deadline; it grants no command or lease authority.
+            self._meter_inflight_deadline_observation = fresh
         if fresh.meter_zero_cause is not None:
             return decision.current_p1 == 0 and decision.meter_zero_cause is not None
         if dispatched:

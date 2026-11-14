@@ -56,6 +56,39 @@ class ElectricalEpisode:
 
 
 @dataclass
+class RawExcursion:
+    """A fixed measured-total deadline, independent of EV reduction I/O.
+
+    These runtime clocks never survive boot as renewed authority. Persistence
+    records an active excursion only so a new process enters recovery instead
+    of manufacturing another ten-second allowance.
+    """
+    source_id: object
+    origin: float
+    deadline: float
+    first_grid_ts: float
+    last_high_grid_ts: float
+    ceiling: float
+
+
+@dataclass(frozen=True)
+class MinimumCertificate:
+    """One genuine minimum observation under an actual accepted boundary.
+
+    Advisory publication gaps may retain this proof within its original
+    finite bound. No persisted state, proposed cap or later callback can
+    construct it, and it supplies no household subtraction/increase credit.
+    """
+    source_id: object
+    mapping_key: tuple
+    accepted_floor: dict
+    receiver_scope: object
+    expires: float
+    received_at_ts: float
+    sequence: int
+
+
+@dataclass
 class LeaseState:
     cap: int = 0
     origin: Optional[float] = None

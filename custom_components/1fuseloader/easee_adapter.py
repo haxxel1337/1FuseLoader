@@ -1275,6 +1275,40 @@ class EaseeCommandAdapter:
             and 0<budget<=(25 if cap==7 else 23))
 
     @staticmethod
+    def _quiet_minimum_permit(decision: Any) -> bool:
+        """Shape only; the real callback must validate the finite 7 A chain.
+
+        Historical physical minimum evidence supplies neither new current
+        freshness nor EV-subtraction/increase authority. Only this exact
+        already accepted cap may use the healthy-transport quiet-data lane.
+        """
+        if getattr(decision, "meter_quiet_minimum_retention", False) is not True:
+            return False
+        raw = getattr(decision, "grid_l1", None)
+        ceiling = getattr(decision, "meter_minimum_continuation_ceiling", None)
+        mode = getattr(decision, "mode", None)
+        if not (getattr(decision, "meter_envelope", False) is True
+                and decision.command == "set_limit" and decision.ttl_seconds == 60
+                and type(decision.current_p1) is int and decision.current_p1 == 7
+                and decision.committed_current_p1 == 7
+                and decision.current_p2 == decision.current_p3 == 0
+                and mode in {"meter_normal", "meter_overload", "meter_raw_peak_hold"}
+                and all(type(value) in (int, float) and isfinite(value) for value in (raw, ceiling))
+                and 25 < ceiling <= 29 and 0 <= raw <= 38):
+            return False
+        if raw <= 25:
+            return mode == "meter_normal" and decision.meter_overload_authority is False
+        remaining = getattr(decision, "overload_remaining_seconds", None)
+        if (decision.meter_overload_authority is not True
+                or type(remaining) not in (int, float) or not isfinite(remaining) or remaining < 90):
+            return False
+        if raw <= ceiling:
+            return mode == "meter_overload"
+        deadline = getattr(decision, "meter_raw_excursion_deadline_ts", None)
+        return bool(mode == "meter_raw_peak_hold"
+            and type(deadline) in (int, float) and isfinite(deadline))
+
+    @staticmethod
     def _feedback_decrease_permit(decision: Any) -> bool:
         """Shape of a callback-revalidated monotone meter-feedback decrease.
 
@@ -1323,7 +1357,11 @@ class EaseeCommandAdapter:
             raise CommandNotSent(problem)
         command = decision.command
         feedback_permit = self._feedback_decrease_permit(decision)
-        quiet_permit=self._quiet_normal_permit(decision) or feedback_permit
+        minimum_permit = self._quiet_minimum_permit(decision)
+        quiet_permit=self._quiet_normal_permit(decision) or feedback_permit or minimum_permit
+        if getattr(decision, "meter_quiet_minimum_retention", False) and (
+                not minimum_permit or not callable(on_dispatch)):
+            raise CommandNotSent("quiet_minimum_dispatch_proof_required")
         if getattr(decision,"meter_quiet_normal_retention",False) and (not quiet_permit or not callable(on_dispatch)):
             raise CommandNotSent("quiet_normal_dispatch_proof_required")
         if getattr(decision, 'meter_feedback_curtailment', False) and (

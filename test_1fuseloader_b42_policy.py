@@ -69,7 +69,18 @@ class B42StandalonePolicyTests(unittest.TestCase):
     def test_exhausted_budget_stays_exhausted_after_operational_recovery(self):
         r=self.proved(1800.,'exhausted')
         self.assertEqual(r.export_overload_state()['automatic_cycle']['used_seconds'],1800.)
-        _,high=self.f.sample(r,70.,28.5,16.1,receipt=64.8,sequence=100)
+        _,lower=self.f.sample(r,70.,28.5,16.1,receipt=64.8,sequence=100)
+        # A genuine normal curtailment remains useful after the extra budget
+        # is spent: house12.4 + offered10 is below buffered23, so a full stop
+        # is unnecessary. This acquires no additional overload permission.
+        self.assertIsNone(lower.meter_zero_cause)
+        self.assertEqual(lower.current_p1,10)
+        self.assertTrue(lower.meter_ordinary_decrease)
+        self.assertFalse(lower.meter_overload_authority)
+        self.assertLessEqual(lower.house_load_l1+lower.current_p1,
+            r.settings.main_fuse_amps-r.settings.buffer_amps)
+        self.assertGreaterEqual(r.export_overload_state()['automatic_cycle']['used_seconds'],1800.)
+        _,high=self.f.sample(r,71.,29.1,10.1,receipt=70.8,sequence=101)
         self.assertEqual(high.meter_zero_cause,'overload_budget')
         self.assertEqual(r.export_overload_state()['automatic_cycle']['cycle_id'],9)
 
@@ -109,7 +120,7 @@ class B42StandalonePolicyTests(unittest.TestCase):
 
     def test_malformed_additive_schema_fails_closed_without_lifetime_refund(self):
         r=self.proved();good=r.export_overload_state()
-        mutations=[('version',True),('version',2),('next_episode_id',True),('next_episode_id',0),
+        mutations=[('version',True),('version',3),('next_episode_id',True),('next_episode_id',0),
             ('state','SOMETHING'),('recovery_stage','unknown'),('operational_fault',True),
             ('history',[dict(reason='x',resolved=True,cycle_id=9,episode_id=None,used_seconds='35')]),
             ('history',[dict(reason='x',resolved=True,cycle_id=9,episode_id=None,used_seconds=float('nan'))]),

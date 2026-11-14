@@ -198,7 +198,16 @@ class MeterElectricalHandoffReviewTests(unittest.TestCase):
                     self.assertFalse(r.peak_response_active)
                     self.assertEqual(later_grid.current_p1, 7)
                 else:
-                    self.assertEqual(later_grid.meter_zero_cause,
+                    # The genuinely newer low RAW12 ended the first measured
+                    # excursion. RAW13.5 begins a distinct one; a changed EV
+                    # receipt neither moves that origin nor requires another
+                    # physical reduction from an already accepted7A.
+                    self.assertIsNone(later_grid.meter_zero_cause)
+                    self.assertEqual(later_grid.current_p1,7)
+                    self.assertAlmostEqual(later_grid.meter_raw_excursion_deadline_ts,23.5)
+                    _,expired=fixture.sample(r,23.5,final_grid,7.4,
+                        receipt=12.9,sequence=4,accept=False)
+                    self.assertEqual(expired.meter_zero_cause,
                         meter.logic.ElectricalStopCause.GRID_CEILING.value)
 
     def test_fresh_normal_meter_can_renew_real_seven_without_erasing_original_peak(self):

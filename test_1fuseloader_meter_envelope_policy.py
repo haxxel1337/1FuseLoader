@@ -199,10 +199,10 @@ class MeterEnvelopePolicyTests(unittest.TestCase):
 
     def test_same_accepted_seven_gets_one_real_peak_dispatch_not_ttl_wait(self):
         r=self.live(cap=7)
-        _,d=self.sample(r,5.,28.5,7.1,receipt=0.,sequence=1)
+        _,d=self.sample(r,5.,29.5,7.1,receipt=0.,sequence=1)
         self.assertEqual((d.current_p1,d.should_call_service),(7,True))
         self.assertEqual(r._get_meter_envelope_policy().minimum_dispatch,5.)
-        _,again=self.sample(r,6.,28.5,7.1,receipt=0.,sequence=1)
+        _,again=self.sample(r,6.,29.5,7.1,receipt=0.,sequence=1)
         self.assertFalse(again.should_call_service)
 
     def test_sustained_minimum_does_not_rearm_peak_and_counts_full_budget(self):
@@ -217,13 +217,17 @@ class MeterEnvelopePolicyTests(unittest.TestCase):
         self.assertEqual(d.meter_zero_cause,logic.ElectricalStopCause.OVERLOAD_BUDGET.value)
         self.assertGreaterEqual(r.effective_overload_used_seconds,1800.)
 
-    def test_hard_and_postresponse_ceilings_remain(self):
+    def test_hard_limit_and_fixed_postresponse_raw_excursion(self):
         r=self.live()
         _,d=self.sample(r,5.,38.01,16.1,receipt=4.8,sequence=2,accept=False)
         self.assertEqual(d.meter_zero_cause,logic.ElectricalStopCause.HARD_LIMIT.value)
         r=self.peak()
         self.sample(r,12.,35.,7.1,receipt=11.8,sequence=3,grid_at=10.)
         _,d=self.sample(r,15.,29.01,7.1,receipt=11.8,sequence=3,accept=False)
+        self.assertIsNone(d.meter_zero_cause)
+        self.assertEqual(d.current_p1,7)
+        self.assertEqual(d.meter_raw_excursion_deadline_ts,20.)
+        _,d=self.sample(r,20.,29.01,7.1,receipt=11.8,sequence=3,accept=False)
         self.assertEqual(d.meter_zero_cause,logic.ElectricalStopCause.GRID_CEILING.value)
 
     def test_rearm_requires_strict_under23_continuously1800(self):

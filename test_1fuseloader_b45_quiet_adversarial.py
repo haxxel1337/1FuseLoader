@@ -263,11 +263,11 @@ class B45QuietAdversarialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after['meter_control']['history'],before['meter_control']['history'])
         self.p.sdk_charger.resume.assert_not_awaited()
 
-    async def confirmed_minimum_hold(self):
+    async def confirmed_minimum_hold(self, raw=28.5):
         p = self.p
         r = await p.peak()
         await p.response()
-        d = await self.tick(210.694,28.5,reported=210.)
+        d = await self.tick(210.694,raw,reported=210.)
         self.assertIsNone(d.meter_zero_cause,d)
         self.assertEqual(r.meter_control_diagnostics()['episode_phase'],'MINIMUM_HOLD')
         self.assertEqual(r.last_target[0],7)
@@ -304,17 +304,102 @@ class B45QuietAdversarialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.meter_control_diagnostics()['episode_phase'],'MINIMUM_HOLD')
         self.assertFalse(p.physical_interruptions)
 
-    async def test_resolved_hold_without_a_later_normal_ack_cannot_be_relabelled_quiet_normal(self):
+    async def test_confirmed_minimum_ack_chain_can_continue_normal_raw_without_new_ev_credit(self):
         p = self.p
         r = await self.confirmed_minimum_hold()
         p.sdk_circuit.set_dynamic_current.side_effect = self.fixture.quiet_sdk
         for at in (215.,230.,260.,290.,320.):
             d = await self.tick(at,28.5)
             self.assertIsNone(d.meter_zero_cause,d)
+        native = deepcopy(p.adapter.native_current_observation)
+        pulse = p.product.state['latestPulse']
+        before = deepcopy(r.export_overload_state())
+        accepted = r.last_target,r.last_set_limit_ts
         p.sdk_calls.clear()
         d = await self.tick(329.,21.9)
-        self.assertIsNotNone(d.meter_zero_cause,d)
-        self.assert_no_positive()
+        # B49's original physical minimum plus the real contiguous7A ACK
+        # chain may retain that SAME finite cap when a fresh RAW total is
+        # normal. No new normal ACK, EV sample or subtraction is invented.
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertEqual(d.current_p1,7)
+        self.assertFalse(d.meter_overload_authority)
+        self.assertIsNone(d.nominal_response_deadline_ts)
+        self.assertEqual(p.sdk_calls,[])
+        self.assertEqual((r.last_target,r.last_set_limit_ts),accepted)
+        for at in (350.,380.,410.):
+            d = await self.tick(at,21.9)
+            self.assertIsNone(d.meter_zero_cause,d)
+            self.assertEqual(d.current_p1,7)
+            self.assertFalse(d.meter_overload_authority)
+        self.assertTrue(p.sdk_calls)
+        self.assertTrue(all(row['phases']==(7,0,0) and row['ttl']==60 for row in p.sdk_calls))
+        self.assertGreater(r.last_set_limit_ts,accepted[1])
+        after = r.export_overload_state()
+        self.assertEqual(after['automatic_cycle']['cycle_id'],before['automatic_cycle']['cycle_id'])
+        self.assertGreaterEqual(after['automatic_cycle']['used_seconds'],before['automatic_cycle']['used_seconds'])
+        self.assertGreaterEqual(after['used_seconds'],before['used_seconds'])
+        self.assertEqual(p.product.state['latestPulse'],pulse)
+        current = p.adapter.native_current_observation
+        self.assertEqual(current.received_at,native.received_at)
+        self.assertEqual(current.source_timestamps,native.source_timestamps)
+        self.assertEqual(current.observation_sequences,native.observation_sequences)
+        self.assertEqual(current.observation_evidence_credit,native.observation_evidence_credit)
+        self.assertFalse(p.physical_interruptions)
+        p.sdk_charger.pause.assert_not_awaited()
+        p.sdk_charger.resume.assert_not_awaited()
+
+    async def test_real_adapter_renews_quiet_28_profile_and_new_bounded_raw_peak(self):
+        p = self.p
+        p.configure(overload_margin_amps=3)
+        r = await self.confirmed_minimum_hold(raw=27.5)
+        p.sdk_circuit.set_dynamic_current.side_effect = self.fixture.quiet_sdk
+        native = deepcopy(p.adapter.native_current_observation)
+        pulse = p.product.state['latestPulse']
+        p.sdk_calls.clear()
+        # Real finite7A SDK/HTTP renewals continue well beyond the native
+        # application's quiet threshold. ACKs publish no ProductUpdate and
+        # cannot manufacture a fresh EV sample or liveness pulse.
+        for at in range(215,661,5):
+            d = await self.tick(float(at),27.5)
+            self.assertIsNone(d.meter_zero_cause,d)
+            self.assertEqual(d.current_p1,7)
+            self.assertTrue(d.meter_overload_authority)
+        self.assertTrue(p.adapter.product_data_quiet)
+        self.assertTrue(p.sdk_calls)
+        self.assertTrue(all(row['phases']==(7,0,0) and row['ttl']==60 for row in p.sdk_calls))
+        self.assertGreater(r.effective_overload_used_seconds,120.)
+        for previous,renewed in zip(p.sdk_calls,p.sdk_calls[1:]):
+            self.assertLess(renewed['at'],previous['at']+previous['ttl'])
+        before = deepcopy(r.export_overload_state())
+        last_ack = r.last_set_limit_ts
+        high_at,renew_at = last_ack+28.,last_ack+30.
+        d = await self.tick(high_at,31.9)
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertAlmostEqual(d.meter_raw_excursion_deadline_ts,high_at+10.)
+        p.sdk_calls.clear()
+        d = await self.tick(renew_at,31.9)
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertAlmostEqual(d.meter_raw_excursion_deadline_ts,high_at+10.)
+        self.assertTrue(p.sdk_calls,"Actual adapter must admit the bounded quiet7A renewal")
+        self.assertTrue(all(row['cap']==7 and row['ttl']==60 for row in p.sdk_calls))
+        self.assertGreaterEqual(r.last_set_limit_ts,renew_at)
+        for at in (high_at+7.,high_at+11.):
+            d = await self.tick(at,27.5)
+            self.assertIsNone(d.meter_zero_cause,d)
+            self.assertEqual(d.current_p1,7)
+            self.assertIsNone(d.meter_raw_excursion_deadline_ts)
+        after = r.export_overload_state()
+        self.assertEqual(after['automatic_cycle']['cycle_id'],before['automatic_cycle']['cycle_id'])
+        self.assertGreaterEqual(after['automatic_cycle']['used_seconds'],before['automatic_cycle']['used_seconds'])
+        current = p.adapter.native_current_observation
+        self.assertEqual(current.received_at,native.received_at)
+        self.assertEqual(current.source_timestamps,native.source_timestamps)
+        self.assertEqual(current.observation_sequences,native.observation_sequences)
+        self.assertEqual(current.observation_evidence_credit,native.observation_evidence_credit)
+        self.assertEqual(p.product.state['latestPulse'],pulse)
+        self.assertFalse(p.physical_interruptions)
+        p.sdk_charger.pause.assert_not_awaited()
+        p.sdk_charger.resume.assert_not_awaited()
 
     async def test_unresolved_peak_does_not_acquire_the_resolved_hold_exception(self):
         p = self.p
