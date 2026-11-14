@@ -50,6 +50,41 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Fixed measured RAW excursions (b49)
+
+The selected meter-led profile gives the measured grid excursion its own
+fixed clock, separate from the vehicle's reduction response. The first fresh
+grid sample above the configured steady ceiling starts at most ten seconds
+of transient allowance, including when an actual live 7 A allocation already
+has genuine mapped phase-current feedback. The same excursion does not need
+another artificial reduction request. New high packets, lease renewals and
+SDK queues cannot move its original deadline. A later fresh grid sample at
+or below the steady ceiling ends that excursion without resetting exposure.
+
+A higher accepted offer still needs genuine 7 A response within the original
+ten-second reduction window. The separate thirty-second confirmation wait
+for old pre-reduction grid data remains distinct; a newly observed high total
+after reduction uses the original RAW deadline. An unresolved excursion is
+persisted and cannot acquire ten fresh seconds by restarting HA.
+
+A genuine minimum response may retain only the same finite 7 A authority
+through advisory publication gaps and contiguous actual same-cap ACKs. This
+memory-only certificate keeps its original observation clocks; it supplies
+no EV subtraction, increase credit or restored boot permission. Source,
+mapping, receiver, higher-current, delivery and lease failures withdraw it.
+The real adapter's quiet-data lane requires the exact minimum-only shape
+and a controller callback that revalidates this authority at SDK entry.
+
+The steady ceiling is consistently `main_fuse_amps + overload_margin_amps`:
+with a 25 A fuse, margin 3 A means 28 A. On the first B49 upgrade, HA's
+minor-version migration tightens the existing selected 25 A / 2 A-buffer
+meter profile from a margin above 3 A to 3 A. Other profiles and already
+tighter margins are preserved. New UI setups start with margin 3 A; later
+explicit option changes are preserved. The 38 A hard ceiling, cumulative
+time above 25 A, finite-lease reserve, critical-source/delivery/storage guards
+and thirty continuous minutes below 23 A for automatic rearm are preserved.
+These are software operating limits, not a fuse thermal model.
+
 ### Finite continuation during graceful shutdown (b48, explicit opt-in)
 
 `graceful_restart_bridge` is off by default. With the selected meter-led,

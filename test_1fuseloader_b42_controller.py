@@ -347,7 +347,7 @@ class B42StandaloneControllerTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(self.now+.1,3.,status='disconnected')
         self.assertFalse(any(row['cap']>0 and row['at']>first['at'] for row in self.sdk_calls))
 
-    async def test_new_peak_at_already_verified_minimum_has_no_second_ten_seconds(self):
+    async def test_new_peak_at_verified_minimum_has_one_fixed_raw_excursion(self):
         r=await self.peak()
         await self.response()
         await self.tick(210.694,28.5,reported=210.)
@@ -356,10 +356,20 @@ class B42StandaloneControllerTests(unittest.IsolatedAsyncioTestCase):
         await self.packet(248.,{182:8.35,183:7.1},source=248.)
         previous=len(self.sdk_calls)
         d=await self.tick(250.,31.)
-        self.assertIsNotNone(d.meter_zero_cause)
+        self.assertIsNone(d.meter_zero_cause)
+        self.assertEqual(d.current_p1,7)
+        self.assertEqual(d.meter_raw_excursion_deadline_ts,260.)
+        self.assertIsNone(d.nominal_response_deadline_ts)
+        self.assertEqual(len(self.sdk_calls),previous)
+        for at in (255.,259.9):
+            repeated=await self.tick(at,31.)
+            self.assertIsNone(repeated.meter_zero_cause)
+            self.assertEqual(repeated.meter_raw_excursion_deadline_ts,260.)
+            self.assertEqual(len(self.sdk_calls),previous)
+        expired=await self.tick(260.,31.)
+        self.assertEqual(expired.meter_zero_cause,'grid_ceiling')
         self.assertEqual(self.sdk_calls[-1]['cap'],0)
         self.assertEqual(len(self.sdk_calls),previous+1)
-        self.assertFalse(d.nominal_response_deadline_ts and d.nominal_response_deadline_ts>250.)
 
     async def test_spent_budget_does_not_refill_on_short_normal_dip(self):
         r,saved=await self.recover_normal(used=1800.,state='exhausted',reason='overload_budget')

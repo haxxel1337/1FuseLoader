@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0b49
+
+- Separate a measured RAW excursion from the vehicle reduction episode.
+  Already verified, actually accepted 7 A can retain its finite authority
+  through a new short grid surge rather than immediately sending zero at
+  the steady ceiling. Newly achieved minimum response uses the same original
+  RAW deadline; repeated packets and renewals cannot extend it.
+- Use the configured steady ceiling consistently instead of mixing a fixed
+  28 A trigger with a configurable 29 A hold ceiling. A 25 A / 3 A margin
+  profile means 28 A. HA's public minor-version migration applies this
+  one-time tightening to the existing selected 25 A / 2 A-buffer meter
+  profile; preserve tighter margins, other profiles and later explicit
+  changes. New UI setups start with a 3 A margin.
+- Persist unresolved RAW excursions and reject fresh allowance after a
+  restart. Expose bounded excursion diagnostics and schedule the actual
+  deadline, including queued submission checks and retained checkpoint I/O.
+- Keep genuine same-minimum authority through noncritical publication gaps
+  and contiguous actual 7 A renewals without manufacturing fresh EV evidence.
+  Revalidate a narrow minimum-only quiet-data permit in the real adapter;
+  revoked scope, expired/unknown authority and critical faults still preempt.
+- Correct the old immediate post-response ceiling test expectation; cover
+  already-minimum, fresh reduction, exact expiry, repeated sources, renewal,
+  hard faults and persistence through the real controller and synthetic MQTT.
+- Preserve cumulative exposure, automatic cooling, historical faults, finite
+  remote leases/reserve and all critical source/storage/delivery protections.
+
 ## 0.4.0b48
 
 - Validate HA 2026.11.0 and 2026.11.1 alongside the minimum and previous current

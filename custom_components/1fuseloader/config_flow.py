@@ -65,6 +65,7 @@ def _config_schema(defaults: dict[str, Any] | None = None, *, include_name: bool
 
 class OneFuseLoaderConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
+    MINOR_VERSION = 2
 
     def _input_errors(self, data: dict[str, Any]) -> dict[str, str]:
         """Check registry references and units without controlling the charger."""
@@ -126,7 +127,11 @@ class OneFuseLoaderConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 title = str(user_input.get(CONF_NAME, DEFAULT_NAME)).strip() or DEFAULT_NAME
                 data = dict(user_input)
                 data.pop(CONF_NAME, None)
-                return self.async_create_entry(title=title, data=data, options=dict(DEFAULT_OPTIONS))
+                # Revision 1.2 starts new entries at the documented 28 A
+                # selected profile. Existing legacy defaults remain available
+                # for validation and are migrated once through HA's entry API.
+                options = {**DEFAULT_OPTIONS, "overload_margin_amps": 3.0}
+                return self.async_create_entry(title=title, data=data, options=options)
 
         return self.async_show_form(step_id="user", data_schema=_config_schema(user_input), errors=errors)
 

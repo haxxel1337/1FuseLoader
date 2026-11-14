@@ -65,7 +65,7 @@ class StandaloneRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.tick()
         state = r.export_overload_state()
         self.assertIn("meter_control", state)
-        self.assertEqual(state["meter_control"]["version"], 1)
+        self.assertEqual(state["meter_control"]["version"], 2)
         self.assertTrue(self.controller._budget_store.state_is_durable(state))
         self.assertFalse(self.controller._normal_control_checkpoint_pending)
         loaded = await self.controller._budget_store.async_load()

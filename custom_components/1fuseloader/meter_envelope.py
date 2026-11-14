@@ -17,6 +17,8 @@ if _name not in sys.modules:
 _state=sys.modules[_name]
 ControlState,ElectricalEpisode,LeaseState,RecoveryState=(_state.ControlState,_state.ElectricalEpisode,_state.LeaseState,_state.RecoveryState)
 OperatingPermission = _state.OperatingPermission
+RawExcursion = _state.RawExcursion
+MinimumCertificate = _state.MinimumCertificate
 def number(value):
     if isinstance(value,bool): return None
     try:
@@ -43,6 +45,8 @@ class MeterEnvelopePolicy:
         self.zero_permits={};self.feedback_base_cap=self.feedback_source=None
         self.ordinary_decrease_grid=self.ordinary_decrease_cap=self.ordinary_decrease_raw=None
         self.peak_complete_grid=None
+        self.raw_excursion=None
+        self.minimum_certificate=None
 
     def limit_due(self,r,now,cap):
         return (r.last_target!=(cap,0,0,60) or r.last_set_limit_ts is None
@@ -50,12 +54,18 @@ class MeterEnvelopePolicy:
 
     def diagnostics(self,r):
         e=self.episode;c=r._ensure_automatic_cycle()
+        raw=self.raw_excursion
         return dict(state=self.state.value,episode_id=e.episode_id if e else None,
             episode_phase=e.phase.value if e else None,response_deadline=e.deadline if e and e.unresolved else None,
             grid_deadline=e.grid_deadline if e and e.phase==ControlState.GRID_WAIT else None,
             operational_fault=self.operational_fault,recovery_stage=self.recovery.stage,recovery_required=self.recovery.required,
             cycle_id=c['cycle_id'],used_seconds=c['used_seconds'],remaining_seconds=max(0.,r.settings.overload_budget_seconds-c['used_seconds']),
-            historical_failure=c['failure_reason'],incident_count=len(self.history))
+            historical_failure=c['failure_reason'],incident_count=len(self.history),
+            raw_excursion_active=raw is not None,
+            raw_excursion_origin=raw.origin if raw else None,
+            raw_excursion_deadline=raw.deadline if raw else None,
+            raw_excursion_first_grid_ts=raw.first_grid_ts if raw else None,
+            raw_excursion_source=raw.source_id if raw else None)
 
     def remember(self,r,reason):
         c=r._ensure_automatic_cycle();eid=self.episode.episode_id if self.episode else None
@@ -71,6 +81,7 @@ class MeterEnvelopePolicy:
 
     def stop(self,r,inp,cause):
         now=number(inp.now_ts) or 0.;raw=number(inp.grid_l1)
+        self.minimum_certificate=None
         repeat=bool(cause in {self.causes.PEAK_RESPONSE_TIMEOUT,self.causes.GRID_CONFIRMATION_TIMEOUT,
             self.causes.GRID_CEILING,self.causes.OVERLOAD_BUDGET,self.causes.OVERLOAD_NOT_ADMITTED}
             and self.recovery.required and self.lease.cap==0 and raw is not None
@@ -85,17 +96,22 @@ class MeterEnvelopePolicy:
 
     def export_state(self):
         e=self.episode
-        return dict(version=1,state=self.state.value,next_episode_id=self.next_episode_id,operational_fault=self.operational_fault,
+        raw=self.raw_excursion
+        return dict(version=2,state=self.state.value,next_episode_id=self.next_episode_id,operational_fault=self.operational_fault,
             recovery_required=self.recovery.required,recovery_stage=self.recovery.stage,history=deepcopy(self.history),
             recovered_cycle_id=self.recovered_cycle_id,
             episode_active=bool(e and e.unresolved),episode_id=e.episode_id if e else None,
             episode_source=e.source_id if e else None,episode_previous=e.previous_authority if e else None,
-            episode_failure=e.failure if e else None,legacy_normal_history=deepcopy(self.legacy_normal_history))
+            episode_failure=e.failure if e else None,legacy_normal_history=deepcopy(self.legacy_normal_history),
+            raw_excursion_active=raw is not None,
+            raw_excursion_source=raw.source_id if raw else None,
+            raw_excursion_first_grid_ts=raw.first_grid_ts if raw else None,
+            raw_excursion_ceiling=raw.ceiling if raw else None)
 
     def restore_state(self,r,state):
         c=r._ensure_automatic_cycle();saved=state.get('meter_control');self.legacy_normal_history=deepcopy(state.get('normal_control'))
         if saved is not None:
-            valid=bool(isinstance(saved,dict) and type(saved.get('version')) is int and saved['version']==1 and saved.get('state') in {v.value for v in ControlState}
+            valid=bool(isinstance(saved,dict) and type(saved.get('version')) is int and saved['version'] in {1,2} and saved.get('state') in {v.value for v in ControlState}
                 and type(saved.get('next_episode_id')) is int and 1<=saved['next_episode_id']<=2**53-1
                 and type(saved.get('recovery_required')) is bool and type(saved.get('episode_active')) is bool
                 and (saved.get('operational_fault') is None or isinstance(saved['operational_fault'],str)
@@ -123,7 +139,15 @@ class MeterEnvelopePolicy:
                     and (item.get('episode_id') is None or type(item['episode_id']) is int
                         and 1<=item['episode_id']<saved['next_episode_id'])
                     and type(item.get('used_seconds')) in (int,float) and number(item['used_seconds']) is not None
-                    and item['used_seconds']>=0 for item in saved['history']))
+                    and item['used_seconds']>=0 for item in saved['history'])
+                and (saved['version']==1 or type(saved.get('raw_excursion_active')) is bool
+                    and (not saved['raw_excursion_active']
+                        or r._trial_identity(saved.get('raw_excursion_source')) is not None
+                        and number(saved.get('raw_excursion_first_grid_ts')) is not None
+                        and type(saved.get('raw_excursion_first_grid_ts')) in (int,float)
+                        and type(saved.get('raw_excursion_ceiling')) in (int,float)
+                        and number(saved.get('raw_excursion_ceiling')) is not None
+                        and 0<saved['raw_excursion_ceiling']<=38)))
             if not valid:
                 self.operational_fault='invalid_standalone_state';self.recovery=RecoveryState(True,'await_authority');self.state=ControlState.STOP_RECOVERY
                 return False
@@ -136,6 +160,11 @@ class MeterEnvelopePolicy:
                 self.operational_fault=self.operational_fault or saved.get('episode_failure') or 'interrupted_episode_after_restore'
                 self.episode=ElectricalEpisode(saved['episode_id'],r._trial_identity(saved['episode_source']),
                     None,None,None,saved['episode_previous'],interrupted=True,failure=self.operational_fault)
+            if saved.get('version')==2 and saved['raw_excursion_active']:
+                # A monotonic deadline belongs to its old process. A saved
+                # active excursion is a recovery barrier, never a fresh grant.
+                needed=True
+                self.operational_fault=self.operational_fault or 'interrupted_raw_excursion_after_restore'
             if needed and self.operational_fault is None:
                 self.operational_fault='interrupted_episode_after_restore'
             if c['state']=='blocked' and not needed:
@@ -338,12 +367,163 @@ class MeterEnvelopePolicy:
         self.recovered_cycle_id=c['cycle_id']
         return True
 
+    @staticmethod
+    def steady_ceiling(r):
+        return r.settings.main_fuse_amps+r.settings.overload_margin_amps
+
+    def observe_raw_excursion(self,r,inp,possible_cap=None):
+        """Remember the first measured high RAW without granting authority.
+
+        SDK callbacks, renewals and a later physical minimum response cannot
+        move this origin. Only a genuinely later low meter sample ends it.
+        """
+        now,wall,gt,raw=map(number,(inp.now_ts,inp.wall_now_ts,inp.grid_report_ts,inp.grid_l1))
+        current=self.raw_excursion
+        if current is not None:
+            if current.source_id!=inp.control_source_id:
+                return self.causes.CONTROL_SOURCE_CHANGED
+            if gt<current.last_high_grid_ts:
+                return self.causes.GRID_INVALID
+            if raw<=current.ceiling and gt>current.last_high_grid_ts:
+                self.raw_excursion=None
+                return None
+            if raw>current.ceiling:
+                current.last_high_grid_ts=max(current.last_high_grid_ts,gt)
+            return None
+        ceiling=self.steady_ceiling(r)
+        if raw>ceiling and (self.lease.live(now) or possible_cap is not None and possible_cap>0):
+            origin=now-(wall-gt)
+            deadline=origin+min(10.,r.settings.overload_response_seconds)
+            if self.lease.live(now): deadline=min(deadline,self.lease.expires)
+            remaining=max(0.,r.settings.overload_budget_seconds-r._ensure_automatic_cycle()['used_seconds'])
+            deadline=min(deadline,now+remaining)
+            self.raw_excursion=RawExcursion(inp.control_source_id,origin,deadline,gt,gt,ceiling)
+        return None
+
+    @staticmethod
+    def minimum_receiver_scope(inp):
+        provenance=inp.charger_report_provenance
+        if inp.charger_report_family!='native_terminal_receipt' or not isinstance(provenance,tuple):
+            return None
+        return (inp.charger_report_family,provenance[:provenance.index('max_terminals')]
+            if 'max_terminals' in provenance else provenance)
+
+    @staticmethod
+    def minimum_advisory_gap(inp):
+        return bool(inp.meter_ev_health is not None and not inp.meter_ev_health.valid
+            or inp.charger_publication_pending or inp.meter_product_data_quiet)
+
+    @staticmethod
+    def minimum_session_eligible(inp):
+        return (inp.status or '').strip().lower() in {'charging','start_charging','ready_to_charge',
+            'awaiting_start','awaiting_load_balancing','connected','buffering'}
+
+    @staticmethod
+    def minimum_higher_pending(r,now):
+        return any(record.get('target',(0,0,0))[0]>r.startup_current
+            and number(record.get('now')) is not None
+            and number(record['now'])+(number(record.get('ttl')) or 60.)>now
+            for record in r._dispatch_records.values())
+
+    def observe_minimum_certificate(self,r,inp):
+        now=number(inp.now_ts);e=self.l1;floor=self.accepted_l1_floor
+        if (not self.lease.live(now) or self.lease.cap!=r.startup_current or floor is None
+                or not self.minimum_session_eligible(inp) or self.minimum_higher_pending(r,now)):
+            self.minimum_certificate=None
+            return
+        certificate=self.minimum_certificate
+        if certificate is not None and (certificate.source_id!=inp.control_source_id
+                or certificate.accepted_floor!=floor or now>=certificate.expires):
+            self.minimum_certificate=None;certificate=None
+        context=inp.controlled_l1
+        if context is None and (not self.minimum_advisory_gap(inp)
+                or certificate is not None and certificate.receiver_scope!=self.minimum_receiver_scope(inp)):
+            self.minimum_certificate=None
+            return
+        if context is not None and (not r._controlled_l1_context(inp)
+                or certificate is not None and r._controlled_l1_key(context)!=certificate.mapping_key):
+            self.minimum_certificate=None;certificate=None
+        if (certificate is not None and context is not None
+                and number(context.current) is not None and number(context.current)>r.startup_current+.5
+                and type(context.sequence) is int and context.sequence>=certificate.sequence
+                and number(context.received_at_ts) is not None
+                and number(context.received_at_ts)>=certificate.received_at_ts):
+            # An advancing larger conductor report withdraws the old bound
+            # even during an incomplete publication. A stale old larger cache
+            # cannot masquerade as an advancing physical report.
+            self.minimum_certificate=None
+            return
+        if e is not None and not 1<=e.current<=r.startup_current+.5:
+            self.minimum_certificate=None
+            return
+        if (e is not None and 1<=e.current<=r.startup_current+.5
+                and r._controlled_l1_after(e,floor)):
+            # Independent conductor evidence does not depend on aggregate EV
+            # increase/partial-publication quality. The receipt's own age and
+            # current real lease bound the new certificate, not this callback.
+            physical_until=now-(number(inp.wall_now_ts)-e.received_at_ts)+r.settings.max_sensor_age_seconds
+            expiry=min(self.lease.expires,physical_until)
+            if certificate is not None:
+                # A valid contiguous same-cap SDK renewal may already have
+                # extended the finite authority. Re-reading its older genuine
+                # current cannot shorten it into a new response requirement.
+                expiry=max(expiry,certificate.expires)
+            self.minimum_certificate=MinimumCertificate(inp.control_source_id,r._controlled_l1_key(e),
+                deepcopy(floor),self.minimum_receiver_scope(inp),expiry,
+                e.received_at_ts,e.sequence)
+
+    def minimum_evidence(self,r,inp):
+        """Independent present minimum or a bounded prior physical certificate."""
+        now=number(inp.now_ts);e=self.l1;floor=self.accepted_l1_floor
+        if (not self.lease.live(now) or self.lease.cap!=r.startup_current or floor is None
+                or not self.minimum_session_eligible(inp) or self.minimum_higher_pending(r,now)):
+            return False
+        if (e is not None and 1<=e.current<=r.startup_current+.5
+                and r._controlled_l1_after(e,floor)):
+            return True
+        certificate=self.minimum_certificate
+        if (certificate is None or now>=certificate.expires
+                or certificate.source_id!=inp.control_source_id or certificate.accepted_floor!=floor):
+            return False
+        context=inp.controlled_l1
+        if context is not None:
+            return bool(r._controlled_l1_context(inp)
+                and r._controlled_l1_key(context)==certificate.mapping_key)
+        # Missing mapping with otherwise fully qualified publication is an
+        # actual withdrawal. Only explicitly advisory gaps can retain a
+        # previously observed minimum, within the same native receiver scope.
+        return bool(self.minimum_advisory_gap(inp) and certificate.receiver_scope is not None
+            and certificate.receiver_scope==self.minimum_receiver_scope(inp))
+
+    def raw_excursion_hold(self,r,inp):
+        raw=self.raw_excursion;now=number(inp.now_ts)
+        if (raw is None or number(inp.grid_l1)<=raw.ceiling
+                or not self.minimum_evidence(r,inp)):
+            return None
+        if (not r.settings.overload_enabled or self.recovery.required or self.operational_fault):
+            return self.supervisor.zero(self,r,inp,self.causes.OVERLOAD_NOT_ADMITTED)
+        if r._ensure_automatic_cycle()['used_seconds']>=r.settings.overload_budget_seconds:
+            return self.supervisor.zero(self,r,inp,self.causes.OVERLOAD_BUDGET)
+        if now>=raw.deadline:
+            return self.supervisor.zero(self,r,inp,self.causes.GRID_CEILING)
+        self.minimum_verified=True
+        return self.decision(r,inp,'meter_raw_peak_hold',r.startup_current,
+            command='set_limit',overload=True,raw_deadline=raw.deadline,
+            reason='The actual verified minimum is retained during the original bounded measured-RAW excursion; no new reduction response or extended peak window is created.')
+
     def observe_inflight(self,r,inp,decision):
         if self.critical_error(r,inp) is not None: return
         raw,now,wall,gt=map(number,(inp.grid_l1,inp.now_ts,inp.wall_now_ts,inp.grid_report_ts))
+        self.observe_raw_excursion(r,inp,decision.current_p1)
+        self.l1=r._controlled_l1_projection(inp)
+        self.observe_minimum_certificate(r,inp)
         self.upper=max(self.upper,decision.current_p1)
-        if 28.<raw<=r.settings.overload_transition_limit_amps and (self.episode is None or not self.episode.unresolved) and not (self.minimum_verified and decision.current_p1<=7):
-            origin=now-(wall-gt);self.episode=ElectricalEpisode(self.next_episode_id,inp.control_source_id,origin,origin+r.settings.overload_response_seconds,gt,self.upper)
+        if self.steady_ceiling(r)<raw<=r.settings.overload_transition_limit_amps and (self.episode is None or not self.episode.unresolved) and not (self.minimum_evidence(r,inp) and decision.current_p1<=7):
+            origin=self.raw_excursion.origin if self.raw_excursion is not None else now-(wall-gt)
+            self.episode=ElectricalEpisode(self.next_episode_id,inp.control_source_id,origin,
+                min(origin+min(10.,r.settings.overload_response_seconds),self.raw_excursion.deadline)
+                    if self.raw_excursion is not None else origin+min(10.,r.settings.overload_response_seconds),
+                self.raw_excursion.first_grid_ts if self.raw_excursion is not None else gt,self.upper)
             self.next_episode_id+=1
 
     def operating_permission(self,r,inp):
@@ -356,7 +536,7 @@ class MeterEnvelopePolicy:
             and episode.phase==ControlState.MINIMUM_HOLD and self.minimum_verified
             and self.lease.cap==r.startup_current)
         if (None in (now,wall,gt,raw) or self.critical_error(r,inp) is not None
-                or not 0<=wall-gt<=min(15.,r.settings.max_sensor_age_seconds) or raw>28.
+                or not 0<=wall-gt<=min(15.,r.settings.max_sensor_age_seconds) or raw>self.steady_ceiling(r)
                 or not self.lease.live(now) or self.lease.cap<=0 or not self.lease.normal_admitted
                 or self.lease.cap>r.settings.max_charge_amps
                 or episode is not None and not ordinary_minimum
@@ -422,17 +602,34 @@ class MeterEnvelopePolicy:
         if d.command=='set_limit' and d.current_p1>0:
             self.zero_l1_floor=None;self.lease.zero_dispatch=None
             self.possible_positive[d.plan_id]=(d.current_p1,record['now']+d.ttl_seconds);self.upper=max(self.upper,d.current_p1)
-            if d.current_p1>7: self.minimum_verified=False
+            if d.current_p1>7:
+                self.minimum_verified=False;self.minimum_certificate=None
             if self.recovery.required and not d.meter_overload_authority: self.recovery.candidate_plan=d.plan_id
         elif d.command=='set_limit' and d.current_p1==0 and self.zero_l1_floor is None:
+            self.minimum_certificate=None
             self.zero_l1_floor=deepcopy(record.get('controlled_l1_floor'));self.lease.zero_dispatch=record['now']
 
     def acknowledge(self,r,d,now,dispatch):
         origin=dispatch['now'];old=self.lease.cap
+        certificate=self.minimum_certificate
+        new_floor=dispatch.get('controlled_l1_floor')
+        continuous_minimum=bool(certificate is not None and old==d.current_p1==r.startup_current
+            and self.lease.live(origin) and self.lease.live(now) and now<certificate.expires
+            and certificate.source_id==dispatch.get('source_id')==self.lease.source_id
+            and certificate.accepted_floor==self.accepted_l1_floor
+            and (new_floor is None or new_floor['key']==certificate.mapping_key)
+            and not self.minimum_higher_pending(r,now))
         same_normal=bool(self.lease.normal_admitted and old==d.current_p1
             and self.lease.source_id==dispatch.get('source_id'))
         r.last_action_ts=now;r.last_set_limit_ts=origin;r.last_command='set_limit';r.last_target=(d.current_p1,0,0,d.ttl_seconds)
         self.lease.cap=d.current_p1;self.lease.origin=origin;self.lease.expires=origin+d.ttl_seconds
+        if continuous_minimum:
+            # Only a real acknowledged same-7A command can continue this
+            # permission through its new finite lease. This is NOT a new EV
+            # sample and cannot extend the independent RAW excursion clock.
+            self.minimum_certificate=replace(certificate,expires=self.lease.expires)
+        else:
+            self.minimum_certificate=None
         mode=d.mode.removeprefix('dry_run_')
         self.lease.normal_admitted=bool(d.current_p1>0 and not d.meter_overload_authority
             and (mode in {'meter_normal','meter_normal_decrease','meter_ready'}
@@ -468,7 +665,6 @@ class MeterEnvelopePolicy:
         self.lease.source_id=dispatch.get('source_id');r._accepted_control_source_id=self.lease.source_id
         startup_proved=bool(self.start_since is not None and origin-self.start_since>=r.settings.restart_stable_seconds
             and self.recovery.old_authority_until is not None and origin>=self.recovery.old_authority_until)
-        new_floor=dispatch.get('controlled_l1_floor')
         normal_floor=not d.meter_overload_authority and new_floor is not None
         operating_scope_missing=bool(normal_floor and (self.accepted_l1_floor is None
             or new_floor['key']!=self.accepted_l1_floor['key']))
@@ -494,6 +690,12 @@ class MeterEnvelopePolicy:
         elif old!=d.current_p1: self.ordinary_decrease_grid=self.ordinary_decrease_cap=self.ordinary_decrease_raw=None
         if self.episode is not None and self.episode.unresolved and d.current_p1==7 and self.minimum_dispatch is None:
             self.minimum_dispatch=origin;self.minimum_l1_floor=deepcopy(dispatch.get('controlled_l1_floor'))
+            if (new_floor is not None and (self.accepted_l1_floor is None
+                    or new_floor['key']!=self.accepted_l1_floor['key'])):
+                # A changed mapping acquires its new response floor only at
+                # this real accepted minimum dispatch, never from a callback.
+                self.accepted_l1_floor=deepcopy(new_floor)
+                self.minimum_certificate=None
         recovery_scope_missing=bool(normal_floor and (self.recovery.normal_floor is None
             or new_floor['key']!=self.recovery.normal_floor['key']))
         if (self.recovery.required and startup_proved and not d.meter_overload_authority
@@ -604,15 +806,23 @@ class MeterEnvelopePolicy:
     def decision(self, r, inp, mode, cap, *, command=None, cause=None,
                  reason='', house=None, overload=False, response_deadline=None,
                  confirmation_deadline=None, no_write_deadline=None, basis='meter_envelope_feedback',
-                 ordinary_decrease=False, normal_retention=False):
+                 ordinary_decrease=False, normal_retention=False, raw_deadline=None):
         s, now = r.settings, number(inp.now_ts)
         self.state=({'meter_peak_response':ControlState.REDUCING,'meter_grid_wait':ControlState.GRID_WAIT,
-            'meter_overload':ControlState.MINIMUM_HOLD,'meter_fault':ControlState.STOP_RECOVERY,
+            'meter_overload':ControlState.MINIMUM_HOLD,'meter_raw_peak_hold':ControlState.MINIMUM_HOLD,'meter_fault':ControlState.STOP_RECOVERY,
             'meter_recovery_wait':ControlState.STOP_RECOVERY}.get(mode,
             ControlState.STOP_RECOVERY if self.recovery.required else ControlState.NORMAL))
         if now is None:
             now = number(r._last_input_now_ts) or 0.
         raw, ev = number(inp.grid_l1), number(inp.charger_current)
+        quiet_minimum=bool(inp.meter_product_data_quiet and command=='set_limit'
+            and mode in {'meter_normal','meter_overload','meter_raw_peak_hold'}
+            and cause is None and cap==self.lease.cap==r.startup_current
+            and r.last_target is not None and r.last_target[0]==cap
+            and self.minimum_evidence(r,inp) and raw is not None
+            and raw<=min(38.,s.overload_transition_limit_amps)
+            and (raw<=self.steady_ceiling(r)
+                or raw_deadline is not None and now<raw_deadline))
         r._plan_sequence += 1
         should = bool(s.active_control is True and s.dry_run is False and command)
         if command == 'set_limit':
@@ -644,6 +854,9 @@ class MeterEnvelopePolicy:
             grid_confirmation_deadline_ts=confirmation_deadline,
             grid_confirmation_remaining_seconds=max(0.,confirmation_deadline-now) if confirmation_deadline is not None else None,
             normal_continuity_deadline_ts=no_write_deadline,
+            meter_raw_excursion_deadline_ts=raw_deadline,
+            meter_quiet_minimum_retention=quiet_minimum,
+            meter_minimum_continuation_ceiling=self.steady_ceiling(r) if quiet_minimum else None,
             meter_envelope=True, meter_zero_cause=cause.value if cause else None,
             meter_state=mode, meter_control_state=self.state.value,
             meter_episode_id=self.episode.episode_id if self.episode else None,
@@ -719,13 +932,21 @@ class MeterEnvelopePolicy:
             and e.grid_deadline is not None and now<e.grid_deadline)
         minimum_hold=bool(e is not None and e.phase==ControlState.MINIMUM_HOLD and cap<=7
             and p.minimum_verified and number(inp.grid_l1)<=r.settings.main_fuse_amps+r.settings.overload_margin_amps)
-        episode_hold=bool((reducing or grid_wait or minimum_hold) and e.failure is None and not e.interrupted
+        raw_hold=bool(d.mode.removeprefix('dry_run_')=='meter_raw_peak_hold'
+            and d.meter_raw_excursion_deadline_ts is not None and now<d.meter_raw_excursion_deadline_ts
+            and cap==r.startup_current and p.minimum_evidence(shadow,inp))
+        certified_minimum_hold=bool(cap==r.startup_current and p.minimum_evidence(shadow,inp)
+            and number(inp.grid_l1)<=p.steady_ceiling(shadow)
+            and (number(inp.grid_l1)<=r.settings.main_fuse_amps or r.settings.overload_enabled
+                and r.effective_overload_used_seconds<r.settings.overload_budget_seconds))
+        episode_hold=bool((raw_hold or certified_minimum_hold or (reducing or grid_wait or minimum_hold)
+                and e.failure is None and not e.interrupted)
             and p.critical_error(shadow,inp) is None and number(inp.grid_l1)<=r.settings.overload_transition_limit_amps
             and p.operational_fault is None and not p.recovery.required)
         if d.meter_zero_cause or (not episode_hold and not provisional_hold
                 and (not d.meter_normal_retention or d.meter_overload_authority)):
             return None
-        if (inp.meter_product_data_quiet and not provisional_hold
+        if (inp.meter_product_data_quiet and not provisional_hold and not (episode_hold and cap==r.startup_current)
                 and (permission is None or permission.kind not in {'retain','hold'})):
             return None
         template=proposed or d
@@ -737,10 +958,12 @@ class MeterEnvelopePolicy:
             meter_envelope=True,meter_zero_cause=None,meter_state='meter_normal_hold',
             meter_normal_retention=True,meter_overload_authority=False,
             meter_feedback_curtailment=False,meter_feedback_budget_amps=None,
+            meter_quiet_minimum_retention=False,meter_minimum_continuation_ceiling=None,
             meter_episode_retention=episode_hold,
             normal_continuity_deadline_ts=r.last_set_limit_ts+r.last_target[3],
             nominal_response_deadline_ts=e.deadline if episode_hold and reducing else None,
-            grid_confirmation_deadline_ts=e.grid_deadline if episode_hold and grid_wait else None)
+            grid_confirmation_deadline_ts=e.grid_deadline if episode_hold and grid_wait else None,
+            meter_raw_excursion_deadline_ts=d.meter_raw_excursion_deadline_ts if episode_hold else None)
 
 
     def evaluate(self, r, inp):
@@ -766,9 +989,12 @@ class MeterEnvelopePolicy:
         uncertain_positive=self.observe_positive_authority(r,inp,now,live)
         self.observe_recovery(r,inp,now,uncertain_positive)
         cap=self.lease.cap if live else 0
+        self.observe_minimum_certificate(r,inp)
         self.upper=max(self.upper,cap)
         if raw>min(38.,s.overload_transition_limit_amps):
             return self.supervisor.zero(self,r,inp,C.HARD_LIMIT)
+        raw_error=self.observe_raw_excursion(r,inp)
+        if raw_error: return self.supervisor.zero(self,r,inp,raw_error)
         manual={'paused','awaiting_smart_start','awaiting_scheduled_start','awaiting_authorization',
             'de_authorizing','authenticating','paused_due_to_equalizer','waiting_for_schedule','stop_charging'}
         if status in manual:
@@ -785,9 +1011,26 @@ class MeterEnvelopePolicy:
                 command='set_limit',house=raw,basis='measured_feedback_provisional',ordinary_decrease=True,
                 reason='Fresh measured total requests a strictly lower actual normal cap without subtracting stale EV data; this is provisional feedback curtailment, not overload or physical-response proof.'),
                 meter_feedback_curtailment=True,meter_feedback_budget_amps=permission.normal_budget)
-        if inp.meter_product_data_quiet:
+        if self.episode is None or not self.episode.unresolved:
+            raw_hold=self.raw_excursion_hold(r,inp)
+            if raw_hold is not None: return raw_hold
+        quiet_minimum_episode=bool(self.episode is not None and self.episode.unresolved
+            and self.minimum_evidence(r,inp) and not self.recovery.required and self.operational_fault is None)
+        if inp.meter_product_data_quiet and not quiet_minimum_episode:
             bound=self.normal_continuation_bound(r,inp)
             if bound is None:
+                if self.minimum_evidence(r,inp) and raw<=self.steady_ceiling(r):
+                    if raw<=s.main_fuse_amps:
+                        return self.decision(r,inp,'meter_normal',cap,command='set_limit',
+                            house=raw,basis='measured_minimum_continuation',normal_retention=True,
+                            reason='Fresh measured normal total retains only the continuously accepted minimum through advisory publication quiet; the old physical proof grants no EV subtraction or increase.')
+                    if r._ensure_automatic_cycle()['used_seconds']>=s.overload_budget_seconds:
+                        return self.supervisor.zero(self,r,inp,C.OVERLOAD_BUDGET)
+                    if not s.overload_enabled or self.recovery.required or self.operational_fault:
+                        return self.supervisor.zero(self,r,inp,C.OVERLOAD_NOT_ADMITTED)
+                    return self.decision(r,inp,'meter_overload',cap,command='set_limit',
+                        house=raw,basis='measured_minimum_continuation',overload=True,
+                        reason='Advisory publication quiet retains only the continuously accepted minimum within fresh measured steady bounds and the preserved cumulative overload budget.')
                 return self.supervisor.zero(self,r,inp,C.ACTUATOR_INVALID,
                     detail='Product data is quiet and the actual finite normal allocation cannot continue under fresh meter supervision.')
             if (cap==self.ordinary_decrease_cap and self.ordinary_decrease_grid is not None
@@ -832,16 +1075,18 @@ class MeterEnvelopePolicy:
         if peak is not None and (peak.interrupted or peak.failure):
             if raw>s.main_fuse_amps: return self.supervisor.zero(self,r,inp,C.PEAK_RESPONSE_TIMEOUT)
             peak=None
-        if (raw>28. and live and not self.recovery.required and peak is None and not (cap==r.startup_current and self.minimum_verified)
+        if (raw>self.steady_ceiling(r) and live and not self.recovery.required and peak is None and not self.minimum_evidence(r,inp)
                 and (self.peak_complete_grid is None or gt>self.peak_complete_grid)):
             ordinary=bool(self.ev_estimate(r,inp) and r._controlled_l1_after(self.l1,self.accepted_l1_floor)
                 and raw-self.l1.current+7<=s.main_fuse_amps-s.buffer_amps)
             if (not s.overload_enabled and not ordinary
                     or r._ensure_automatic_cycle()['used_seconds']>=s.overload_budget_seconds):
                 return self.supervisor.zero(self,r,inp,C.OVERLOAD_NOT_ADMITTED if not s.overload_enabled else C.OVERLOAD_BUDGET)
-            origin=now-(wall-gt)
+            origin=self.raw_excursion.origin if self.raw_excursion is not None else now-(wall-gt)
             peak=self.episode=ElectricalEpisode(self.next_episode_id,inp.control_source_id,origin,
-                origin+min(10.,s.overload_response_seconds),gt,int(max(cap,self.upper)))
+                min(origin+min(10.,s.overload_response_seconds),self.raw_excursion.deadline)
+                    if self.raw_excursion is not None else origin+min(10.,s.overload_response_seconds),
+                self.raw_excursion.first_grid_ts if self.raw_excursion is not None else gt,int(max(cap,self.upper)))
             self.next_episode_id+=1
             self.response_ts=self.response_at=self.confirmation_deadline=None
             self.minimum_dispatch=None;self.minimum_l1_floor=None
@@ -897,18 +1142,20 @@ class MeterEnvelopePolicy:
                     return self.supervisor.zero(self,r,inp,C.PEAK_RESPONSE_TIMEOUT)
                 return self.decision(r,inp,'meter_peak_response',minimum,command='set_limit',
                     response_deadline=peak.deadline,overload=peak.overload_authority and raw>s.main_fuse_amps,
+                    raw_deadline=self.raw_excursion.deadline if self.raw_excursion is not None else None,
                     reason='Measured RAW peak requests the configured minimum inside the original electrical response deadline.')
             if now>=self.confirmation_deadline:
                 return self.supervisor.zero(self,r,inp,C.GRID_CONFIRMATION_TIMEOUT)
             ceiling=self.confirmation_ceiling
             if gt>self.response_ts and raw>ceiling:
-                return self.supervisor.zero(self,r,inp,C.GRID_CEILING)
+                raw_hold=self.raw_excursion_hold(r,inp)
+                return raw_hold if raw_hold is not None else self.supervisor.zero(self,r,inp,C.GRID_CEILING)
             if (genuine and abs(ev-self.confirmation_value)>.1
                     and et>self.confirmation_grid_floor):
                 self.confirmation_grid_floor=et
                 self.confirmation_value=ev
             if gt>self.confirmation_grid_floor and genuine:
-                if ev>raw+1 or raw-ev+minimum>ceiling:
+                if ev>raw+1:
                     return self.supervisor.zero(self,r,inp,C.GRID_CEILING)
                 peak.phase=ControlState.MINIMUM_HOLD
                 self.peak_complete_grid=gt
@@ -929,7 +1176,7 @@ class MeterEnvelopePolicy:
             return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
                 no_write_deadline=r.last_set_limit_ts+r.last_target[3],
                 reason='The same pre-decrease meter packet cannot claim another response or stop; retain only its actual finite lower lease.')
-        if s.main_fuse_amps<raw<=28. and live:
+        if s.main_fuse_amps<raw<=self.steady_ceiling(r) and live:
             if (status=='charging' and self.ev_estimate(r,inp)
                     and r._controlled_l1_after(self.l1,self.accepted_l1_floor)):
                 house=max(0.,raw-ev)
@@ -944,7 +1191,8 @@ class MeterEnvelopePolicy:
             if not s.overload_enabled or self.recovery.required or self.operational_fault:
                 return self.supervisor.zero(self,r,inp,C.OVERLOAD_NOT_ADMITTED)
             if raw>s.main_fuse_amps+s.overload_margin_amps:
-                return self.supervisor.zero(self,r,inp,C.GRID_CEILING)
+                raw_hold=self.raw_excursion_hold(r,inp)
+                return raw_hold if raw_hold is not None else self.supervisor.zero(self,r,inp,C.GRID_CEILING)
             if not live:
                 return self.decision(r,inp,'meter_wait',0,reason='No new session starts from overload headroom.')
             return self.decision(r,inp,'meter_overload',minimum,command='set_limit',overload=True,

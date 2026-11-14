@@ -93,6 +93,8 @@ _SOURCE_METADATA_FIELDS = frozenset({
     "meter_episode_phase", "meter_response_deadline_ts", "meter_grid_deadline_ts",
     "meter_recovery_required", "meter_cycle_id", "meter_cycle_used_seconds",
     "meter_cycle_remaining_seconds", "meter_historical_fault", "meter_incident_count",
+    "meter_raw_excursion_active", "meter_raw_excursion_origin_ts",
+    "meter_raw_excursion_deadline_ts", "meter_raw_excursion_first_grid_ts",
     "controlled_l1_current", "controlled_l1_observed_current", "controlled_l1_used",
     "controlled_l1_received_at_utc", "controlled_l1_source_at_utc",
     "controlled_l1_output_phase", "controlled_l1_mapping_epoch",
@@ -1040,6 +1042,12 @@ class OneFuseLoaderController:
                     or latest.control_source_id != self._dispatch_input.control_source_id or rising_load)
             if rejected:
                 self._cancel_positive_dispatch()
+            elif self.settings.meter_envelope_control and self._dispatch_started:
+                observed = getattr(self.regulator, "_meter_inflight_deadline_observation", None)
+                if observed is not None:
+                    # Source callbacks cannot enter the locked tick while
+                    # SDK waits. Schedule newly observed fixed deadlines now.
+                    self._schedule_overload_deadline(observed)
         if self._restart_bridge.preparing:
             # Preserve the existing cancellation checks above even while the
             # shutdown job waits for an earlier ordinary request to finish.
@@ -2281,6 +2289,10 @@ class OneFuseLoaderController:
                 ("meter_cycle_remaining_seconds", "remaining_seconds"),
                 ("meter_historical_fault", "historical_failure"),
                 ("meter_incident_count", "incident_count"),
+                ("meter_raw_excursion_active", "raw_excursion_active"),
+                ("meter_raw_excursion_origin_ts", "raw_excursion_origin"),
+                ("meter_raw_excursion_deadline_ts", "raw_excursion_deadline"),
+                ("meter_raw_excursion_first_grid_ts", "raw_excursion_first_grid_ts"),
             )})
         return self.compact_state_attributes({
             **self.source_diagnostics,
@@ -2909,6 +2921,19 @@ class OneFuseLoaderController:
             self._handle_source_change(None)
             self.notify()
             return
+        raw_excursion_deadline = getattr(decision, "meter_raw_excursion_deadline_ts", None)
+        if (positive_submission and raw_excursion_deadline is not None
+                and self.hass.loop.time() >= raw_excursion_deadline):
+            # This old proposal has not entered SDK. Let the electrical owner
+            # decide from current RAW without granting a new excursion window.
+            await self._checkpoint_unsent_cleanup(decision)
+            self.last_service_result = "not_sent"
+            self.last_decision = replace(decision, command=None, service=None,
+                should_call_service=False, mode="waiting_for_latest_sources",
+                reason="The fixed RAW excursion deadline passed before dispatch; recalculating from the electrical owner.")
+            self._handle_source_change(None)
+            self.notify()
+            return
         response_deadline = decision.nominal_response_deadline_ts
         if (positive_submission and response_deadline is not None
                 and self.hass.loop.time() >= response_deadline):
@@ -3055,7 +3080,11 @@ class OneFuseLoaderController:
                     or self._dispatch_superseded):
                 return False
             latest = self._read_input()
-            if decision.meter_quiet_normal_retention or decision.meter_feedback_curtailment:
+            if (positive_submission and raw_excursion_deadline is not None
+                    and self.hass.loop.time() >= raw_excursion_deadline):
+                return False
+            if (decision.meter_quiet_normal_retention or decision.meter_feedback_curtailment
+                    or decision.meter_quiet_minimum_retention):
                 if (self._protective_zero_pending or self._delivery.unresolved_correlated_zero
                         or self._budget_error not in {None,"overload_budget_save_pending"}
                         or self._runtime_offline_problem(latest)
@@ -3303,7 +3332,8 @@ class OneFuseLoaderController:
                     if problem or budget_fault:
                         latest = self._critical_runtime_input(latest, budget_fault or problem)
                 if (self._input_revision(latest) != self._input_revision(inp)
-                        or response_deadline is not None or raw_response_deadline is not None):
+                        or response_deadline is not None or raw_response_deadline is not None
+                        or raw_excursion_deadline is not None):
                     self._handle_source_change(None)
         if capture_stop and self.last_stop_context is not None:
             self.last_stop_context.update({
@@ -3414,7 +3444,7 @@ class OneFuseLoaderController:
             # Separate, nonrenewable measurement synchronization; the original
             # high-load response allowance is never extended by this timer.
             delays.append(sync_deadline - self.hass.loop.time() + elapsed)
-        for name in ("raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts", "ordinary_response_deadline_ts", "positive_response_deadline_ts", "readiness_deadline_ts", "normal_continuity_deadline_ts"):
+        for name in ("meter_raw_excursion_deadline_ts", "raw_budget_response_deadline_ts", "source_processing_deadline_ts", "grid_confirmation_deadline_ts", "ordinary_response_deadline_ts", "positive_response_deadline_ts", "readiness_deadline_ts", "normal_continuity_deadline_ts"):
             deadline = getattr(decision, name, None)
             if decision.current_p1 > 0 and deadline is not None:
                 # Fixed source/response clocks survive event churn and every
@@ -3443,12 +3473,38 @@ class OneFuseLoaderController:
         # expiry with another 50 ms on every update.
         minimum_delay = 0.0 if (
             getattr(decision, "grid_confirmation_deadline_ts", None) is not None
+            or getattr(decision, "meter_raw_excursion_deadline_ts", None) is not None
             or getattr(decision, "ordinary_response_deadline_ts", None) is not None
             or getattr(decision, "normal_continuity_deadline_ts", None) is not None) else 0.05
         self._unsub_deadline = async_call_later(self.hass, max(minimum_delay, min(delays) - elapsed), deadline_tick)
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    return True
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Align the existing selected meter profile once through HA's own API.
+
+    Minor-version migration runs before controller construction. It tightens
+    the former 29 A profile to 28 A without cancelling a running SDK request,
+    rewriting private storage or clearing exposure and operational history.
+    Later explicit option changes are preserved by the new entry revision.
+    """
+    if entry.version != 1:
+        return False
+    if entry.minor_version >= 2:
+        return True
+    options = dict(entry.options or {})
+    settings = _settings_from_entry(entry)
+    if (settings.meter_envelope_control and settings.main_fuse_amps == 25
+            and settings.buffer_amps == 2 and settings.overload_margin_amps > 3):
+        options["overload_margin_amps"] = 3.0
+    validated = validate_options(options)
+    hass.config_entries.async_update_entry(entry, options=options, minor_version=2)
+    _LOGGER.info("1FuseLoader B49 configuration revision 1.2: meter control=%s, steady ceiling=%.1f A",
+        validated["meter_envelope_control"],
+        validated["main_fuse_amps"] + validated["overload_margin_amps"])
     return True
 
 
