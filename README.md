@@ -50,6 +50,41 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Real HA shutdown and quiet-data reductions (b50)
+
+The finite restart bridge accepts Home Assistant's actual read-only
+configuration mapping without changing that configuration. Every early
+shutdown outcome now quiesces the controller before native/MQTT teardown;
+disabled or refused handoff no longer leaves ordinary callbacks running.
+Repeated stop callers share one cleanup transaction, and cancellation of
+one caller does not reopen command admission or close the adapter twice.
+
+Preparation pins the first genuine post-command minimum response. A later
+independent grid sample confirms that fixed receipt rather than chasing
+each newer EV packet. New contradictory mapped current, including adverse
+partial data, still withdraws the proof. Phase-specific diagnostics distinguish
+lock, binding, Store, SDK, physical-response and grid waits. The existing
+preparation has one fixed 16-second budget inside an 18-second driver and
+HA's 20-second early shutdown stage. The at most 7 A / five-minute remote
+permission remains bounded; unknown physical response is never replaced
+by an accepted API call. This healthy-normal shutdown preparation does not
+extend the separate ten-second high-load response or RAW peak deadline.
+
+With healthy critical grid and transport sources, quiet product data may
+request only a protective withdrawal from a known live higher offer to 7 A.
+It keeps the first measured RAW excursion and vehicle-response deadlines.
+Only genuine later mapped current can resolve physical reduction. Quiet
+context grants no EV subtraction, higher offer, new timer or overload budget.
+The real adapter requires an actual-dispatch callback to revalidate the
+original authority. Feedback decreases use the configured steady ceiling
+consistently; the selected 25 + 3 A profile stays at 28 A.
+
+An installation restart executes the outgoing version's shutdown code.
+Installing this fix therefore cannot repair an already running old bridge
+before that restart. Even after activation, a successful finite handoff needs
+available source/SDK feedback within HA's early shutdown window. Crashes,
+expired authority and critical faults retain their protective behavior.
+
 ### Fixed measured RAW excursions (b49)
 
 The selected meter-led profile gives the measured grid excursion its own

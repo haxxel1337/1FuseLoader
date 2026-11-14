@@ -835,8 +835,10 @@ class EaseeCommandAdapter:
 
         Bootstrap mode is explicit native context, never a default or current
         sample. After adoption/gap/switch an independently new183 is required.
+        Healthy transport may expose unchanged mapping context while product
+        data is quiet. Its old receipt receives no freshness or control credit.
         """
-        problem = self.telemetry_block_reason
+        problem = self.transport_block_reason
         if problem:
             return None
         identity = self._snapshot_source_identity()
@@ -1323,6 +1325,7 @@ class EaseeCommandAdapter:
         previous = getattr(decision, 'committed_current_p1', None)
         raw = getattr(decision, 'grid_l1', None)
         budget = getattr(decision, 'meter_feedback_budget_amps', None)
+        ceiling = getattr(decision, 'meter_feedback_ceiling_amps', None)
         return bool(getattr(decision, 'meter_envelope', False) is True
             and decision.command == 'set_limit'
             and decision.mode == 'meter_normal_decrease'
@@ -1330,9 +1333,40 @@ class EaseeCommandAdapter:
             and type(cap) is int and type(previous) is int and 7 <= cap < previous <= 16
             and decision.current_p2 == decision.current_p3 == 0
             and getattr(decision, 'meter_overload_authority', False) is False
-            and all(type(v) in (int, float) and isfinite(v) for v in (raw, budget))
-            and 0 < budget <= 23 and budget < raw <= 28
+            and all(type(v) in (int, float) and isfinite(v) for v in (raw, budget, ceiling))
+            and 25 < ceiling <= 29
+            and 0 < budget <= 23 and budget < raw <= ceiling
             and cap <= max(7, previous - ceil(raw - budget)))
+
+    @staticmethod
+    def _quiet_peak_permit(decision: Any) -> bool:
+        """Shape of an actual-source revalidated withdrawal to exactly7 A."""
+        if getattr(decision, 'meter_quiet_peak_reduction', False) is not True:
+            return False
+        raw=getattr(decision,'grid_l1',None)
+        ceiling=getattr(decision,'meter_peak_reduction_ceiling_amps',None)
+        origin=getattr(decision,'meter_peak_reduction_lease_origin_ts',None)
+        previous=getattr(decision,'committed_current_p1',None)
+        if not (getattr(decision,'meter_envelope',False) is True
+                and decision.command=='set_limit' and decision.ttl_seconds==60
+                and decision.current_p1==7 and type(decision.current_p1) is int
+                and decision.current_p2==decision.current_p3==0
+                and type(previous) is int and 7<=previous<=16
+                and all(type(v) in (int,float) and isfinite(v) for v in (raw,ceiling,origin))
+                and 25<ceiling<=29 and 0<=raw<=38):
+            return False
+        if decision.mode=='meter_normal':
+            return bool(previous==7 and raw<=25 and decision.meter_overload_authority is False)
+        deadline=getattr(decision,'nominal_response_deadline_ts',None)
+        if (decision.mode!='meter_peak_response'
+                or type(deadline) not in (int,float) or not isfinite(deadline)
+                or _monotonic()>=deadline):
+            return False
+        if raw>25:
+            remaining=getattr(decision,'overload_remaining_seconds',None)
+            return bool(decision.meter_overload_authority is True
+                and type(remaining) in (int,float) and isfinite(remaining) and remaining>=90)
+        return decision.meter_overload_authority is False
 
     def _controlled_health_result(self, problem: str) -> str:
         # An observed transport/online gap cannot preserve a phase-to-current
@@ -1358,7 +1392,11 @@ class EaseeCommandAdapter:
         command = decision.command
         feedback_permit = self._feedback_decrease_permit(decision)
         minimum_permit = self._quiet_minimum_permit(decision)
-        quiet_permit=self._quiet_normal_permit(decision) or feedback_permit or minimum_permit
+        peak_permit = self._quiet_peak_permit(decision)
+        quiet_permit=self._quiet_normal_permit(decision) or feedback_permit or minimum_permit or peak_permit
+        if getattr(decision, 'meter_quiet_peak_reduction', False) and (
+                not peak_permit or not callable(on_dispatch)):
+            raise CommandNotSent('quiet_peak_dispatch_proof_required')
         if getattr(decision, "meter_quiet_minimum_retention", False) and (
                 not minimum_permit or not callable(on_dispatch)):
             raise CommandNotSent("quiet_minimum_dispatch_proof_required")

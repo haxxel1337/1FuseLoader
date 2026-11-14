@@ -11,6 +11,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 from math import isfinite
 import re
 from uuid import uuid4
@@ -26,6 +27,7 @@ REQUEST_TIMEOUT_SECONDS = 6
 FIRST_GRID_WAIT = "L1 MQTT source is waiting for a fresh non-retained sample."
 _STATES = {"prepared", "acknowledged", "claimed", "completed", "aborted"}
 _ALLOWED = {"charging", "awaiting_start", "ready_to_charge", "start_charging", "awaiting_load_balancing"}
+_LOGGER = logging.getLogger(__name__)
 
 
 class _BridgeGate:
@@ -84,6 +86,14 @@ class GracefulRestartBridge:
         self._bridge_dispatch = None
         self._phase = "disabled"
         self._error = None
+        self._prepare_stage = None
+        self._failed_stage = None
+        self._error_type = None
+        self._prepare_started_mono = None
+        self._prepare_deadline_wall = None
+        self._prepare_finished_mono = None
+        self._physical_response_wall = None
+        self._grid_response_wall = None
 
     @property
     def preparing(self):
@@ -118,7 +128,9 @@ class GracefulRestartBridge:
             raise BridgeRefused("bridge_binding_unverified")
         selection = self.c._electrical_selection()
         source = getattr(self.c, "_l1_source_config", None)
-        payload = dict(entry=self.c.entry.entry_id, data=self.c.entry.data,
+        # Real ConfigEntry.data is a read-only mappingproxy, not a JSON dict.
+        # Copy only for canonical serialization; never mutate the HA entry.
+        payload = dict(entry=self.c.entry.entry_id, data=dict(self.c.entry.data),
             settings=asdict(self.c.settings), circuit=getattr(circuit, "id", None),
             configured=configured, selection=selection,
             mqtt=asdict(source) if source is not None else None)
@@ -369,6 +381,8 @@ class GracefulRestartBridge:
             grid_l1=_number(inp.grid_l1), charger_current=_number(inp.charger_current) or 0.,
             paused_by_us=False, should_call_service=bool(command), dry_run=False,
             meter_envelope=True, meter_state=mode, meter_overload_authority=False,
+            meter_quiet_peak_reduction=False, meter_peak_reduction_ceiling_amps=None,
+            meter_peak_reduction_lease_origin_ts=None,
             normal_continuity_deadline_ts=self._expires_mono)
 
     def _withdraw(self, reason):
@@ -502,6 +516,19 @@ class GracefulRestartBridge:
         # Arming still requires a genuinely new physical reduction afterward.
         return bool(r._controlled_l1_boundary(inp) is not None)
 
+    def _minimum_response_problem(self, inp, floor):
+        """New adverse observations can withdraw proof without earning credit."""
+        r = self.c.regulator
+        boundary = r._controlled_l1_boundary(inp)
+        if boundary is None or boundary["key"] != floor["key"]:
+            return "bridge_minimum_binding_changed"
+        e = inp.controlled_l1
+        if r._controlled_l1_after(e, floor):
+            current = _number(e.current)
+            if current is not None and not 0 < current <= 7.5:
+                return "bridge_minimum_response_lost"
+        return None
+
     async def _send(self, cap, ttl, *, protective=False, timeout=REQUEST_TIMEOUT_SECONDS):
         c = self.c
         inp = c._read_input()
@@ -586,13 +613,26 @@ class GracefulRestartBridge:
         self._prepare_binding = None
         self._prepare_generation = None
         self._phase = "preparing"
+        self._prepare_stage = "clock"
+        self._failed_stage = self._error_type = None
+        self._prepare_started_mono = self._prepare_deadline_wall = None
+        self._prepare_finished_mono = None
+        self._physical_response_wall = self._grid_response_wall = None
         possible = False
         try:
-            async with asyncio.timeout(PREPARE_TIMEOUT_SECONDS - 2):
+            wall, mono = self._clocks()
+            self._prepare_started_mono = mono
+            self._prepare_deadline_wall = wall + PREPARE_TIMEOUT_SECONDS
+            self._prepare_stage = "wait_lock"
+            # One fixed 16s preparation budget, then up to 2s controller
+            # cleanup inside the driver's 18s / Core's 20s early stage.
+            async with asyncio.timeout(PREPARE_TIMEOUT_SECONDS):
                 async with self.c._lock:
+                    self._prepare_stage = "qualify"
                     inp = self.c._read_input()
                     if not self._producer_eligible(inp):
                         raise BridgeRefused("bridge_normal_qualification_required")
+                    self._prepare_stage = "bind_source"
                     self._prepare_binding = self._binding()
                     self._prepare_generation = self.c._generation
                     wall, mono = self._clocks(inp)
@@ -603,10 +643,13 @@ class GracefulRestartBridge:
                         possible_until_wall=wall+316, physical_response_wall=None,
                         grid_response_wall=None, claimed_wall=None, ended_wall=None,
                         unobserved_seconds=0., revision=uuid4().hex)
+                    self._prepare_stage = "save_prepared"
                     await self._save(marker)
+                    self._prepare_stage = "dispatch_minimum"
                     boundary = await self._send(7, 300)
                     possible = True
-                    physical = grid = None
+                    physical = grid = physical_floor = None
+                    self._prepare_stage = "wait_physical"
                     while not self._abort:
                         latest = self.c._read_input()
                         if self._source_problem(latest):
@@ -614,28 +657,58 @@ class GracefulRestartBridge:
                         e = self.c.regulator._controlled_l1_projection(latest)
                         if (e is not None and 0 < e.current <= 7.5
                                 and self.c.regulator._controlled_l1_after(e, boundary["floor"])):
-                            physical = e.received_at_ts
+                            # Pin the first real post-dispatch response. A
+                            # faster EV publisher must not keep moving the
+                            # independent grid-confirmation target forward.
+                            if physical is None:
+                                physical = e.received_at_ts
+                                physical_floor = {**self.c.regulator._controlled_l1_boundary(latest),
+                                    "wall": physical}
+                                self._physical_response_wall = physical
+                                self._prepare_stage = "wait_grid"
+                        elif (physical is not None and e is not None
+                                and self.c.regulator._controlled_l1_after(e, boundary["floor"])
+                                and e.received_at_ts >= physical):
+                            raise BridgeRefused("bridge_minimum_response_lost")
+                        if physical is not None:
+                            problem = self._minimum_response_problem(latest, physical_floor)
+                            if problem:
+                                raise BridgeRefused(problem)
                             gt = _number(latest.grid_report_ts)
                             if gt is not None and gt > physical:
                                 grid = gt
+                                self._grid_response_wall = grid
                                 break
                         await asyncio.sleep(.05)
                     if self._abort or physical is None or grid is None:
                         raise BridgeRefused("bridge_physical_response_unverified")
+                    self._prepare_stage = "save_acknowledged"
                     self._marker = await self._save({**self._marker, "state": "acknowledged",
                         "dispatch_wall": boundary["wall"], "expires_wall": boundary["wall"]+300,
                         "physical_response_wall": physical, "grid_response_wall": grid})
-                    if self._abort or self._source_problem(self.c._read_input()):
+                    self._prepare_stage = "final_check"
+                    latest = self.c._read_input()
+                    problem = self._minimum_response_problem(latest, physical_floor)
+                    if problem:
+                        raise BridgeRefused(problem)
+                    if self._abort or self._source_problem(latest):
                         raise BridgeRefused("bridge_final_source_check_failed")
                     self._armed = True
                     self._phase = "armed"
+                    self._prepare_stage = "armed"
                     return True
         except BaseException as err:
             self._abort = True
             self._grant_guard["valid"] = False
             self._armed = False
             self._phase = "refused"
-            self._error = str(err) if isinstance(err, BridgeRefused) else "bridge_prepare_timeout_or_failure"
+            self._failed_stage = self._prepare_stage
+            self._error_type = type(err).__name__
+            self._error = (str(err) if isinstance(err, BridgeRefused)
+                else f"bridge_prepare_timeout_{self._failed_stage}" if isinstance(err, TimeoutError)
+                else f"bridge_prepare_error_{self._failed_stage}")
+            _LOGGER.warning("1FuseLoader restart bridge refused at %s (%s)",
+                self._failed_stage, self._error_type)
             possible = possible or self._bridge_dispatch is not None
             if self._marker is not None and self._marker["state"] in {"prepared", "acknowledged"}:
                 wall, _ = self._clocks()
@@ -695,6 +768,7 @@ class GracefulRestartBridge:
                     pass
             return False
         finally:
+            self._prepare_finished_mono = _number(self.c.hass.loop.time())
             self._preparing = False
             self._prepare_binding = None
             self._prepare_generation = None
@@ -730,4 +804,13 @@ class GracefulRestartBridge:
             restart_bridge_expires_at_utc=_iso(expiry),
             restart_bridge_remaining_seconds=max(0., expiry-wall) if expiry is not None and wall is not None else 0.,
             restart_bridge_last_error=self._error, restart_bridge_preparing=self._preparing,
+            restart_bridge_prepare_phase=self._prepare_stage,
+            restart_bridge_failed_phase=self._failed_stage,
+            restart_bridge_error_type=self._error_type,
+            restart_bridge_prepare_deadline_utc=_iso(self._prepare_deadline_wall),
+            restart_bridge_prepare_elapsed_seconds=(max(0.,
+                (self._prepare_finished_mono if self._prepare_finished_mono is not None else mono)
+                - self._prepare_started_mono) if self._prepare_started_mono is not None and mono is not None else 0.),
+            restart_bridge_physical_response_at_utc=_iso(self._physical_response_wall),
+            restart_bridge_grid_response_at_utc=_iso(self._grid_response_wall),
             restart_bridge_unobserved_seconds=self._marker.get("unobserved_seconds", 0.) if self._marker else 0.)

@@ -425,6 +425,37 @@ class MeterEnvelopePolicy:
             and number(record['now'])+(number(record.get('ttl')) or 60.)>now
             for record in r._dispatch_records.values())
 
+    def quiet_peak_permission(self,r,inp):
+        """Withdraw known higher authority without borrowing quiet EV data.
+
+        The stale conductor value supplies only its verified mapping context.
+        A physical minimum still requires a genuinely later receipt under the
+        real SDK boundary and original electrical deadline.
+        """
+        now,raw,gt=map(number,(inp.now_ts,inp.grid_l1,inp.grid_report_ts))
+        floor=self.accepted_l1_floor;peak=self.episode
+        if (not inp.meter_product_data_quiet or not r.settings.overload_enabled
+                or self.critical_error(r,inp) is not None or self.recovery.required or self.operational_fault
+                or not self.lease.live(now) or self.lease.source_id!=inp.control_source_id
+                or not self.minimum_session_eligible(inp) or floor is None
+                or not r._controlled_l1_context(inp)
+                or r._controlled_l1_key(inp.controlled_l1)!=floor['key']
+                or not 0<=raw<=min(38.,r.settings.overload_transition_limit_amps)
+                or raw>r.settings.main_fuse_amps
+                    and r._ensure_automatic_cycle()['used_seconds']>=r.settings.overload_budget_seconds):
+            return False
+        if self.lease.cap>r.startup_current:
+            return bool(raw>self.steady_ceiling(r) and self.raw_excursion is not None
+                or peak is not None and peak.unresolved and not peak.interrupted and not peak.failure)
+        if (self.lease.cap!=r.startup_current or peak is None or not peak.unresolved
+                or peak.interrupted or peak.failure or self.minimum_dispatch is None
+                or self.minimum_l1_floor is None or self.minimum_l1_floor['key']!=floor['key']):
+            return False
+        # This admits evaluation by the existing electrical owner, including
+        # its typed expiry. A positive SDK permit below is stricter and never
+        # survives that owner's original deadline while RAW remains high.
+        return True
+
     def observe_minimum_certificate(self,r,inp):
         now=number(inp.now_ts);e=self.l1;floor=self.accepted_l1_floor
         if (not self.lease.live(now) or self.lease.cap!=r.startup_current or floor is None
@@ -823,6 +854,11 @@ class MeterEnvelopePolicy:
             and raw<=min(38.,s.overload_transition_limit_amps)
             and (raw<=self.steady_ceiling(r)
                 or raw_deadline is not None and now<raw_deadline))
+        quiet_peak=bool(cause is None and command=='set_limit' and cap==r.startup_current
+            and self.quiet_peak_permission(r,inp)
+            and (mode=='meter_peak_response' and response_deadline is not None and now<response_deadline
+                or mode=='meter_normal' and self.lease.cap==r.startup_current
+                    and raw<=s.main_fuse_amps))
         r._plan_sequence += 1
         should = bool(s.active_control is True and s.dry_run is False and command)
         if command == 'set_limit':
@@ -857,6 +893,9 @@ class MeterEnvelopePolicy:
             meter_raw_excursion_deadline_ts=raw_deadline,
             meter_quiet_minimum_retention=quiet_minimum,
             meter_minimum_continuation_ceiling=self.steady_ceiling(r) if quiet_minimum else None,
+            meter_quiet_peak_reduction=quiet_peak,
+            meter_peak_reduction_ceiling_amps=self.steady_ceiling(r) if quiet_peak else None,
+            meter_peak_reduction_lease_origin_ts=self.lease.origin if quiet_peak else None,
             meter_envelope=True, meter_zero_cause=cause.value if cause else None,
             meter_state=mode, meter_control_state=self.state.value,
             meter_episode_id=self.episode.episode_id if self.episode else None,
@@ -957,8 +996,10 @@ class MeterEnvelopePolicy:
             command=None,service=None,should_call_service=False,current_p1=cap,current_p2=0,current_p3=0,
             meter_envelope=True,meter_zero_cause=None,meter_state='meter_normal_hold',
             meter_normal_retention=True,meter_overload_authority=False,
-            meter_feedback_curtailment=False,meter_feedback_budget_amps=None,
+            meter_feedback_curtailment=False,meter_feedback_budget_amps=None,meter_feedback_ceiling_amps=None,
             meter_quiet_minimum_retention=False,meter_minimum_continuation_ceiling=None,
+            meter_quiet_peak_reduction=False,meter_peak_reduction_ceiling_amps=None,
+            meter_peak_reduction_lease_origin_ts=None,
             meter_episode_retention=episode_hold,
             normal_continuity_deadline_ts=r.last_set_limit_ts+r.last_target[3],
             nominal_response_deadline_ts=e.deadline if episode_hold and reducing else None,
@@ -1010,13 +1051,15 @@ class MeterEnvelopePolicy:
             return replace(self.decision(r,inp,'meter_normal_decrease',permission.cap,
                 command='set_limit',house=raw,basis='measured_feedback_provisional',ordinary_decrease=True,
                 reason='Fresh measured total requests a strictly lower actual normal cap without subtracting stale EV data; this is provisional feedback curtailment, not overload or physical-response proof.'),
-                meter_feedback_curtailment=True,meter_feedback_budget_amps=permission.normal_budget)
+                meter_feedback_curtailment=True,meter_feedback_budget_amps=permission.normal_budget,
+                meter_feedback_ceiling_amps=self.steady_ceiling(r))
         if self.episode is None or not self.episode.unresolved:
             raw_hold=self.raw_excursion_hold(r,inp)
             if raw_hold is not None: return raw_hold
         quiet_minimum_episode=bool(self.episode is not None and self.episode.unresolved
             and self.minimum_evidence(r,inp) and not self.recovery.required and self.operational_fault is None)
-        if inp.meter_product_data_quiet and not quiet_minimum_episode:
+        if (inp.meter_product_data_quiet and not quiet_minimum_episode
+                and not self.quiet_peak_permission(r,inp)):
             bound=self.normal_continuation_bound(r,inp)
             if bound is None:
                 if self.minimum_evidence(r,inp) and raw<=self.steady_ceiling(r):
