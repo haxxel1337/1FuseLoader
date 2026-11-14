@@ -236,11 +236,20 @@ class B44QuietSafetyTests(unittest.IsolatedAsyncioTestCase):
         original=p.controller.regulator.meter_control_diagnostics()
         p.sdk_calls.clear()
         d=await self.tick(312.,3.)
-        self.assertIsNotNone(d.meter_zero_cause,d)
-        self.assert_no_positive()
+        # Independently normal RAW can retain the actual7 without resolving
+        # the original peak or claiming a physical response from quiet EV.
+        self.assertIsNone(d.meter_zero_cause,d)
+        self.assertEqual(d.current_p1,7)
+        self.assertFalse(p.sdk_calls)
+        engine=p.controller.regulator._get_meter_envelope_policy()
+        self.assertIsNone(engine.response_ts)
+        self.assertIsNone(engine.minimum_certificate)
         retained=p.controller.regulator.meter_control_diagnostics()
         self.assertEqual(retained['episode_id'],original['episode_id'])
         self.assertEqual(retained['response_deadline'],original['response_deadline'])
+        d=await self.tick(original['response_deadline']+1.,27.5)
+        self.assertEqual(d.meter_zero_cause,'peak_response_timeout')
+        self.assert_no_positive()
 
     async def test_quiet_product_cannot_override_manual_pause_or_schedule(self):
         for status in ('paused','awaiting_scheduled_start','awaiting_authorization'):
