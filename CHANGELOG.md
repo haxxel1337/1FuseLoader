@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0b51
+
+- Prepare the orderly restart handoff after a recent ordinary decrease when
+  earlier requests are acknowledged normal limits for the same source. Track
+  those requests until their original expiry. If an earlier higher limit is
+  still possible, require a fresh native 7/0/0 A circuit readback, a physical
+  minimum response, and a later independent meter report before arming.
+- Recheck the bridge's qualification where the adapter submits the request.
+  An actual decrease to 7 A can use the existing protective admission slots.
+  Expose the specific reason when qualification or preparation is refused.
+- Keep a confirmed zero offer in recovery when only advisory Easee product
+  updates are quiet. Preserve the observed grid stability and wait for valid
+  product data before considering a positive offer.
+- Exercise the shutdown and recovery paths against real Home Assistant Core
+  and the Easee adapter, with HA 2026.11.2 added to the compatibility matrix.
+
 ## 0.4.0b50
 
 - Serialize real Home Assistant ConfigEntry data through a plain mapping copy

@@ -199,6 +199,9 @@ class RegulatorInput:
     meter_ev_health: Optional[SourceHealth] = None
     meter_product_data_quiet: bool = False
     controlled_l1: Optional[ControlledL1Evidence] = None
+    # Own accepted zero plus matching native circuit readback on the same
+    # receiver. For no-write recovery only. This is never physical EV proof.
+    meter_zero_limit_confirmed: bool = False
 
 
 @dataclass(frozen=True, slots=True)

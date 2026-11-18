@@ -1060,6 +1060,16 @@ class MeterEnvelopePolicy:
             and self.minimum_evidence(r,inp) and not self.recovery.required and self.operational_fault is None)
         if (inp.meter_product_data_quiet and not quiet_minimum_episode
                 and not self.quiet_peak_permission(r,inp)):
+            if (self.recovery.required and cap == 0 and not uncertain_positive
+                    and inp.meter_zero_limit_confirmed is True and not r._dispatch_records
+                    and self.lease.zero_dispatch is not None and self.lease.origin is not None
+                    and self.lease.origin >= self.lease.zero_dispatch
+                    and 0 <= wall - gt <= min(15., s.max_sensor_age_seconds)):
+                # Keep the existing recovery interval and electrical checks.
+                # Product silence alone neither renews zero nor opens a new
+                # allocation once the last own zero is read back.
+                return self.decision(r,inp,'meter_recovery_wait',0,
+                    reason='Waiting for fresh charger data with a confirmed zero limit. Normal meter recovery continues without another command.')
             bound=self.normal_continuation_bound(r,inp)
             if bound is None:
                 if self.minimum_evidence(r,inp) and raw<=self.steady_ceiling(r):

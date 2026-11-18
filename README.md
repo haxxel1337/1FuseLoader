@@ -137,6 +137,13 @@ grid report, before the handoff can arm. HTTP acceptance alone is insufficient.
 The finite grant is recorded through verified checkpoints with a fixed expiry
 and a one-use identity before MQTT and the native connection shut down.
 
+Since b51, a prior acknowledged ordinary offer on the same source can remain
+within its original lifetime when shutdown begins after a decrease. If that
+prior offer is higher than the current one, arming also requires a new native
+7/0/0 A readback after submission. Unknown delivery, an in-flight request or
+an unverified source still prevents preparation. The bridge reports why it
+refused and which stage it reached.
+
 The next runtime can retain only that verified grant while first reports and
 ordinary restart qualification arrive. This is a no-write hold: no repeated
 boot, old measurement, delayed ACK or timer can supply another five minutes.

@@ -2067,6 +2067,8 @@ class OneFuseLoaderController:
             meter_ev_health=ev_health,
             meter_product_data_quiet=product_data_quiet,
             controlled_l1=controlled_l1,
+            meter_zero_limit_confirmed=(self.settings.meter_envelope_control
+                and product_data_quiet and self._quiet_zero_limit_confirmed(source_id)),
         )
 
     def _configured_control_identity(self) -> str | None:
@@ -2142,6 +2144,29 @@ class OneFuseLoaderController:
                     ev_current=current_evidence,
                     healthy=healthy, offline_zero=bool(getattr(self._adapter, "offline_limits_verified_zero", False)),
                     max_age=self.settings.max_sensor_age_seconds)
+
+    def _quiet_zero_limit_confirmed(self, source_id: str | None) -> bool:
+        """Check the last own zero against an unchanged native limit receipt.
+
+        Silence can leave that receipt older than the telemetry window. It is
+        used only to wait without a new write, never as current feedback or
+        to release the positive command barrier.
+        """
+        record = self._delivery.latest
+        if (record is None or record.command != "set_limit" or record.phases != (0, 0, 0)
+                or record.superseded or record.http_status is None
+                or record.state not in {"http_accepted_unverified", "vendor_accepted_unverified"}
+                or record.vendor_accepted is False or self._delivery.unresolved_correlated_zero
+                or self._protective_zero_pending or source_id is None or source_id != self._delivery_binding
+                or self._control_identity is None
+                or self._control_identity != getattr(self._adapter, "control_identity", None)
+                or not getattr(self._adapter, "offline_limits_verified_zero", False)
+                or getattr(self._adapter, "reported_limits", None) != (0., 0., 0.)):
+            return False
+        receipts = getattr(self._adapter, "reported_limit_receipts", ())
+        receipt = receipts[0] if isinstance(receipts, tuple) and len(receipts) == 3 else None
+        return (type(receipt) in (int, float) and isfinite(receipt)
+                and record.started <= receipt <= self.hass.loop.time())
 
     def _zero_ordering_confirmed(self, inp: RegulatorInput) -> bool:
         """Separate expired prior authority from a measured physical OFF."""

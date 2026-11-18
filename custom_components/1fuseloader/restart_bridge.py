@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -38,6 +38,16 @@ class _BridgeGate:
 
 def _number(value):
     return float(value) if type(value) in (int, float) and isfinite(value) else None
+
+
+def _grid_number(value):
+    """HA entity states are text. The MQTT source already supplies a number."""
+    if type(value) not in (str, int, float):
+        return None
+    try:
+        return _number(float(value))
+    except (ValueError, OverflowError):
+        return None
 
 
 def _iso(value):
@@ -324,7 +334,8 @@ class GracefulRestartBridge:
             if allow_missing and self._missing_first_sample(inp):
                 return None
             return ElectricalStopCause.GRID_INVALID
-        raw, wall, gt = map(_number, (inp.grid_l1, inp.wall_now_ts, inp.grid_report_ts))
+        raw = _grid_number(inp.grid_l1)
+        wall, gt = map(_number, (inp.wall_now_ts, inp.grid_report_ts))
         if raw is None or wall is None or gt is None or not 0 <= wall-gt <= min(15, self.c.settings.max_sensor_age_seconds) or raw < 0:
             return ElectricalStopCause.GRID_INVALID
         # The consumer retains an already acknowledged 7 A allocation without
@@ -373,12 +384,13 @@ class GracefulRestartBridge:
             and inp.grid_l1 is None and inp.grid_report_ts is None)
 
     def _decision(self, inp, *, mode, cap=7, command=None, ttl=300):
+        raw = _grid_number(inp.grid_l1)
         return RegulatorDecision(mode=mode, reason=(
             "One finite graceful-shutdown allowance; no renewal, new response evidence or overload permission."),
             command=command, service="easee.set_circuit_dynamic_limit" if command else None,
             current_p1=cap, current_p2=0, current_p3=0, ttl_seconds=ttl,
-            available_l1=cap, house_load_l1=max(0., (_number(inp.grid_l1) or 0.)-(_number(inp.charger_current) or 0.)),
-            grid_l1=_number(inp.grid_l1), charger_current=_number(inp.charger_current) or 0.,
+            available_l1=cap, house_load_l1=max(0., (raw or 0.)-(_number(inp.charger_current) or 0.)),
+            grid_l1=raw, charger_current=_number(inp.charger_current) or 0.,
             paused_by_us=False, should_call_service=bool(command), dry_run=False,
             meter_envelope=True, meter_state=mode, meter_overload_authority=False,
             meter_quiet_peak_reduction=False, meter_peak_reduction_ceiling_amps=None,
@@ -496,25 +508,64 @@ class GracefulRestartBridge:
                 self._grant_guard["valid"] = False
                 self._abort_event.set()
 
-    def _producer_eligible(self, inp):
+    def _producer_problem(self, inp):
         c, r = self.c, self.c.regulator
-        if self._source_problem(inp) or inp.status.lower() != "charging" or self._closed:
-            return False
+        source_problem = self._source_problem(inp)
+        if source_problem is not None:
+            return f"bridge_qualification_{source_problem.value}"
+        if self._closed or (inp.status or "").strip().lower() != "charging":
+            return "bridge_qualification_not_charging"
         p = r._get_meter_envelope_policy()
         now = _number(inp.now_ts)
         if (p.state.value != "NORMAL" or p.operational_fault is not None or p.recovery.required
-                or p.episode is not None and p.episode.unresolved or p.cold_unknown_pending
-                or not p.lease.live(now) or not p.lease.normal_admitted or not 7 <= p.lease.cap <= 16
-                or any(cap > p.lease.cap or key not in p.lease.normal_commands
-                       for key, (cap, expiry) in p.possible_positive.items() if expiry > now)
-                or r._dispatch_records or c._dispatch_task is not None
-                or not getattr(c._adapter, "offline_limits_verified_zero", False)
-                or not c._budget_store.state_is_durable(r.export_overload_state())):
-            return False
+                or p.episode is not None and p.episode.unresolved):
+            return "bridge_qualification_not_normal"
+        if r._dispatch_records or c._dispatch_task is not None:
+            return "bridge_qualification_dispatch_pending"
+        if (now is None or not p.lease.live(now) or not p.lease.normal_admitted
+                or not 7 <= p.lease.cap <= 16 or inp.control_source_id is None
+                or p.lease.source_id != inp.control_source_id):
+            return "bridge_qualification_normal_limit_missing"
+        if p.cold_unknown_pending:
+            return "bridge_qualification_previous_authority_unknown"
+        for key, (cap, expiry) in p.possible_positive.items():
+            if expiry <= now:
+                continue
+            # Every unexpired request must be an acknowledged normal offer
+            # from this very source. An older higher offer can still exist
+            # while we attempt a strictly lower handoff. Keep its horizon and
+            # require a new native readback before arming that handoff.
+            prior = p.lease.normal_commands.get(key)
+            if (prior is None or prior["source_id"] != inp.control_source_id
+                    or prior["cap"] != cap or prior["expires"] != expiry
+                    or (cap > p.lease.cap and expiry >= p.lease.expires)):
+                return "bridge_qualification_previous_authority_unknown"
+        if not getattr(c._adapter, "offline_limits_verified_zero", False):
+            return "bridge_qualification_offline_fallback_unverified"
+        if not c._budget_store.state_is_durable(r.export_overload_state()):
+            return "bridge_qualification_checkpoint_unverified"
         # A steady pre-shutdown EV value may be old. It grants no subtraction
         # or response credit here: only its valid mapped boundary is pinned.
         # Arming still requires a genuinely new physical reduction afterward.
-        return bool(r._controlled_l1_boundary(inp) is not None)
+        if r._controlled_l1_boundary(inp) is None:
+            return "bridge_qualification_mapping_unverified"
+        return None
+
+    def _producer_eligible(self, inp):
+        return self._producer_problem(inp) is None
+
+    def _minimum_readback_verified(self, boundary, latest):
+        if not boundary["requires_limit_readback"]:
+            return True
+        adapter = self.c._adapter
+        limits = getattr(adapter, "reported_limits", None)
+        receipts = getattr(adapter, "reported_limit_receipts", None)
+        # P2 and P3 must still report zero. Only P1 changes, so it must
+        # also have a native receipt after this specific request began.
+        receipt = _number(receipts[0]) if isinstance(receipts, tuple) and len(receipts) == 3 else None
+        now = _number(latest.now_ts)
+        return bool(limits == (7, 0, 0) and receipt is not None and now is not None
+                    and boundary["mono"] < receipt <= now)
 
     def _minimum_response_problem(self, inp, floor):
         """New adverse observations can withdraw proof without earning credit."""
@@ -535,15 +586,42 @@ class GracefulRestartBridge:
         decision = self._decision(inp, mode="restart_bridge_shutdown" if cap else "restart_bridge_abort", cap=cap, command="set_limit", ttl=ttl)
         record = attempt = None
         generation = c._generation
+        rejected = None
+        previous = None
+        if not protective:
+            problem = self._producer_problem(inp)
+            if problem is not None:
+                raise BridgeRefused(problem)
+            lease = c.regulator._get_meter_envelope_policy().lease
+            previous = (lease.cap, lease.origin, lease.expires, lease.source_id)
+            if cap == BRIDGE_CAP_AMPS and lease.cap > cap:
+                decision = replace(decision, command_urgency="protective_reduction",
+                                   committed_current_p1=lease.cap)
 
         def dispatch():
-            nonlocal record, attempt
+            nonlocal record, attempt, rejected
             latest = c._read_input()
-            if c._stopped or c._generation != generation or not protective and (self._abort or self._source_problem(latest)):
+            if c._stopped or c._generation != generation:
                 return False
+            requires_limit_readback = False
+            if not protective:
+                if self._abort:
+                    return False
+                rejected = self._producer_problem(latest)
+                if rejected is not None:
+                    return False
+                policy = c.regulator._get_meter_envelope_policy()
+                lease = policy.lease
+                if (lease.cap, lease.origin, lease.expires, lease.source_id) != previous:
+                    rejected = "bridge_qualification_normal_limit_changed"
+                    return False
+                requires_limit_readback = any(
+                    old_cap > lease.cap and expiry > latest.now_ts
+                    for old_cap, expiry in policy.possible_positive.values())
             wall, mono = self._clocks(latest)
             self._last_dispatch = dict(wall=wall, mono=mono,
-                floor=c.regulator._controlled_l1_boundary(latest))
+                floor=c.regulator._controlled_l1_boundary(latest),
+                requires_limit_readback=requires_limit_readback)
             if cap:
                 self._bridge_dispatch = self._last_dispatch
             record = c._delivery.begin("set_limit", (cap, 0, 0), mono)
@@ -571,7 +649,12 @@ class GracefulRestartBridge:
                     raise BridgeRefused("bridge_source_preempted_request")
                 if self._request_task not in done:
                     raise TimeoutError
-                receipt = self._request_task.result()
+                try:
+                    receipt = self._request_task.result()
+                except CommandNotSent:
+                    if rejected is not None:
+                        raise BridgeRefused(rejected) from None
+                    raise
             finally:
                 pending = [task for task in (self._request_task, aborted) if task is not None and not task.done()]
                 for task in pending:
@@ -582,11 +665,14 @@ class GracefulRestartBridge:
             if record is None or type(getattr(receipt, "http_status", None)) is not int or not 200 <= receipt.http_status < 300:
                 raise BridgeRefused("bridge_http_acceptance_missing")
             c._delivery.accepted(record, receipt, c.hass.loop.time())
+            if record.vendor_accepted is False:
+                raise BridgeRefused("bridge_vendor_rejected")
             attempt["result"] = "submitted_unverified"
             c.last_service_result, c.last_service_error = "submitted_unverified", None
         except BaseException:
             if record is not None:
-                c._delivery.failed(record, superseded=self._abort)
+                if record.vendor_accepted is not False:
+                    c._delivery.failed(record, superseded=self._abort)
                 attempt.update(result="error", error="bridge_submission_unverified")
                 c.last_service_result, c.last_service_error = "error", "bridge_submission_unverified"
             raise
@@ -595,7 +681,7 @@ class GracefulRestartBridge:
                 wall, _ = self._clocks()
                 attempt.update(completed_at_utc=_iso(wall), delivery=record.public())
                 c._recent_commands.append({**deepcopy(attempt), "mode": decision.mode,
-                    "reason": decision.reason, "grid_l1": _number(inp.grid_l1),
+                    "reason": decision.reason, "grid_l1": _grid_number(inp.grid_l1),
                     "charger_current": _number(inp.charger_current)})
                 if attempt["result"] == "submitted_unverified":
                     c.last_accepted_command = deepcopy(attempt)
@@ -630,8 +716,9 @@ class GracefulRestartBridge:
                 async with self.c._lock:
                     self._prepare_stage = "qualify"
                     inp = self.c._read_input()
-                    if not self._producer_eligible(inp):
-                        raise BridgeRefused("bridge_normal_qualification_required")
+                    problem = self._producer_problem(inp)
+                    if problem is not None:
+                        raise BridgeRefused(problem)
                     self._prepare_stage = "bind_source"
                     self._prepare_binding = self._binding()
                     self._prepare_generation = self.c._generation
@@ -675,10 +762,13 @@ class GracefulRestartBridge:
                             if problem:
                                 raise BridgeRefused(problem)
                             gt = _number(latest.grid_report_ts)
-                            if gt is not None and gt > physical:
+                            if grid is None and gt is not None and gt > physical:
                                 grid = gt
                                 self._grid_response_wall = grid
-                                break
+                            if grid is not None:
+                                if self._minimum_readback_verified(boundary, latest):
+                                    break
+                                self._prepare_stage = "wait_readback"
                         await asyncio.sleep(.05)
                     if self._abort or physical is None or grid is None:
                         raise BridgeRefused("bridge_physical_response_unverified")
@@ -691,6 +781,8 @@ class GracefulRestartBridge:
                     problem = self._minimum_response_problem(latest, physical_floor)
                     if problem:
                         raise BridgeRefused(problem)
+                    if not self._minimum_readback_verified(boundary, latest):
+                        raise BridgeRefused("bridge_minimum_readback_lost")
                     if self._abort or self._source_problem(latest):
                         raise BridgeRefused("bridge_final_source_check_failed")
                     self._armed = True
@@ -705,10 +797,11 @@ class GracefulRestartBridge:
             self._failed_stage = self._prepare_stage
             self._error_type = type(err).__name__
             self._error = (str(err) if isinstance(err, BridgeRefused)
+                else f"bridge_command_not_sent_{err.code}" if isinstance(err, CommandNotSent)
                 else f"bridge_prepare_timeout_{self._failed_stage}" if isinstance(err, TimeoutError)
                 else f"bridge_prepare_error_{self._failed_stage}")
-            _LOGGER.warning("1FuseLoader restart bridge refused at %s (%s)",
-                self._failed_stage, self._error_type)
+            _LOGGER.warning("1FuseLoader restart bridge refused at %s (%s, %s)",
+                self._failed_stage, self._error, self._error_type)
             possible = possible or self._bridge_dispatch is not None
             if self._marker is not None and self._marker["state"] in {"prepared", "acknowledged"}:
                 wall, _ = self._clocks()
@@ -745,7 +838,8 @@ class GracefulRestartBridge:
                 # high-load interval must survive shutdown as exposure, rather
                 # than becoming fault history beside a false inactive ledger.
                 self.c.regulator.evaluate(latest)
-                raw, wall, gt = map(_number, (latest.grid_l1, latest.wall_now_ts, latest.grid_report_ts))
+                raw = _grid_number(latest.grid_l1)
+                wall, gt = map(_number, (latest.wall_now_ts, latest.grid_report_ts))
                 if (getattr(latest.meter_grid_health, "valid", False) is True
                         and raw is not None and raw > self.c.settings.main_fuse_amps
                         and wall is not None and gt is not None and 0 <= wall-gt <= 15):
