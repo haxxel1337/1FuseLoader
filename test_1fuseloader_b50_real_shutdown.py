@@ -50,6 +50,7 @@ class SyntheticShutdownAdapter:
     overload_block_reason = None
     offline_limits_verified_zero = True
     async_read_current_snapshot = None
+    reported_limits = None
     reported_limit_receipts = (None, None, None)
     control_identity = 'offline-real-core-adapter'
 
@@ -241,6 +242,8 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.current = 7.1
         self.sequence += 1
         self.current_wall = datetime.now(timezone.utc).timestamp()
+        self.adapter.reported_limits = (7., 0., 0.)
+        self.adapter.reported_limit_receipts = (self.hass.loop.time(), None, None)
         # There is a real later meter event. Repeated mode then publishes a
         # new identical-current event just AFTER each meter event, so a reader
         # that keeps moving its physical floor can never catch that meter.
@@ -351,6 +354,26 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(marker)
         self.assertEqual(marker['state'], 'acknowledged')
         self.assertEqual([d.current_p1 for d in self.adapter.calls], [7])
+        self.assertGreater(marker['grid_response_wall'], marker['physical_response_wall'])
+        await self.assert_quiescent(list(self.adapter.calls))
+
+    async def test_actual_core_stop_after_normal_decrease_prepares_verified_bridge(self):
+        regulator = await self.start_healthy()
+        self.raw = 24.5
+        self.grid_wall = datetime.now(timezone.utc).timestamp()
+        await self.controller.async_tick()
+        self.assertEqual([decision.current_p1 for decision in self.adapter.calls], [14])
+        self.assertEqual(regulator.last_target, (14, 0, 0, 60))
+
+        self.raw = 22.5
+        self.grid_wall = datetime.now(timezone.utc).timestamp()
+        await self.core_stop()
+
+        self.assertEqual([(decision.current_p1, decision.ttl_seconds)
+                          for decision in self.adapter.calls], [(14, 60), (7, 300)])
+        marker = await self.marker()
+        self.assertEqual(marker['state'], 'acknowledged')
+        self.assertGreater(marker['physical_response_wall'], marker['dispatch_wall'])
         self.assertGreater(marker['grid_response_wall'], marker['physical_response_wall'])
         await self.assert_quiescent(list(self.adapter.calls))
 
