@@ -230,14 +230,18 @@ class MeterEnvelopePolicyTests(unittest.TestCase):
         _,d=self.sample(r,20.,29.01,7.1,receipt=11.8,sequence=3,accept=False)
         self.assertEqual(d.meter_zero_cause,logic.ElectricalStopCause.GRID_CEILING.value)
 
-    def test_rearm_requires_strict_under23_continuously1800(self):
+    def test_rearm_requires_fifteen_verified_minutes_strictly_under23(self):
         r=self.live()
         cycle=r._automatic_cycle;cycle.update(state='blocked',used_seconds=100.,failure_reason='response_timeout')
-        for at in range(5,1801,5): self.sample(r,float(at),23.,7.,receipt=4.8,sequence=2)
+        for at in range(5,31,5): self.sample(r,float(at),23.,7.,receipt=4.8,sequence=2)
+        self.assertEqual(r.automatic_cycle_diagnostics()['automatic_cooling_seconds'],0.)
+        for at in range(35,516,5): self.sample(r,float(at),22.,7.,receipt=4.8,sequence=2)
+        for at in range(520,701,5): self.sample(r,float(at),23.,7.,receipt=4.8,sequence=2)
+        self.assertEqual(r.automatic_cycle_diagnostics()['automatic_cooling_seconds'],480.)
+        for at in range(705,1121,5): self.sample(r,float(at),22.,7.,receipt=4.8,sequence=2)
+        self.assertEqual(r.automatic_cycle_diagnostics()['automatic_cooling_seconds'],895.)
         self.assertEqual(cycle['used_seconds'],100.)
-        for at in range(1805,3601,5): self.sample(r,float(at),22.,7.,receipt=4.8,sequence=2)
-        self.assertEqual(cycle['used_seconds'],100.)
-        self.sample(r,3605.,22.,7.,receipt=4.8,sequence=2)
+        self.sample(r,1125.,22.,7.,receipt=4.8,sequence=2)
         self.assertEqual(cycle['used_seconds'],0.)
         self.assertIsNone(cycle['failure_reason'])
         self.assertGreaterEqual(r._overload_used_seconds,0.)
