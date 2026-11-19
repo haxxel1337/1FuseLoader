@@ -606,9 +606,13 @@ class GracefulRestartBridge:
             if (lease.cap, lease.origin, lease.expires, lease.source_id) != previous:
                 rejected = "bridge_qualification_normal_limit_changed"
                 return False
+            adapter_identity = c._adapter.control_identity
+            if adapter_identity is None:
+                rejected = "bridge_qualification_actuator_identity_missing"
+                return False
             wall, mono = self._clocks(latest)
             self._bridge_dispatch = dict(wall=wall, mono=mono, managed_proof=managed_proof,
-                source_id=latest.control_source_id, adapter_identity=c._adapter.control_identity)
+                source_id=latest.control_source_id, adapter_identity=adapter_identity)
             record = c._delivery.begin("set_limit", (BRIDGE_CAP_AMPS, 0, 0), mono)
             attempt = dict(started_at_utc=_iso(wall), completed_at_utc=None,
                 command="set_limit", target_p1=BRIDGE_CAP_AMPS, target_p2=0, target_p3=0,

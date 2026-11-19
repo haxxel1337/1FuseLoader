@@ -92,6 +92,7 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.receive_grid(value)
 
     def install_mqtt_bootstrap(self):
+        self.adapter.control_identity = (1, id(self.adapter))
         async def configure_source():
             if self.controller._l1_source is None:
                 source = self.new_mqtt_source()
