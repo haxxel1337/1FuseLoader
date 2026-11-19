@@ -1,8 +1,7 @@
 """Initial ledger load latency without HA, network calls or real storage.
 
 Shortened deadlines preserve the production 10:2 load/write relationship.
-The delayed-load regression crosses the old write deadline before completing;
-only the controller's initial-load deadline may allow it to finish.
+The initial wait deadline never discards an in-progress exact read.
 """
 from __future__ import annotations
 
@@ -22,6 +21,7 @@ class StartupBudgetTests(unittest.IsolatedAsyncioTestCase):
         await fixtures.ControllerTests.asyncSetUp(self)
         self.entry.options["overload_enabled"] = True
         self.fresh_control_reports()
+        self.hass.data = {}
         self.controller = fixtures.runtime.OneFuseLoaderController(
             self.hass, self.entry, self.adapter)
         self.controller._budget_store.clock = lambda: 1030.0
@@ -100,29 +100,31 @@ class StartupBudgetTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(starting, return_exceptions=True)
             await self.controller._budget_store.async_wait_pending()
 
-    async def test_initial_deadline_still_fails_closed_and_late_read_cannot_retry_or_write(self):
+    async def test_initial_deadline_protects_and_late_exact_read_recovers(self):
         original = deepcopy(self.controller._budget_store.store.data)
         entered, release, reader = self.blocked_read()
         starting = asyncio.create_task(self.controller.async_start())
         try:
             await entered.wait()
             await starting  # The scaled initial deadline, not the write one.
-            self.assertTrue(self.controller._budget_loaded)
-            self.assertEqual(self.controller._budget_error, "overload_budget_restore_failed")
-            self.assertEqual(self.controller._budget_error_type, "TimeoutError")
+            self.assertFalse(self.controller._budget_loaded)
+            self.assertEqual(self.controller._budget_error, "overload_budget_restore_pending")
             self.assertTrue(all(d.current_p1 == 0 for d in self.adapter.calls))
-            self.assertGreaterEqual(
-                self.controller.regulator.export_overload_state()["used_seconds"], 1800)
+            self.assertEqual(self.controller.regulator.export_overload_state()["used_seconds"], 0)
+            exact_read = self.controller._budget_restore_task
+            self.assertIsNotNone(exact_read)
             pending = self.controller._budget_store._gate.pending
             self.assertIsNotNone(pending)
             self.assertFalse(pending.cancelled())
             self.assertEqual(self.controller._budget_store.store.data, original)
             release.set()
-            await self.controller._budget_store.async_wait_pending()
+            await exact_read
 
             await self.controller.async_tick()
-            self.assertEqual(self.controller._budget_error, "overload_budget_restore_failed")
-            self.assertTrue(all(d.current_p1 == 0 for d in self.adapter.calls))
+            self.assertTrue(self.controller._budget_loaded)
+            self.assertTrue(self.controller._budget_restored_from_disk)
+            self.assertIsNone(self.controller._budget_error)
+            self.assertEqual(self.controller.regulator.export_overload_state()["used_seconds"], 120)
             self.assertEqual(self.controller._budget_store.store.data, original)
             reader.assert_awaited_once()
         finally:
@@ -235,7 +237,7 @@ class StartupBudgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.controller._budget_store.store.data)
         self.assertTrue(all(d.current_p1 == 0 for d in self.adapter.calls))
 
-    async def test_stop_during_load_cannot_install_listeners_or_submit_late_commands(self):
+    async def test_stop_during_load_removes_passive_listeners_and_detaches_exact_read(self):
         entered, release, _ = self.blocked_read()
         self.adapter.async_initialize = AsyncMock()
         with patch.object(fixtures.runtime, "async_track_time_interval") as timer, \
@@ -244,19 +246,59 @@ class StartupBudgetTests(unittest.IsolatedAsyncioTestCase):
             stopping = None
             try:
                 await entered.wait()
+                exact_read = self.controller._budget_restore_task
+                states.assert_called_once()
+                self.adapter.async_initialize.assert_awaited_once()
                 stopping = asyncio.create_task(self.controller.async_stop())
                 await asyncio.sleep(0)
                 self.assertTrue(self.controller._stopped)
                 release.set()
                 await asyncio.gather(starting, stopping)
                 timer.assert_not_called()
-                states.assert_not_called()
-                self.adapter.async_initialize.assert_not_awaited()
+                self.assertIsNone(self.controller.unsub_states)
+                self.assertIsNone(self.controller._budget_restore_task)
+                self.assertTrue(exact_read.cancelled())
+                self.assertFalse(self.controller._budget_loaded)
                 self.assertEqual(self.adapter.calls, [])
             finally:
                 release.set()
                 await asyncio.gather(starting, *([stopping] if stopping else []), return_exceptions=True)
                 await self.controller._budget_store.async_wait_pending()
+
+    async def test_reloaded_controller_owns_late_ledger_after_previous_reader_detaches(self):
+        previous = self.controller
+        entered, release, original_reader = self.blocked_read()
+        starting = asyncio.create_task(previous.async_start())
+        stopping = reloading = None
+        next_adapter = fixtures.FakeAdapter()
+        next_controller = fixtures.runtime.OneFuseLoaderController(self.hass, self.entry, next_adapter)
+        try:
+            await entered.wait()
+            await starting
+            stopping = asyncio.create_task(previous.async_stop())
+            await asyncio.sleep(0)
+            calls_at_stop = list(self.adapter.calls)
+            self.assertIsNone(previous._budget_restore_task)
+            self.assertIs(previous._budget_store._gate, next_controller._budget_store._gate)
+
+            reloading = asyncio.create_task(next_controller.async_start())
+            await asyncio.sleep(0)
+            self.assertFalse(next_controller._budget_loaded)
+            self.assertEqual(next_adapter.calls, [])
+            release.set()
+            await asyncio.gather(stopping, reloading)
+
+            self.assertTrue(next_controller._budget_restored_from_disk)
+            self.assertEqual(next_controller.regulator.export_overload_state()["used_seconds"], 120)
+            self.assertIsNone(next_controller._budget_error)
+            self.assertFalse(previous._budget_loaded)
+            self.assertEqual(self.adapter.calls, calls_at_stop)
+            original_reader.assert_awaited_once()
+        finally:
+            release.set()
+            await asyncio.gather(*(task for task in (starting, stopping, reloading) if task is not None),
+                                 return_exceptions=True)
+            await next_controller.async_stop()
 
 
 if __name__ == "__main__":

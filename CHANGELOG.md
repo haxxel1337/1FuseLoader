@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0b55
+
+- Keep the startup exposure read and process its verified result when it
+  completes. A pending read prevents exposure writes and ordinary positive
+  commands. A confirmed restore error continues to block control.
+- An authenticated managed restart can retain the existing 7 A allocation
+  while exposure and claim verification are pending. Its original expiry,
+  live protection and verified takeover requirements remain in force.
+
 ## 0.4.0b54
 
 - Reconcile a delayed durable restart claim within the original finite
