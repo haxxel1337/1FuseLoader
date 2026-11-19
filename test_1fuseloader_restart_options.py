@@ -53,16 +53,21 @@ class RestartOptionTests(unittest.TestCase):
         for changed in ({"meter_envelope_control": False},
                         {"nominal_import_only_fallback": False},
                         {"main_fuse_amps": 32},
-                        {"buffer_amps": 1},
+                        {"buffer_amps": 0},
+                        {"buffer_amps": 1.5},
                         {"buffer_amps": 3},
                         {"min_charge_amps": 8},
                         {"max_charge_amps": 6}):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 const.validate_options(profile(**{KEY: True, **changed}))
-        for minimum, maximum in ((6, 7), (7, 7), (6, 16)):
-            options = const.validate_options(profile(**{
-                KEY: True, "min_charge_amps": minimum, "max_charge_amps": maximum}))
-            self.assertTrue(options[KEY])
+        for buffer in (1, 2):
+            for minimum, maximum in ((6, 7), (7, 7), (6, 16)):
+                with self.subTest(buffer=buffer, minimum=minimum, maximum=maximum):
+                    options = const.validate_options(profile(**{
+                        KEY: True, "buffer_amps": buffer,
+                        "min_charge_amps": minimum, "max_charge_amps": maximum}))
+                    self.assertTrue(options[KEY])
+                    self.assertEqual(options["buffer_amps"], buffer)
 
     def test_selection_does_not_activate_control_or_overload_or_change_normal_ttl(self):
         selected = const.validate_options(profile(**{KEY: True}))

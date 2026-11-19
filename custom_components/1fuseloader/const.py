@@ -235,10 +235,14 @@ def validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
         not result[OPT_METER_ENVELOPE_CONTROL]
         or not result[OPT_NOMINAL_IMPORT_ONLY_FALLBACK]
         or result[OPT_MAIN_FUSE_AMPS] != 25
-        or result[OPT_BUFFER_AMPS] != 2
+        or result[OPT_BUFFER_AMPS] not in {1, 2}
         or not result[OPT_MIN_CHARGE_AMPS] <= 7 <= result[OPT_MAX_CHARGE_AMPS]
     ):
-        raise ValueError("Graceful restart bridge requires meter envelope control, verified import-only fallback and the 25 A / 2 A buffer profile with min/max bounds including 7 A; turn the bridge off before disabling its prerequisites")
+        raise ValueError(
+            "Graceful restart bridge requires meter envelope control, verified import-only "
+            "fallback, the 25 A profile with a 1 A or 2 A normal buffer, and current "
+            "bounds including 7 A; turn the bridge off before disabling its prerequisites"
+        )
     if result[OPT_OVERLOAD_ENABLED]:
         if not result[OPT_ENABLE_DYNAMIC_LIMIT]:
             raise ValueError("Experimental overload operation requires dynamic current control")

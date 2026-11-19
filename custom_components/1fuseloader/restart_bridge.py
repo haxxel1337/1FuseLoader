@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -24,6 +24,9 @@ BRIDGE_TTL_SECONDS = 300
 MANAGED_PREFLIGHT_TIMEOUT_SECONDS = 90
 MANAGED_COMMIT_TIMEOUT_SECONDS = 16
 STORE_TIMEOUT_SECONDS = 1.5
+# A consumer may wait for its own durable claim to finish while the previously
+# accepted limit remains unchanged. The original charger expiry still wins.
+BOOT_CLAIM_TIMEOUT_SECONDS = 30
 REQUEST_TIMEOUT_SECONDS = 6
 FIRST_GRID_WAIT = "L1 MQTT source is waiting for a fresh non-retained sample."
 _STATES = {"prepared", "acknowledged", "claimed", "completed", "aborted", "not_sent"}
@@ -35,6 +38,13 @@ class _BridgeGate:
     def __init__(self):
         self.lock = asyncio.Lock()
         self.pending = None
+
+
+@dataclass(frozen=True)
+class _PendingClaim:
+    task: asyncio.Task
+    revision: str
+    deadline: float
 
 
 def _number(value):
@@ -74,6 +84,7 @@ class GracefulRestartBridge:
         self._store = store
         self._read_back = read_back
         self._marker = None
+        self._pending_claim = None
         self._active = False
         self._preparing = False
         self._armed = False
@@ -126,7 +137,7 @@ class GracefulRestartBridge:
         return bool(getattr(s, "graceful_restart_bridge", False) is True
             and s.meter_envelope_control and s.nominal_import_only_fallback
             and s.active_control and not s.dry_run and s.enable_dynamic_limit
-            and s.main_fuse_amps == 25 and s.buffer_amps == 2
+            and s.main_fuse_amps == 25 and s.buffer_amps in (1, 2)
             and s.min_charge_amps <= 7 <= s.max_charge_amps <= 16)
 
     def _clocks(self, inp=None):
@@ -203,12 +214,16 @@ class GracefulRestartBridge:
                 raise BridgeRefused("bridge_abort_not_verified")
         return snapshot
 
-    async def _save_locked(self, snapshot):
+    async def _start_save_locked(self, snapshot):
         await self._wait_pending()
         create = getattr(self.c.hass, "async_create_task", asyncio.create_task)
         grant_guard = self._grant_guard
         task = create(self._write_verified(snapshot, grant_guard))
         self._gate.pending = task
+        return task, grant_guard
+
+    async def _save_locked(self, snapshot):
+        task, grant_guard = await self._start_save_locked(snapshot)
         try:
             return await asyncio.wait_for(asyncio.shield(task), STORE_TIMEOUT_SECONDS)
         except BaseException:
@@ -217,7 +232,7 @@ class GracefulRestartBridge:
                 grant_guard["valid"] = False
             raise
 
-    async def _save(self, marker, *, expected_nonce=None):
+    async def _save(self, marker, *, expected_nonce=None, expected_revisions=None):
         self._ensure_store()
         snapshot = deepcopy(marker)
         snapshot["revision"] = uuid4().hex
@@ -227,6 +242,7 @@ class GracefulRestartBridge:
                 current = await self._read_raw()
                 expected = expected_nonce or snapshot["nonce"]
                 if (type(current) is not dict or current.get("nonce") != expected
+                        or expected_revisions is not None and current.get("revision") not in expected_revisions
                         or snapshot["state"] == "acknowledged" and current.get("state") != "prepared"
                         or snapshot["state"] in {"completed", "aborted", "not_sent"}
                            and current.get("state") in {"completed", "aborted", "not_sent"}
@@ -318,15 +334,31 @@ class GracefulRestartBridge:
                     return
                 claimed = {**marker, "state": "claimed", "claimed_wall": wall,
                     "unobserved_seconds": wall - marker["dispatch_wall"], "revision": uuid4().hex}
-                self._marker = await self._save_locked(claimed)
+                task, _ = await self._start_save_locked(claimed)
+                try:
+                    self._marker = await asyncio.wait_for(asyncio.shield(task), STORE_TIMEOUT_SECONDS)
+                except TimeoutError:
+                    if task.done():
+                        self._marker = task.result()
+                    else:
+                        self._pending_claim = _PendingClaim(task, claimed["revision"],
+                            mono + BOOT_CLAIM_TIMEOUT_SECONDS)
+                        task.add_done_callback(self._claim_finished)
             self._active = True
-            self._phase = "bootstrap_wait"
+            self._phase = "claim_verify_wait" if self._pending_claim is not None else "bootstrap_wait"
             self._expires_mono = mono + marker["expires_wall"] - wall
             self._last_wall, self._last_mono = wall, mono
         except Exception as err:
             self._active = False
             self._phase = "rejected"
             self._error = str(err) if isinstance(err, BridgeRefused) else "bridge_restore_failed"
+            self._error_type = type(err).__name__
+
+    def _claim_finished(self, task):
+        if not task.cancelled():
+            task.exception()
+        if self._pending_claim is not None and self._pending_claim.task is task and not self._closed:
+            self.c._handle_source_change(None)
 
     def _source_problem(self, inp, *, allow_missing=False):
         if not self._enabled():
@@ -412,7 +444,7 @@ class GracefulRestartBridge:
         return any(observed != expected and (at := _number(receipt)) is not None and 0 <= at <= mono
                    for observed, receipt, expected in zip(limits, receipts, (BRIDGE_CAP_AMPS, 0, 0)))
 
-    def _decision(self, inp, *, mode, cap=7, command=None, ttl=300):
+    def _decision(self, inp, *, mode, cap=7, command=None, ttl=300, deadline=None):
         raw = _grid_number(inp.grid_l1)
         return RegulatorDecision(mode=mode, reason=(
             "One finite graceful-shutdown allowance; no renewal, new response evidence or overload permission."),
@@ -424,14 +456,15 @@ class GracefulRestartBridge:
             meter_envelope=True, meter_state=mode, meter_overload_authority=False,
             meter_quiet_peak_reduction=False, meter_peak_reduction_ceiling_amps=None,
             meter_peak_reduction_lease_origin_ts=None,
-            normal_continuity_deadline_ts=self._expires_mono)
+            normal_continuity_deadline_ts=self._expires_mono if deadline is None else deadline)
 
     def _withdraw(self, reason):
         self._active = False
+        claim, self._pending_claim = self._pending_claim, None
         self._error, self._phase = reason, "withdrawn"
         if self._planner is not None:
             self._planner._get_meter_envelope_policy().restart_bridge_context = None
-        if self._marker is not None and self._marker["state"] == "claimed":
+        if self._marker is not None and (self._marker["state"] == "claimed" or claim is not None):
             try:
                 wall, _ = self._clocks()
             except BridgeRefused:
@@ -440,12 +473,13 @@ class GracefulRestartBridge:
                 return
             update = {**self._marker, "state": "aborted", "ended_wall": wall,
                 "unobserved_seconds": min(316., max(0., wall-self._marker["dispatch_wall"]))}
-            self._queue_save(update)
+            revisions = (self._marker["revision"], claim.revision) if claim is not None else None
+            self._queue_save(update, expected_revisions=revisions)
 
-    def _queue_save(self, marker):
+    def _queue_save(self, marker, *, expected_revisions=None):
         async def save():
             try:
-                await self._save(marker, expected_nonce=marker["nonce"])
+                await self._save(marker, expected_nonce=marker["nonce"], expected_revisions=expected_revisions)
             except Exception:
                 self._error = "bridge_checkpoint_not_verified"
         creator = getattr(self.c.hass, "async_create_task", asyncio.create_task)
@@ -478,7 +512,11 @@ class GracefulRestartBridge:
         if wall >= self._marker["expires_wall"] or mono >= self._expires_mono:
             self._withdraw("bridge_expired")
             return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.LEASE_EXPIRED)
-        if self._binding() != self._marker["binding"]:
+        try:
+            binding = self._binding()
+        except BridgeRefused:
+            binding = None
+        if binding != self._marker["binding"]:
             self._withdraw("bridge_binding_changed")
             return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.CONTROL_SOURCE_CHANGED)
         problem = self._source_problem(inp, allow_missing=True)
@@ -488,7 +526,28 @@ class GracefulRestartBridge:
         if self._bridge_readback_changed(mono):
             self._withdraw("bridge_limit_readback_changed")
             return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.UNKNOWN_DELIVERY)
-        if self._missing_first_sample(inp) or self._native_initial_wait(inp):
+        missing_grid = self._missing_first_sample(inp)
+        if self._pending_claim is not None:
+            claim = self._pending_claim
+            if not missing_grid:
+                self._first_fresh = True
+            if mono >= claim.deadline:
+                self._error_type = "TimeoutError"
+                self._withdraw("bridge_claim_verification_timeout")
+                return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.PERSISTENCE)
+            if not claim.task.done():
+                return self._decision(inp, mode="restart_bridge_claim_verify_hold",
+                    deadline=min(self._expires_mono, claim.deadline))
+            try:
+                # Only this task's exact, verified durable revision can arm a
+                # takeover. A previously claimed file never enters this path.
+                self._marker = claim.task.result()
+            except (Exception, asyncio.CancelledError) as err:
+                self._error_type = type(err).__name__
+                self._withdraw(str(err) if isinstance(err, BridgeRefused) else "bridge_claim_verification_failed")
+                return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.PERSISTENCE)
+            self._pending_claim = None
+        if missing_grid or self._native_initial_wait(inp):
             self._phase = "bootstrap_wait"
             return self._decision(inp, mode="restart_bridge_bootstrap_hold")
         self._first_fresh = True
@@ -941,6 +1000,8 @@ class GracefulRestartBridge:
 
     async def async_close(self):
         self._closed = True
+        if self._pending_claim is not None:
+            self._withdraw("bridge_claim_closed")
         self._active = False
         self._planner = None
         self._restored = False

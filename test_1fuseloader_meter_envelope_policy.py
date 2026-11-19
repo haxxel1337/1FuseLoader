@@ -78,6 +78,16 @@ class MeterEnvelopePolicyTests(unittest.TestCase):
         self.assertFalse(r.peak_response_active)
         return r
 
+    def test_one_amp_normal_buffer_retains_16_amp_offer_at_23_5_amp_total(self):
+        for buffer, expected in ((2.0, 15), (1.0, 16)):
+            with self.subTest(buffer=buffer):
+                regulator = self.regulator(buffer_amps=buffer)
+                self.sample(regulator, 0.0, 4.0, status="disconnected", receipt=0.0)
+                self.sample(regulator, 5.0, 20.0, 15.9, receipt=4.8, sequence=2)
+                _, decision = self.sample(regulator, 10.0, 23.5, 15.9, receipt=9.8, sequence=3)
+                self.assertEqual(decision.current_p1, expected)
+                self.assertIsNone(decision.meter_zero_cause)
+
     def test_expired_ordinary_owners_and_fractional_partial_current_have_no_stop_authority(self):
         r=self.live()
         # Public ordinary offers, followed by packet order EV-before-meter.

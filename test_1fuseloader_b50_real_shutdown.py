@@ -374,6 +374,87 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(next_controller.last_decision.meter_zero_cause)
         self.assertTrue(all(d.current_p1 > 0 for d in next_adapter.calls))
 
+    async def test_cold_boot_retains_only_existing_limit_during_delayed_store_claim(self):
+        from homeassistant.core import HomeAssistant
+
+        await self.start_healthy()
+        await self.managed_stop()
+        original = await self.marker()
+        self.assertEqual(original['state'], 'acknowledged')
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls],
+                         [(7, 60), (7, 300)])
+
+        next_hass = HomeAssistant(self.temp.name)
+        next_hass.set_state(self.CoreState.running)
+        self.extra_hass.append(next_hass)
+        next_adapter = SyntheticShutdownAdapter(self)
+        next_controller = self.make_controller(next_hass, next_adapter)
+        bridge = next_controller._restart_bridge
+        bridge._ensure_store()
+        real_readback = bridge._read_back
+        claim_written = asyncio.Event()
+        allow_readback = asyncio.Event()
+        grid_available = False
+
+        async def delayed_readback():
+            payload = await real_readback()
+            if payload is not None and payload['state'] == 'claimed':
+                claim_written.set()
+                await allow_readback.wait()
+                return await real_readback()
+            return payload
+
+        # Isolate the absent first MQTT packet. The controller and both
+        # independent Store instances still run on a real Home Assistant loop.
+        next_controller._l1_source = SimpleNamespace(
+            snapshot=lambda: SimpleNamespace(current=None, receipt_ts=None,
+                sample_ts=None, error=self.bridge_module.FIRST_GRID_WAIT),
+            stop=lambda: None)
+        read_input = next_controller._read_input
+
+        def read_boot_input():
+            inp = read_input()
+            if grid_available:
+                return inp
+            return replace(inp, grid_l1=None, grid_report_ts=None,
+                meter_grid_health=self.logic.SourceHealth(False, 'first_mqtt_packet_pending'))
+
+        next_controller._read_input = read_boot_input
+        with (patch.object(bridge, '_read_back', delayed_readback),
+              patch.object(next_controller, '_async_configure_l1_source_locked', AsyncMock(return_value=False)),
+              patch.object(self.bridge_module, 'STORE_TIMEOUT_SECONDS', .5)):
+            try:
+                await next_controller.async_start()
+                self.assertTrue(claim_written.is_set())
+                durable = await self.marker(next_hass)
+                self.assertEqual(durable['state'], 'claimed')
+                self.assertEqual(durable['nonce'], original['nonce'])
+                self.assertEqual(durable['expires_wall'], original['expires_wall'])
+                self.assertEqual(next_controller.last_decision.mode, 'restart_bridge_claim_verify_hold',
+                                 bridge.diagnostics())
+                self.assertFalse(next_controller.last_decision.should_call_service)
+                self.assertEqual(next_controller.last_decision.current_p1, 7)
+                self.assertIsNone(next_controller.regulator.last_target)
+                self.assertEqual(next_adapter.calls, [])
+
+                # A fresh MQTT packet supplies enough raw headroom for the
+                # ordinary 7 A offer even without a fresh mapped EV packet.
+                self.raw = 14.3
+                self.grid_wall = datetime.now(timezone.utc).timestamp()
+                grid_available = True
+                await next_controller.async_tick()
+                self.assertEqual(next_controller.last_decision.mode, 'restart_bridge_claim_verify_hold')
+                self.assertEqual(next_adapter.calls, [])
+            finally:
+                allow_readback.set()
+            await next_hass.async_block_till_done()
+
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in next_adapter.calls], [(7, 60)])
+        completed = await self.marker(next_hass)
+        self.assertEqual(completed['state'], 'completed')
+        self.assertEqual(completed['expires_wall'], original['expires_wall'])
+        self.assertEqual(next_controller.regulator.last_target, (7, 0, 0, 60))
+
     async def test_repeated_new_minimum_frames_do_not_move_grid_confirmation_floor(self):
         await self.start_healthy()
         self.repeated_current = True
