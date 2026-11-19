@@ -1118,7 +1118,12 @@ class OneFuseLoaderController:
                     # HA's Core stop does not unload every config entry. A
                     # refused/disabled bridge must also cease ordinary work
                     # before MQTT and native HTTP enter their stop stages.
-                    await self.async_stop()
+                    try:
+                        if not armed:
+                            async with asyncio.timeout(3):
+                                await self._restart_bridge.async_protect_failed_shutdown()
+                    finally:
+                        await self.async_stop()
         except Exception as err:
             _LOGGER.warning("1FuseLoader shutdown preparation or cleanup failed (%s)", type(err).__name__)
         return armed
@@ -2643,8 +2648,9 @@ class OneFuseLoaderController:
                 inp.controlled_l1 if self.settings.meter_envelope_control else None,
                 age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
-    async def _async_tick_locked(self) -> None:
-        if self._restart_bridge.preparing:
+    async def _async_tick_locked(self, *,
+                                 shutdown_protection: tuple[ElectricalStopCause, object] | None = None) -> None:
+        if self._restart_bridge.preparing and shutdown_protection is None:
             return
         generation = self._generation
         # Recheck public identity metadata as well as entry updates. A renamed,
@@ -2716,7 +2722,8 @@ class OneFuseLoaderController:
                 "shared_confirmation_owner_before": confirmation.owner if confirmation is not None else None,
                 "owner_clock_scope": "monotonic_seconds_not_utc",
             }
-        decision = await self._restart_bridge.async_tick_override(inp)
+        decision = (await self._restart_bridge.async_tick_override(inp)
+                    if shutdown_protection is None else None)
         if decision is not None and not decision.should_call_service:
             # This separately bounded owner retains only the previous runtime's
             # verified bridge. It supplies no new SDK lease or source evidence.
@@ -2725,7 +2732,7 @@ class OneFuseLoaderController:
             self._schedule_overload_deadline(decision)
             self.notify()
             return
-        pending_proposal = self._meter_checkpoint_proposal
+        pending_proposal = self._meter_checkpoint_proposal if shutdown_protection is None else None
         if pending_proposal is not None and decision is None:
             # A verified write can take longer than the caller's bounded I/O
             # wait. Re-evaluating and saving a moving exposure counter on every
@@ -2762,7 +2769,10 @@ class OneFuseLoaderController:
                 self._meter_checkpoint_proposal = None
         if decision is None:
             decision = self.regulator.evaluate(inp)
-        if self._protective_zero_pending and self.settings.active_control and not self.settings.dry_run:
+        if shutdown_protection is not None:
+            self.regulator.reject_unsubmitted(decision, self.hass.loop.time())
+            decision = self.regulator.meter_envelope_fault(inp, shutdown_protection[0])
+        elif self._protective_zero_pending and self.settings.active_control and not self.settings.dry_run:
             self.regulator.reject_unsubmitted(decision, self.hass.loop.time())
             if self.settings.meter_envelope_control:
                 decision = self.regulator.meter_envelope_fault(inp, ElectricalStopCause.UNKNOWN_DELIVERY)
@@ -3147,6 +3157,9 @@ class OneFuseLoaderController:
             nonlocal attempt, receipt_record, capture_stop, inp, plan_source_diagnostics, exposure
             if (self._dispatch_started or self._stopped or generation != self._generation
                     or self._dispatch_superseded):
+                return False
+            if (shutdown_protection is not None
+                    and self._adapter.control_identity != shutdown_protection[1]):
                 return False
             latest = self._read_input()
             if (positive_submission and raw_excursion_deadline is not None

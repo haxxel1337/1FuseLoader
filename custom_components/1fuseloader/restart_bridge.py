@@ -607,7 +607,8 @@ class GracefulRestartBridge:
                 rejected = "bridge_qualification_normal_limit_changed"
                 return False
             wall, mono = self._clocks(latest)
-            self._bridge_dispatch = dict(wall=wall, mono=mono, managed_proof=managed_proof)
+            self._bridge_dispatch = dict(wall=wall, mono=mono, managed_proof=managed_proof,
+                source_id=latest.control_source_id, adapter_identity=c._adapter.control_identity)
             record = c._delivery.begin("set_limit", (BRIDGE_CAP_AMPS, 0, 0), mono)
             attempt = dict(started_at_utc=_iso(wall), completed_at_utc=None,
                 command="set_limit", target_p1=BRIDGE_CAP_AMPS, target_p2=0, target_p3=0,
@@ -852,9 +853,9 @@ class GracefulRestartBridge:
                 key = ("managed_restart", marker["nonce"])
                 expiry = boundary["mono"] + 300
                 policy.possible_positive[key] = (7, expiry)
-                if accepted:
+                if accepted and boundary["source_id"] == latest.control_source_id:
                     policy.lease.normal_commands[key] = dict(cap=7, expires=expiry,
-                        source_id=latest.control_source_id)
+                        source_id=boundary["source_id"])
             if boundary is not None and (not accepted or self._managed_proof(latest) is None):
                 self.c._protective_zero_pending = True
             self._queue_save(tombstone)
@@ -879,9 +880,12 @@ class GracefulRestartBridge:
                     or wall-boundary["wall"] >= MANAGED_COMMIT_TIMEOUT_SECONDS):
                 return False
             self._prepare_stage = "save_acknowledged"
-            await self._save({**self._marker, "state": "acknowledged",
+            marker = {**self._marker, "state": "acknowledged",
                 "dispatch_wall": boundary["wall"], "expires_wall": boundary["wall"]+300,
-                "physical_response_wall": proof[1], "grid_response_wall": proof[2]})
+                "physical_response_wall": proof[1], "grid_response_wall": proof[2]}
+            if not self._valid_marker(marker, wall):
+                return False
+            await self._save(marker)
             # A successful store write is not the source revalidation.
             current = self._managed_proof(self.c._read_input())
             if self._abort or current is None or current[0] != proof[0]:
@@ -893,6 +897,25 @@ class GracefulRestartBridge:
             self._phase = self._prepare_stage = "armed"
             self._managed_commit.set()
             return True
+
+    async def async_protect_failed_shutdown(self):
+        """Withdraw a submitted bridge on a real fault before closing its adapter."""
+        boundary = self._bridge_dispatch
+        if boundary is None or self._armed or self.c._stopped:
+            return
+        async with self.c._lock:
+            if (self._armed or self.c._stopped
+                    or self.c.hass.loop.time() >= boundary["mono"] + BRIDGE_TTL_SECONDS
+                    or self.c._adapter.control_identity != boundary["adapter_identity"]):
+                return
+            inp = self.c._read_input()
+            cause = self._managed_source_problem(inp)
+            if cause is None and inp.control_source_id != boundary["source_id"]:
+                cause = ElectricalStopCause.CONTROL_SOURCE_CHANGED
+            if cause is not None:
+                self.c._protective_zero_pending = True
+                await self.c._async_tick_locked(
+                    shutdown_protection=(cause, boundary["adapter_identity"]))
 
     async def async_close(self):
         self._closed = True

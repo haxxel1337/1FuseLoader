@@ -427,6 +427,54 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.marker())
         self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
 
+    async def test_hard_load_during_marker_commit_withdraws_before_adapter_closes(self):
+        await self.start_healthy()
+        bridge = self.controller._restart_bridge
+        write_marker = bridge._write_verified
+        close_adapter = self.adapter.async_close
+        stop = None
+        commands_at_close = []
+
+        async def request_restart():
+            nonlocal stop
+            stop = asyncio.create_task(self.core_stop())
+            # Core owns shutdown once it receives the request. Cancellation
+            # of the action waiting for a handoff must not undo Core's stop.
+            await asyncio.shield(stop)
+
+        async def inject_high_load(snapshot, grant_guard):
+            if snapshot['state'] == 'acknowledged':
+                # The first Core shutdown stage runs before CoreState.stopping.
+                self.assertIsNotNone(stop)
+                self.assertFalse(stop.done())
+                self.assertEqual(self.adapter.calls[-1].ttl_seconds, 300)
+                self.packet_stop.set()
+                self.raw = 39.
+                self.grid_wall = datetime.now(timezone.utc).timestamp()
+                self.controller._handle_source_change(None)
+            return await write_marker(snapshot, grant_guard)
+
+        async def record_close():
+            commands_at_close.extend((d.current_p1, d.ttl_seconds) for d in self.adapter.calls)
+            await close_adapter()
+
+        with (
+            patch.object(bridge, '_write_verified', inject_high_load),
+            patch.object(self.adapter, 'async_close', record_close),
+        ):
+            try:
+                with self.assertRaises(self.bridge_module.BridgeRefused):
+                    await self.controller.async_restart_with_charging(request_restart)
+            finally:
+                if stop is not None:
+                    await asyncio.wait_for(stop, 24)
+
+        self.assertIsNotNone(stop)
+        self.assertEqual(commands_at_close, [(7, 60), (7, 300), (0, 60)])
+        self.assertEqual((await self.marker())['state'], 'aborted')
+        self.assertFalse(bridge.armed)
+        await self.assert_quiescent(list(self.adapter.calls))
+
     async def test_unmanaged_core_stop_does_not_replace_healthy_charging_lease(self):
         await self.start_healthy()
         await self.core_stop()
