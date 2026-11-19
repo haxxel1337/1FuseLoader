@@ -678,6 +678,21 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.async_tick()
         self.assertFalse(any(d.current_p1 > 0 for d in self.adapter.calls))
 
+    async def test_unverified_source_binding_preempts_pending_claim(self):
+        _, release, task = await self.boot_with_delayed_claim_readback()
+        try:
+            self.assertEqual(self.adapter.calls, [])
+            self.now = 1.
+            self.controller._configured_control_identity.return_value = None
+            await self.controller.async_tick()
+            self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+            self.assertEqual(self.controller.last_decision.meter_zero_cause, 'control_source_changed')
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+        await self.controller.async_tick()
+        self.assertFalse(any(d.current_p1 > 0 for d in self.adapter.calls))
+
     async def test_claim_readback_hold_has_own_fixed_short_deadline(self):
         _, release, task = await self.boot_with_delayed_claim_readback()
         try:

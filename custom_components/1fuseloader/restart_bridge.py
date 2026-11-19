@@ -512,7 +512,11 @@ class GracefulRestartBridge:
         if wall >= self._marker["expires_wall"] or mono >= self._expires_mono:
             self._withdraw("bridge_expired")
             return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.LEASE_EXPIRED)
-        if self._binding() != self._marker["binding"]:
+        try:
+            binding = self._binding()
+        except BridgeRefused:
+            binding = None
+        if binding != self._marker["binding"]:
             self._withdraw("bridge_binding_changed")
             return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.CONTROL_SOURCE_CHANGED)
         problem = self._source_problem(inp, allow_missing=True)
