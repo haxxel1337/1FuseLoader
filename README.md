@@ -50,6 +50,24 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Planned restart while charging (b52)
+
+Enable the existing 7 A restart option and run the administrator action
+`1fuseloader.restart_with_charging` in **Developer tools → Actions** while
+the car is charging. The ordinary controller stays active while a finite
+7 A reduction is verified by Easee's native readback, measured charging
+current, and a newer independent meter sample. A health or load change can
+invalidate the request before shutdown. A missing measurement during this
+preflight leaves HA running under its ordinary protection.
+
+Only a verified minimum can receive the one 7 A allowance of at most five
+minutes. The shutdown job revalidates the allowance and records a single-use
+handoff. The new runtime claims it once and resumes regular control from
+live data. A direct HA, Supervisor or SSH restart bypasses this preflight.
+The installation restart from an older version still runs that version's
+shutdown code. While Core is down, running load protection is unavailable
+and Easee's expiry and configured offline limit remain the fallback.
+
 ### Real HA shutdown and quiet-data reductions (b50)
 
 The finite restart bridge accepts Home Assistant's actual read-only
@@ -79,11 +97,8 @@ The real adapter requires an actual-dispatch callback to revalidate the
 original authority. Feedback decreases use the configured steady ceiling
 consistently; the selected 25 + 3 A profile stays at 28 A.
 
-An installation restart executes the outgoing version's shutdown code.
-Installing this fix therefore cannot repair an already running old bridge
-before that restart. Even after activation, a successful finite handoff needs
-available source/SDK feedback within HA's early shutdown window. Crashes,
-expired authority and critical faults retain their protective behavior.
+This describes the b50 shutdown-only producer. B52 uses the planned action
+described above.
 
 ### Fixed measured RAW excursions (b49)
 

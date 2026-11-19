@@ -202,6 +202,8 @@ class RegulatorInput:
     # Own accepted zero plus matching native circuit readback on the same
     # receiver. For no-write recovery only. This is never physical EV proof.
     meter_zero_limit_confirmed: bool = False
+    # Optional runtime-only bound on an otherwise normal positive offer.
+    restart_preflight: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +460,7 @@ class RegulatorDecision:
     meter_overload_authority: bool = False
     meter_ordinary_decrease: bool = False
     meter_feedback_curtailment: bool = False
+    meter_restart_preflight_reduction: bool = False
     meter_feedback_budget_amps: Optional[float] = None
     meter_feedback_ceiling_amps: Optional[float] = None
     meter_basis_grid_ts: Optional[float] = None
@@ -5244,6 +5247,7 @@ class OneFuseRegulator:
                 "native_current":_valid_number(inp.charger_current) if inp.charger_native_committed and inp.charger_current_trusted else None,
                 "native_source_known":inp.charger_event_source_known,
                 "controlled_l1_floor": shadow._controlled_l1_boundary(inp),
+                "restart_preflight": inp.restart_preflight,
                 "normal_anchor": normal_anchor,
                 "generation": self._control_generation,
                 "target": (decision.current_p1, decision.current_p2, decision.current_p3)}
@@ -6320,6 +6324,11 @@ class OneFuseRegulator:
             return False
         if planned.control_source_id != latest.control_source_id:
             return False
+        if (not dispatched and planned.restart_preflight and decision.current_p1 == 7
+                and decision.mode == "meter_normal" and decision.committed_current_p1 is not None
+                and decision.committed_current_p1 > 7
+                and (not latest.restart_preflight or (_valid_number(latest.grid_l1) or 0) > 23)):
+            return False
         if decision.meter_quiet_peak_reduction and not dispatched:
             shadow = deepcopy(self)
             fresh = shadow._get_meter_envelope_policy().evaluate(shadow, latest)
@@ -6359,6 +6368,7 @@ class OneFuseRegulator:
             permit = self._get_meter_envelope_policy().operating_permission(self, latest)
             return bool(permit is not None and permit.kind == 'decrease'
                 and fresh.meter_zero_cause is None
+                and fresh.meter_restart_preflight_reduction == decision.meter_restart_preflight_reduction
                 and decision.meter_feedback_ceiling_amps == fresh.meter_feedback_ceiling_amps
                     == self.settings.main_fuse_amps+self.settings.overload_margin_amps
                 and decision.command == fresh.command == 'set_limit'

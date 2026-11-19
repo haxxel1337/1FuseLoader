@@ -1,0 +1,10 @@
+restart_with_charging:
+  name: Restart Home Assistant with charging verified
+  description: Checks charging and grid measurements while Home Assistant is running. If verified, requests a restart with a temporary 7 A limit for up to five minutes.
+  fields:
+    entry_id:
+      name: 1FuseLoader configuration entry
+      description: Optional when exactly one 1FuseLoader configuration entry exists.
+      selector:
+        config_entry:
+          integration: 1fuseloader

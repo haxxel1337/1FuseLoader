@@ -1326,6 +1326,7 @@ class EaseeCommandAdapter:
         raw = getattr(decision, 'grid_l1', None)
         budget = getattr(decision, 'meter_feedback_budget_amps', None)
         ceiling = getattr(decision, 'meter_feedback_ceiling_amps', None)
+        managed = getattr(decision, 'meter_restart_preflight_reduction', False)
         return bool(getattr(decision, 'meter_envelope', False) is True
             and decision.command == 'set_limit'
             and decision.mode == 'meter_normal_decrease'
@@ -1335,8 +1336,10 @@ class EaseeCommandAdapter:
             and getattr(decision, 'meter_overload_authority', False) is False
             and all(type(v) in (int, float) and isfinite(v) for v in (raw, budget, ceiling))
             and 25 < ceiling <= 29
-            and 0 < budget <= 23 and budget < raw <= ceiling
-            and cap <= max(7, previous - ceil(raw - budget)))
+            and 0 < budget <= 23
+            and (managed is True and cap == 7 and 0 <= raw <= budget
+                 or managed is False and budget < raw <= ceiling
+                    and cap <= max(7, previous - ceil(raw - budget))))
 
     @staticmethod
     def _quiet_peak_permit(decision: Any) -> bool:

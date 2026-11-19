@@ -261,7 +261,7 @@ class RestartBridgeStoreTests(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_shutdown_request_cannot_refill_an_armed_bridge(self):
         self.bridge._armed = True
         self.owner._read_input = lambda: (_ for _ in ()).throw(AssertionError('must not inspect or renew'))
-        self.assertFalse(await self.bridge.async_prepare_shutdown())
+        self.assertFalse(await self.bridge.async_commit_managed_shutdown())
         self.assertFalse(self.store.writes)
 
     async def test_unhashable_marker_state_is_rejected(self):

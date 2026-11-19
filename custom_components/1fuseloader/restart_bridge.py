@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -21,11 +21,12 @@ from .easee_adapter import CommandNotSent
 
 BRIDGE_CAP_AMPS = 7
 BRIDGE_TTL_SECONDS = 300
-PREPARE_TIMEOUT_SECONDS = 16
+MANAGED_PREFLIGHT_TIMEOUT_SECONDS = 90
+MANAGED_COMMIT_TIMEOUT_SECONDS = 16
 STORE_TIMEOUT_SECONDS = 1.5
 REQUEST_TIMEOUT_SECONDS = 6
 FIRST_GRID_WAIT = "L1 MQTT source is waiting for a fresh non-retained sample."
-_STATES = {"prepared", "acknowledged", "claimed", "completed", "aborted"}
+_STATES = {"prepared", "acknowledged", "claimed", "completed", "aborted", "not_sent"}
 _ALLOWED = {"charging", "awaiting_start", "ready_to_charge", "start_charging", "awaiting_load_balancing"}
 _LOGGER = logging.getLogger(__name__)
 
@@ -92,7 +93,6 @@ class GracefulRestartBridge:
         self._actuator_ready_seen = False
         self._unknown_until = None
         self._background_save = None
-        self._last_dispatch = None
         self._bridge_dispatch = None
         self._phase = "disabled"
         self._error = None
@@ -104,6 +104,10 @@ class GracefulRestartBridge:
         self._prepare_finished_mono = None
         self._physical_response_wall = None
         self._grid_response_wall = None
+        self._managed = False
+        self._managed_ready = None
+        self._managed_commit = asyncio.Event()
+        self._managed_minimum = None
 
     @property
     def preparing(self):
@@ -112,6 +116,10 @@ class GracefulRestartBridge:
     @property
     def armed(self):
         return self._armed
+
+    @property
+    def managed_preflight(self):
+        return self._managed
 
     def _enabled(self):
         s = self.c.settings
@@ -220,8 +228,8 @@ class GracefulRestartBridge:
                 expected = expected_nonce or snapshot["nonce"]
                 if (type(current) is not dict or current.get("nonce") != expected
                         or snapshot["state"] == "acknowledged" and current.get("state") != "prepared"
-                        or snapshot["state"] in {"completed", "aborted"}
-                           and current.get("state") in {"completed", "aborted"}
+                        or snapshot["state"] in {"completed", "aborted", "not_sent"}
+                           and current.get("state") in {"completed", "aborted", "not_sent"}
                            and current["state"] != snapshot["state"]):
                     if snapshot["state"] == "acknowledged":
                         raise BridgeRefused("bridge_prepared_owner_changed")
@@ -238,13 +246,16 @@ class GracefulRestartBridge:
             "physical_response_wall", "grid_response_wall", "claimed_wall", "ended_wall",
             "unobserved_seconds", "revision"}
         if (type(marker) is not dict or set(marker) != required
-                or type(marker["version"]) is not int or marker["version"] != 1
+                or type(marker["version"]) is not int or marker["version"] not in {1, 2}
                 or type(marker["state"]) is not str or marker["state"] not in _STATES
                 or not isinstance(marker["nonce"], str) or re.fullmatch(r"[0-9a-f]{32}", marker["nonce"]) is None
                 or not isinstance(marker["revision"], str) or re.fullmatch(r"[0-9a-f]{32}", marker["revision"]) is None
                 or marker["binding"] != self._binding()
                 or type(marker["cap"]) is not int or marker["cap"] != 7
                 or type(marker["ttl_seconds"]) is not int or marker["ttl_seconds"] != 300):
+            return False
+        if marker["state"] == "not_sent" and (marker["version"] != 2
+                or marker["dispatch_wall"] is not None or marker["ended_wall"] is None):
             return False
         prepared, expiry, possible = map(_number, (marker["prepared_wall"], marker["expires_wall"], marker["possible_until_wall"]))
         if (prepared is None or prepared <= 0 or prepared > wall
@@ -256,12 +267,20 @@ class GracefulRestartBridge:
         if marker["state"] in {"acknowledged", "claimed", "completed"}:
             dispatch, physical, grid = map(_number, (marker["dispatch_wall"], marker["physical_response_wall"], marker["grid_response_wall"]))
             if (dispatch is None or physical is None or grid is None
-                    or not prepared <= dispatch < physical < grid <= wall
                     or expiry != dispatch + 300):
+                return False
+            if marker["version"] == 1:
+                ordered = prepared <= dispatch < physical < grid <= wall
+            else:
+                ordered = (0 < dispatch - physical <= 30
+                    and physical < grid <= dispatch and prepared <= dispatch <= wall)
+            if not ordered:
                 return False
         for key in ("dispatch_wall", "physical_response_wall", "grid_response_wall", "claimed_wall", "ended_wall"):
             value = marker[key]
-            if value is not None and (_number(value) is None or value < prepared or value > wall):
+            lower = 0 if marker["version"] == 2 and key in {
+                "physical_response_wall", "grid_response_wall"} else prepared
+            if value is not None and (_number(value) is None or value < lower or value > wall):
                 return False
         return True
 
@@ -499,7 +518,11 @@ class GracefulRestartBridge:
     def source_changed(self):
         if self._preparing:
             try:
-                if self._source_problem(self.c._read_input()):
+                inp = self.c._read_input()
+                proof = self._managed_ready[1] if self._managed_ready is not None else None
+                current = self._managed_proof(inp) if proof is not None else None
+                if (self._source_problem(inp)
+                        or proof is not None and (current is None or current[0] != proof[0])):
                     self._abort = True
                     self._grant_guard["valid"] = False
                     self._abort_event.set()
@@ -554,80 +577,46 @@ class GracefulRestartBridge:
     def _producer_eligible(self, inp):
         return self._producer_problem(inp) is None
 
-    def _minimum_readback_verified(self, boundary, latest):
-        if not boundary["requires_limit_readback"]:
-            return True
-        adapter = self.c._adapter
-        limits = getattr(adapter, "reported_limits", None)
-        receipts = getattr(adapter, "reported_limit_receipts", None)
-        # P2 and P3 must still report zero. Only P1 changes, so it must
-        # also have a native receipt after this specific request began.
-        receipt = _number(receipts[0]) if isinstance(receipts, tuple) and len(receipts) == 3 else None
-        now = _number(latest.now_ts)
-        return bool(limits == (7, 0, 0) and receipt is not None and now is not None
-                    and boundary["mono"] < receipt <= now)
-
-    def _minimum_response_problem(self, inp, floor):
-        """New adverse observations can withdraw proof without earning credit."""
-        r = self.c.regulator
-        boundary = r._controlled_l1_boundary(inp)
-        if boundary is None or boundary["key"] != floor["key"]:
-            return "bridge_minimum_binding_changed"
-        e = inp.controlled_l1
-        if r._controlled_l1_after(e, floor):
-            current = _number(e.current)
-            if current is not None and not 0 < current <= 7.5:
-                return "bridge_minimum_response_lost"
-        return None
-
-    async def _send(self, cap, ttl, *, protective=False, timeout=REQUEST_TIMEOUT_SECONDS):
+    async def _send(self):
         c = self.c
         inp = c._read_input()
-        decision = self._decision(inp, mode="restart_bridge_shutdown" if cap else "restart_bridge_abort", cap=cap, command="set_limit", ttl=ttl)
+        decision = self._decision(inp, mode="restart_bridge_shutdown", command="set_limit")
         record = attempt = None
         generation = c._generation
         rejected = None
-        previous = None
-        if not protective:
-            problem = self._producer_problem(inp)
-            if problem is not None:
-                raise BridgeRefused(problem)
-            lease = c.regulator._get_meter_envelope_policy().lease
-            previous = (lease.cap, lease.origin, lease.expires, lease.source_id)
-            if cap == BRIDGE_CAP_AMPS and lease.cap > cap:
-                decision = replace(decision, command_urgency="protective_reduction",
-                                   committed_current_p1=lease.cap)
+        problem = self._producer_problem(inp)
+        if problem is not None:
+            raise BridgeRefused(problem)
+        lease = c.regulator._get_meter_envelope_policy().lease
+        previous = (lease.cap, lease.origin, lease.expires, lease.source_id)
 
         def dispatch():
             nonlocal record, attempt, rejected
             latest = c._read_input()
-            if c._stopped or c._generation != generation:
+            if c._stopped or self._abort or c._generation != generation:
                 return False
-            requires_limit_readback = False
-            if not protective:
-                if self._abort:
-                    return False
-                rejected = self._producer_problem(latest)
-                if rejected is not None:
-                    return False
-                policy = c.regulator._get_meter_envelope_policy()
-                lease = policy.lease
-                if (lease.cap, lease.origin, lease.expires, lease.source_id) != previous:
-                    rejected = "bridge_qualification_normal_limit_changed"
-                    return False
-                requires_limit_readback = any(
-                    old_cap > lease.cap and expiry > latest.now_ts
-                    for old_cap, expiry in policy.possible_positive.values())
+            rejected = self._producer_problem(latest)
+            if rejected is not None:
+                return False
+            managed_proof = self._managed_proof(latest)
+            if managed_proof is None:
+                rejected = "bridge_preflight_proof_lost"
+                return False
+            lease = c.regulator._get_meter_envelope_policy().lease
+            if (lease.cap, lease.origin, lease.expires, lease.source_id) != previous:
+                rejected = "bridge_qualification_normal_limit_changed"
+                return False
+            adapter_identity = c._adapter.control_identity
+            if adapter_identity is None:
+                rejected = "bridge_qualification_actuator_identity_missing"
+                return False
             wall, mono = self._clocks(latest)
-            self._last_dispatch = dict(wall=wall, mono=mono,
-                floor=c.regulator._controlled_l1_boundary(latest),
-                requires_limit_readback=requires_limit_readback)
-            if cap:
-                self._bridge_dispatch = self._last_dispatch
-            record = c._delivery.begin("set_limit", (cap, 0, 0), mono)
+            self._bridge_dispatch = dict(wall=wall, mono=mono, managed_proof=managed_proof,
+                source_id=latest.control_source_id, adapter_identity=adapter_identity)
+            record = c._delivery.begin("set_limit", (BRIDGE_CAP_AMPS, 0, 0), mono)
             attempt = dict(started_at_utc=_iso(wall), completed_at_utc=None,
-                command="set_limit", target_p1=cap, target_p2=0, target_p3=0,
-                ttl_seconds=ttl, result="pending", error=None)
+                command="set_limit", target_p1=BRIDGE_CAP_AMPS, target_p2=0, target_p3=0,
+                ttl_seconds=BRIDGE_TTL_SECONDS, result="pending", error=None)
             c.last_command_attempt = attempt
             return True
 
@@ -640,12 +629,11 @@ class GracefulRestartBridge:
                     raise BridgeRefused("bridge_dispatch_rejected")
                 coroutine = c._adapter.async_execute(decision)
             self._request_task = asyncio.create_task(coroutine)
-            aborted = asyncio.create_task(self._abort_event.wait()) if not protective else None
+            aborted = asyncio.create_task(self._abort_event.wait())
             try:
-                waiting = {self._request_task} | ({aborted} if aborted is not None else set())
-                done, _ = await asyncio.wait(waiting, timeout=timeout,
+                done, _ = await asyncio.wait({self._request_task, aborted}, timeout=REQUEST_TIMEOUT_SECONDS,
                     return_when=asyncio.FIRST_COMPLETED)
-                if aborted is not None and aborted in done:
+                if aborted in done:
                     raise BridgeRefused("bridge_source_preempted_request")
                 if self._request_task not in done:
                     raise TimeoutError
@@ -656,7 +644,7 @@ class GracefulRestartBridge:
                         raise BridgeRefused(rejected) from None
                     raise
             finally:
-                pending = [task for task in (self._request_task, aborted) if task is not None and not task.done()]
+                pending = [task for task in (self._request_task, aborted) if not task.done()]
                 for task in pending:
                     task.cancel()
                 if pending:
@@ -686,186 +674,252 @@ class GracefulRestartBridge:
                 if attempt["result"] == "submitted_unverified":
                     c.last_accepted_command = deepcopy(attempt)
                     c.last_accepted_limit = deepcopy(attempt)
-        return self._last_dispatch
+                c._queue_incident_journal()
+        return self._bridge_dispatch
 
-    async def async_prepare_shutdown(self):
-        if not self._enabled() or self._preparing or self._active or self._armed or self._closed:
-            return False
-        self._preparing, self._abort = True, False
-        self._grant_guard = {"valid": True}
-        self._abort_event.clear()
-        self._last_dispatch = None
-        self._bridge_dispatch = None
-        self._prepare_binding = None
-        self._prepare_generation = None
-        self._phase = "preparing"
-        self._prepare_stage = "clock"
-        self._failed_stage = self._error_type = None
-        self._prepare_started_mono = self._prepare_deadline_wall = None
-        self._prepare_finished_mono = None
+    def _managed_proof(self, inp):
+        """Return measured minimum plus a later meter packet and native cap."""
+        policy = self.c.regulator._get_meter_envelope_policy()
+        lease = policy.lease
+        if (self._producer_problem(inp) is not None or lease.cap != BRIDGE_CAP_AMPS
+                or lease.normal_origin is None or _grid_number(inp.grid_l1) > 23):
+            return None
+        regulator = self.c.regulator
+        ev = regulator._controlled_l1_projection(inp)
+        if not regulator._controlled_l1_after(ev, policy.accepted_l1_floor):
+            return None
+        wall, mono = self._clocks(inp)
+        meter = _number(inp.grid_report_ts)
+        raw = _grid_number(inp.grid_l1)
+        if not 1 <= ev.current <= min(7.5, raw + 1) or not 0 <= wall - ev.received_at_ts <= 30:
+            self._managed_minimum = None
+            return None
+        key = regulator._controlled_l1_key(ev), lease.normal_origin
+        pinned = self._managed_minimum
+        if pinned is None or pinned[0] != key or wall - pinned[1] > 30:
+            self._managed_minimum = pinned = (key, ev.received_at_ts, ev.current)
+        physical = pinned[1]
+        limits = getattr(self.c._adapter, "reported_limits", None)
+        receipts = getattr(self.c._adapter, "reported_limit_receipts", None)
+        receipt = _number(receipts[0]) if isinstance(receipts, tuple) and len(receipts) == 3 else None
+        if (meter is None or not physical < meter <= wall
+                or ev.received_at_ts < physical
+                or raw + max(0, BRIDGE_CAP_AMPS - min(pinned[2], ev.current)) > 23
+                or limits != (7, 0, 0) or receipt is None
+                or not lease.normal_origin < receipt <= mono):
+            return None
+        return key, physical, meter
+
+    def _managed_source_problem(self, inp):
+        problem = self._source_problem(inp)
+        if problem is None and _grid_number(inp.grid_l1) > 23:
+            return ElectricalStopCause.GRID_CEILING
+        return problem
+
+    async def async_restart_with_charging(self, request_restart):
+        if self._managed or self._preparing or self._active or self._armed or self._closed:
+            raise BridgeRefused("bridge_restart_already_in_progress")
+        inp = self.c._read_input()
+        problem = self._producer_problem(inp)
+        # A controller tick or pending budget write can finish before the
+        # first proof check. Do not turn those transient states into a stop.
+        if problem not in {None, "bridge_qualification_dispatch_pending",
+                           "bridge_qualification_checkpoint_unverified",
+                           "bridge_qualification_persistence"}:
+            raise BridgeRefused(problem)
+        if self._managed_source_problem(inp) not in {None, ElectricalStopCause.PERSISTENCE}:
+            raise BridgeRefused("bridge_preflight_source_or_load")
+        self._managed = True
+        self._managed_minimum = None
+        self._phase, self._prepare_stage = "preflight", "wait_normal_minimum"
+        self._failed_stage = self._error_type = self._error = None
+        self._managed_commit.clear()
+        self._prepare_started_mono = self._prepare_deadline_wall = self._prepare_finished_mono = None
         self._physical_response_wall = self._grid_response_wall = None
-        possible = False
+        self._bridge_dispatch = None
+        self._abort = False
+        self._abort_event.clear()
+        self._grant_guard = {"valid": True}
+        accepted = False
         try:
             wall, mono = self._clocks()
+            binding, generation = self._binding(), self.c._generation
             self._prepare_started_mono = mono
-            self._prepare_deadline_wall = wall + PREPARE_TIMEOUT_SECONDS
-            self._prepare_stage = "wait_lock"
-            # One fixed 16s preparation budget, then up to 2s controller
-            # cleanup inside the driver's 18s / Core's 20s early stage.
-            async with asyncio.timeout(PREPARE_TIMEOUT_SECONDS):
-                async with self.c._lock:
-                    self._prepare_stage = "qualify"
+            self._prepare_deadline_wall = wall + MANAGED_PREFLIGHT_TIMEOUT_SECONDS
+            async with asyncio.timeout(MANAGED_PREFLIGHT_TIMEOUT_SECONDS):
+                # Ordinary controller writes and all electrical rules remain
+                # active while waiting for the normal finite 7 A reduction.
+                self.c._handle_source_change(None)
+                while True:
                     inp = self.c._read_input()
-                    problem = self._producer_problem(inp)
-                    if problem is not None:
-                        raise BridgeRefused(problem)
-                    self._prepare_stage = "bind_source"
-                    self._prepare_binding = self._binding()
-                    self._prepare_generation = self.c._generation
+                    latest_wall, latest_mono = self._clocks(inp)
+                    if (self._closed or self.c._stopped or generation != self.c._generation
+                            or binding != self._binding() or latest_wall < wall or latest_mono < mono
+                            or abs((latest_wall-wall)-(latest_mono-mono)) > 2
+                            or (inp.status or "").lower() != "charging"
+                            or self._managed_source_problem(inp) not in {None, ElectricalStopCause.PERSISTENCE}):
+                        raise BridgeRefused("bridge_preflight_source_or_load")
+                    proof = self._managed_proof(inp)
+                    expiry = self.c.regulator._get_meter_envelope_policy().lease.expires
+                    if proof is not None and latest_mono + MANAGED_COMMIT_TIMEOUT_SECONDS < expiry:
+                        break
+                    await asyncio.sleep(.1)
+            async with asyncio.timeout(MANAGED_COMMIT_TIMEOUT_SECONDS):
+                async with self.c._lock:
+                    self._preparing = True
+                    self._prepare_binding, self._prepare_generation = binding, generation
+                    inp = self.c._read_input()
+                    proof = self._managed_proof(inp)
+                    if proof is None or generation != self.c._generation or binding != self._binding():
+                        raise BridgeRefused("bridge_preflight_proof_lost")
+                    self._prepare_stage = "save_prepared"
                     wall, mono = self._clocks(inp)
                     self._last_wall, self._last_mono = wall, mono
-                    marker = dict(version=1, state="prepared", nonce=uuid4().hex,
-                        binding=self._binding(), cap=7, ttl_seconds=300,
+                    await self._save(dict(version=2, state="prepared", nonce=uuid4().hex,
+                        binding=binding, cap=7, ttl_seconds=300,
                         prepared_wall=wall, dispatch_wall=None, expires_wall=wall+300,
                         possible_until_wall=wall+316, physical_response_wall=None,
                         grid_response_wall=None, claimed_wall=None, ended_wall=None,
-                        unobserved_seconds=0., revision=uuid4().hex)
-                    self._prepare_stage = "save_prepared"
-                    await self._save(marker)
-                    self._prepare_stage = "dispatch_minimum"
-                    boundary = await self._send(7, 300)
-                    possible = True
-                    physical = grid = physical_floor = None
-                    self._prepare_stage = "wait_physical"
-                    while not self._abort:
-                        latest = self.c._read_input()
-                        if self._source_problem(latest):
-                            raise BridgeRefused("bridge_source_changed_during_prepare")
-                        e = self.c.regulator._controlled_l1_projection(latest)
-                        if (e is not None and 0 < e.current <= 7.5
-                                and self.c.regulator._controlled_l1_after(e, boundary["floor"])):
-                            # Pin the first real post-dispatch response. A
-                            # faster EV publisher must not keep moving the
-                            # independent grid-confirmation target forward.
-                            if physical is None:
-                                physical = e.received_at_ts
-                                physical_floor = {**self.c.regulator._controlled_l1_boundary(latest),
-                                    "wall": physical}
-                                self._physical_response_wall = physical
-                                self._prepare_stage = "wait_grid"
-                        elif (physical is not None and e is not None
-                                and self.c.regulator._controlled_l1_after(e, boundary["floor"])
-                                and e.received_at_ts >= physical):
-                            raise BridgeRefused("bridge_minimum_response_lost")
-                        if physical is not None:
-                            problem = self._minimum_response_problem(latest, physical_floor)
-                            if problem:
-                                raise BridgeRefused(problem)
-                            gt = _number(latest.grid_report_ts)
-                            if grid is None and gt is not None and gt > physical:
-                                grid = gt
-                                self._grid_response_wall = grid
-                            if grid is not None:
-                                if self._minimum_readback_verified(boundary, latest):
-                                    break
-                                self._prepare_stage = "wait_readback"
-                        await asyncio.sleep(.05)
-                    if self._abort or physical is None or grid is None:
-                        raise BridgeRefused("bridge_physical_response_unverified")
-                    self._prepare_stage = "save_acknowledged"
-                    self._marker = await self._save({**self._marker, "state": "acknowledged",
-                        "dispatch_wall": boundary["wall"], "expires_wall": boundary["wall"]+300,
-                        "physical_response_wall": physical, "grid_response_wall": grid})
-                    self._prepare_stage = "final_check"
-                    latest = self.c._read_input()
-                    problem = self._minimum_response_problem(latest, physical_floor)
-                    if problem:
-                        raise BridgeRefused(problem)
-                    if not self._minimum_readback_verified(boundary, latest):
-                        raise BridgeRefused("bridge_minimum_readback_lost")
-                    if self._abort or self._source_problem(latest):
-                        raise BridgeRefused("bridge_final_source_check_failed")
-                    self._armed = True
-                    self._phase = "armed"
-                    self._prepare_stage = "armed"
-                    return True
+                        unobserved_seconds=0., revision=uuid4().hex))
+                    self._prepare_stage = "dispatch_verified_minimum"
+                    boundary = await self._send()
+                    accepted = True
+                    proof = boundary["managed_proof"]
+                    current = self._managed_proof(self.c._read_input())
+                    if current is None or current[0] != proof[0] or self._abort:
+                        raise BridgeRefused("bridge_preflight_proof_lost")
+                    self._physical_response_wall, self._grid_response_wall = proof[1:]
+                    self._managed_ready = (boundary, proof)
+                    self._phase, self._prepare_stage = "preflight_ready", "wait_shutdown"
+
+                async def restart():
+                    try:
+                        await request_restart()
+                    except Exception:
+                        if not self._armed:
+                            raise
+                        _LOGGER.warning("1FuseLoader restart transport closed after handoff was committed")
+
+                request = asyncio.create_task(restart())
+                abort = asyncio.create_task(self._abort_event.wait())
+                commit = asyncio.create_task(self._managed_commit.wait())
+                try:
+                    done, _ = await asyncio.wait({request, abort, commit}, return_when=asyncio.FIRST_COMPLETED)
+                    if not self._armed:
+                        if request in done:
+                            request.result()
+                            await asyncio.wait({abort, commit}, return_when=asyncio.FIRST_COMPLETED)
+                    if not self._armed:
+                        raise BridgeRefused("bridge_managed_shutdown_not_committed")
+                finally:
+                    closing = (abort, commit) if self._armed else (request, abort, commit)
+                    for task in closing:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*closing, return_exceptions=True)
         except BaseException as err:
             self._abort = True
             self._grant_guard["valid"] = False
-            self._armed = False
-            self._phase = "refused"
-            self._failed_stage = self._prepare_stage
-            self._error_type = type(err).__name__
-            self._error = (str(err) if isinstance(err, BridgeRefused)
-                else f"bridge_command_not_sent_{err.code}" if isinstance(err, CommandNotSent)
-                else f"bridge_prepare_timeout_{self._failed_stage}" if isinstance(err, TimeoutError)
-                else f"bridge_prepare_error_{self._failed_stage}")
-            _LOGGER.warning("1FuseLoader restart bridge refused at %s (%s, %s)",
+            self._phase, self._failed_stage, self._error_type = "refused", self._prepare_stage, type(err).__name__
+            self._error = str(err) if isinstance(err, BridgeRefused) else (
+                f"bridge_prepare_timeout_{self._prepare_stage}" if isinstance(err, TimeoutError)
+                else f"bridge_prepare_error_{self._prepare_stage}")
+            _LOGGER.warning("1FuseLoader managed restart refused at %s (%s, %s)",
                 self._failed_stage, self._error, self._error_type)
-            possible = possible or self._bridge_dispatch is not None
-            if self._marker is not None and self._marker["state"] in {"prepared", "acknowledged"}:
-                wall, _ = self._clocks()
-                # Queue a tombstone before attempting another cloud command.
-                # It serializes behind even a timed-out executor write.
-                tombstone = {**self._marker, "state": "aborted", "ended_wall": wall}
-                if self._bridge_dispatch is not None:
-                    tombstone.update(dispatch_wall=self._bridge_dispatch["wall"],
-                        expires_wall=self._bridge_dispatch["wall"]+300)
-                self._queue_save(tombstone)
-            if isinstance(err, asyncio.CancelledError):
-                if possible:
-                    self.c._protective_zero_pending = True
+            if isinstance(err, (BridgeRefused, asyncio.CancelledError)):
                 raise
-            if isinstance(err, CommandNotSent):
-                possible = False
-            latest = self.c._read_input()
-            critical = self._source_problem(latest)
-            known_actuator_fault = (getattr(latest.meter_actuator_health, "valid", False) is not True
-                or getattr(self.c._adapter, "transport_block_reason", None) is not None)
-            actual_critical = bool(
-                critical in {ElectricalStopCause.HARD_LIMIT, ElectricalStopCause.GRID_INVALID,
-                             ElectricalStopCause.UNKNOWN_DELIVERY, ElectricalStopCause.CLOCK_INVALID}
-                or critical == ElectricalStopCause.ACTUATOR_INVALID and known_actuator_fault
-                or critical == ElectricalStopCause.PERSISTENCE and self.c._budget_error
-                   and self.c._budget_error != "overload_budget_save_pending"
-                or self._abort_event.is_set() and critical not in {None, ElectricalStopCause.CONTROL_SOURCE_CHANGED})
-            if possible or actual_critical:
-                self.c._protective_zero_pending = True
-                cause = critical or (ElectricalStopCause.PERSISTENCE if isinstance(err, OSError)
-                    or isinstance(err, BridgeRefused) and "checkpoint" in str(err)
-                    else ElectricalStopCause.UNKNOWN_DELIVERY)
-                # Use the existing observer before recording a stop: a real
-                # high-load interval must survive shutdown as exposure, rather
-                # than becoming fault history beside a false inactive ledger.
-                self.c.regulator.evaluate(latest)
-                raw = _grid_number(latest.grid_l1)
-                wall, gt = map(_number, (latest.wall_now_ts, latest.grid_report_ts))
-                if (getattr(latest.meter_grid_health, "valid", False) is True
-                        and raw is not None and raw > self.c.settings.main_fuse_amps
-                        and wall is not None and gt is not None and 0 <= wall-gt <= 15):
-                    self.c.regulator._overload_exposure_active = True
-                self.c.regulator.meter_envelope_fault(latest, cause)
-                try:
-                    await asyncio.wait_for(self.c._budget_store.async_save(
-                        self.c.regulator.export_overload_state()), .5)
-                except Exception:
-                    self.c._budget_error = ("overload_budget_save_pending"
-                        if self.c._budget_store.verification_pending else "overload_budget_save_failed")
-                try:
-                    await self._send(0, 60, protective=True, timeout=1.)
-                except Exception:
-                    pass
-            if self._background_save is not None:
-                try:
-                    await asyncio.wait_for(asyncio.shield(self._background_save), .5)
-                except Exception:
-                    pass
-            return False
+            raise BridgeRefused(self._error) from err
         finally:
-            self._prepare_finished_mono = _number(self.c.hass.loop.time())
-            self._preparing = False
-            self._prepare_binding = None
-            self._prepare_generation = None
+            try:
+                if not self._armed:
+                    self._abort_managed_attempt(accepted)
+            finally:
+                self._managed_ready = self._managed_minimum = None
+                self._managed = self._preparing = False
+                self._prepare_binding = self._prepare_generation = None
+                self._prepare_finished_mono = _number(self.c.hass.loop.time())
+                if not self.c._stopped:
+                    self.c._handle_source_change(None)
+
+    def _abort_managed_attempt(self, accepted):
+        marker = self._marker
+        if marker is None or marker["version"] != 2 or marker["state"] not in {"prepared", "acknowledged", "aborted"}:
+            return
+        boundary = self._bridge_dispatch
+        try:
+            latest = self.c._read_input()
+            wall, _ = self._clocks(latest)
+            tombstone = {**marker, "state": "not_sent" if boundary is None else "aborted",
+                         "ended_wall": wall}
+            if boundary is not None:
+                tombstone.update(dispatch_wall=boundary["wall"], expires_wall=boundary["wall"]+300)
+                policy = self.c.regulator._get_meter_envelope_policy()
+                key = ("managed_restart", marker["nonce"])
+                expiry = boundary["mono"] + 300
+                policy.possible_positive[key] = (7, expiry)
+                if accepted and boundary["source_id"] == latest.control_source_id:
+                    policy.lease.normal_commands[key] = dict(cap=7, expires=expiry,
+                        source_id=boundary["source_id"])
+            if boundary is not None and (not accepted or self._managed_proof(latest) is None):
+                self.c._protective_zero_pending = True
+            self._queue_save(tombstone)
+        except Exception:
+            if boundary is not None:
+                self.c._protective_zero_pending = True
+
+    async def async_commit_managed_shutdown(self):
+        """A raw shutdown with no live managed request cannot grant a lease."""
+        if self._managed_ready is None or self._abort or self._closed:
+            return False
+        async with self.c._lock:
+            if self._managed_ready is None or self._armed or self._abort or self._closed:
+                return False
+            boundary, proof = self._managed_ready
+            inp = self.c._read_input()
+            wall, mono = self._clocks(inp)
+            current = self._managed_proof(inp)
+            if (self._abort or current is None or current[0] != proof[0]
+                    or wall < boundary["wall"] or mono < boundary["mono"]
+                    or abs((wall-boundary["wall"])-(mono-boundary["mono"])) > 2
+                    or wall-boundary["wall"] >= MANAGED_COMMIT_TIMEOUT_SECONDS):
+                return False
+            self._prepare_stage = "save_acknowledged"
+            marker = {**self._marker, "state": "acknowledged",
+                "dispatch_wall": boundary["wall"], "expires_wall": boundary["wall"]+300,
+                "physical_response_wall": proof[1], "grid_response_wall": proof[2]}
+            if not self._valid_marker(marker, wall):
+                return False
+            await self._save(marker)
+            # A successful store write is not the source revalidation.
+            current = self._managed_proof(self.c._read_input())
+            if self._abort or current is None or current[0] != proof[0]:
+                wall, _ = self._clocks()
+                await self._save({**self._marker, "state": "aborted", "ended_wall": wall},
+                                 expected_nonce=self._marker["nonce"])
+                return False
+            self._armed = True
+            self._phase = self._prepare_stage = "armed"
+            self._managed_commit.set()
+            return True
+
+    async def async_protect_failed_shutdown(self):
+        """Withdraw a submitted bridge on a real fault before closing its adapter."""
+        boundary = self._bridge_dispatch
+        if boundary is None or self._armed or self.c._stopped:
+            return
+        async with self.c._lock:
+            if (self._armed or self.c._stopped
+                    or self.c.hass.loop.time() >= boundary["mono"] + BRIDGE_TTL_SECONDS
+                    or self.c._adapter.control_identity != boundary["adapter_identity"]):
+                return
+            inp = self.c._read_input()
+            cause = self._managed_source_problem(inp)
+            if cause is None and inp.control_source_id != boundary["source_id"]:
+                cause = ElectricalStopCause.CONTROL_SOURCE_CHANGED
+            if cause is not None:
+                self.c._protective_zero_pending = True
+                await self.c._async_tick_locked(
+                    shutdown_protection=(cause, boundary["adapter_identity"]))
 
     async def async_close(self):
         self._closed = True
@@ -897,7 +951,7 @@ class GracefulRestartBridge:
         return dict(restart_bridge_state=self._phase,
             restart_bridge_expires_at_utc=_iso(expiry),
             restart_bridge_remaining_seconds=max(0., expiry-wall) if expiry is not None and wall is not None else 0.,
-            restart_bridge_last_error=self._error, restart_bridge_preparing=self._preparing,
+            restart_bridge_last_error=self._error, restart_bridge_preparing=self._managed or self._preparing,
             restart_bridge_prepare_phase=self._prepare_stage,
             restart_bridge_failed_phase=self._failed_stage,
             restart_bridge_error_type=self._error_type,

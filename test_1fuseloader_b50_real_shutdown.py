@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime, timezone
 import importlib
 import importlib.util
@@ -16,11 +17,12 @@ from pathlib import Path
 import tempfile
 from types import MappingProxyType, SimpleNamespace
 import unittest
+from unittest.mock import AsyncMock, patch
 
 
 HAS_HA = importlib.util.find_spec('homeassistant') is not None
 if os.environ.get('ONEFUSE_REQUIRE_HOMEASSISTANT') and not HAS_HA:
-    raise RuntimeError('CI must install real Home Assistant for B50 shutdown contracts')
+    raise RuntimeError('CI must install real Home Assistant for shutdown contracts')
 
 
 class ImmutableEntryBindingContractTests(unittest.TestCase):
@@ -83,7 +85,9 @@ class SyntheticShutdownAdapter:
         if not on_dispatch():
             raise self.owner.component.CommandNotSent('offline_dispatch_refused')
         self.calls.append(decision)
-        if decision.current_p1 == 7 and decision.ttl_seconds == 300:
+        if (decision.current_p1 == 7 and decision.ttl_seconds == 60
+                and self.owner.minimum_dispatched_at is None):
+            self.owner.minimum_dispatched_at = datetime.now(timezone.utc).timestamp()
             self.owner.packet_tasks.append(asyncio.create_task(self.owner.response_packets()))
         return SimpleNamespace(http_status=200, correlation_ids=())
 
@@ -133,6 +137,7 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.mapping_wall = wall-1000.
         self.response_delay = .02
         self.repeated_current = False
+        self.minimum_dispatched_at = None
         self.packet_stop = asyncio.Event()
         self.packet_tasks = []
         self.controllers = []
@@ -166,7 +171,8 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         controller._configured_control_identity = lambda: self.source
         # Synthetic device acquisition only. The production Store, controller
         # lifecycle, public policy, shutdown job, dispatch and marker are real.
-        controller._read_input = lambda: self.input(hass)
+        controller._read_input = lambda: replace(self.input(hass),
+            restart_preflight=controller._restart_bridge.managed_preflight)
         self.controllers.append(controller)
         return controller
 
@@ -265,6 +271,23 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.hass.async_stop(), 24)
         self.assertIs(self.hass.state, self.CoreState.stopped)
 
+    async def managed_stop(self):
+        stop = None
+
+        async def request_restart():
+            nonlocal stop
+            self.assertIs(self.hass.state, self.CoreState.running)
+            prepared = await self.marker()
+            self.assertEqual(prepared['state'], 'prepared')
+            self.assertEqual(self.adapter.calls[-1].ttl_seconds, 300)
+            stop = asyncio.current_task()
+            await self.core_stop()
+
+        await self.controller.async_restart_with_charging(request_restart)
+        self.assertIsNotNone(stop)
+        await asyncio.wait_for(stop, 24)
+        self.assertIs(self.hass.state, self.CoreState.stopped)
+
     async def assert_quiescent(self, calls):
         self.assertTrue(self.controller._stopped)
         self.assertIsNone(self.controller.unsub_timer)
@@ -285,18 +308,19 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller._restart_bridge._binding(), binding)
         self.assertEqual(self.entry.data['device_id'], 'offline-real-core-device')
 
-    async def test_actual_core_stop_arms_real_marker_and_next_runtime_claims_it_once(self):
+    async def test_managed_core_stop_arms_real_marker_and_next_runtime_claims_it_once(self):
         from homeassistant.core import HomeAssistant
         r = await self.start_healthy()
         before = deepcopy(r.export_overload_state())
-        await self.core_stop()
+        await self.managed_stop()
         self.assertEqual([(d.command, d.current_p1, d.ttl_seconds) for d in self.adapter.calls],
-                         [('set_limit', 7, 300)])
+                         [('set_limit', 7, 60), ('set_limit', 7, 300)])
         marker = await self.marker()
         self.assertEqual(marker['state'], 'acknowledged')
         self.assertEqual(marker['expires_wall'], marker['dispatch_wall']+300)
-        self.assertGreater(marker['physical_response_wall'], marker['dispatch_wall'])
+        self.assertGreater(marker['physical_response_wall'], self.minimum_dispatched_at)
         self.assertGreater(marker['grid_response_wall'], marker['physical_response_wall'])
+        self.assertGreaterEqual(marker['dispatch_wall'], marker['grid_response_wall'])
         self.assertTrue(Path(self.hass.config.path('.storage',
             self.controller._restart_bridge.storage_key)).is_file())
         await self.assert_quiescent(list(self.adapter.calls))
@@ -349,15 +373,16 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_repeated_new_minimum_frames_do_not_move_grid_confirmation_floor(self):
         await self.start_healthy()
         self.repeated_current = True
-        await self.core_stop()
+        await self.managed_stop()
         marker = await self.marker()
         self.assertIsNotNone(marker)
         self.assertEqual(marker['state'], 'acknowledged')
-        self.assertEqual([d.current_p1 for d in self.adapter.calls], [7])
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls],
+                         [(7, 60), (7, 300)])
         self.assertGreater(marker['grid_response_wall'], marker['physical_response_wall'])
         await self.assert_quiescent(list(self.adapter.calls))
 
-    async def test_actual_core_stop_after_normal_decrease_prepares_verified_bridge(self):
+    async def test_managed_core_stop_after_normal_decrease_prepares_verified_bridge(self):
         regulator = await self.start_healthy()
         self.raw = 24.5
         self.grid_wall = datetime.now(timezone.utc).timestamp()
@@ -367,26 +392,95 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.raw = 22.5
         self.grid_wall = datetime.now(timezone.utc).timestamp()
-        await self.core_stop()
+        await self.managed_stop()
 
         self.assertEqual([(decision.current_p1, decision.ttl_seconds)
-                          for decision in self.adapter.calls], [(14, 60), (7, 300)])
+                          for decision in self.adapter.calls], [(14, 60), (7, 60), (7, 300)])
         marker = await self.marker()
         self.assertEqual(marker['state'], 'acknowledged')
-        self.assertGreater(marker['physical_response_wall'], marker['dispatch_wall'])
+        self.assertGreater(marker['physical_response_wall'], self.minimum_dispatched_at)
         self.assertGreater(marker['grid_response_wall'], marker['physical_response_wall'])
         await self.assert_quiescent(list(self.adapter.calls))
 
-    async def test_fourteen_second_real_response_can_arm_within_core_early_stage(self):
+    async def test_seventeen_second_real_response_is_verified_before_core_stops(self):
         await self.start_healthy()
-        self.response_delay = 14.1
-        await self.core_stop()
+        self.response_delay = 17.1
+        await self.managed_stop()
         marker = await self.marker()
         self.assertIsNotNone(marker)
         self.assertEqual(marker['state'], 'acknowledged')
-        self.assertGreaterEqual(marker['physical_response_wall']-marker['dispatch_wall'], 14.)
-        self.assertEqual([d.current_p1 for d in self.adapter.calls], [7])
+        self.assertGreaterEqual(marker['physical_response_wall']-self.minimum_dispatched_at, 17.)
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls],
+                         [(7, 60), (7, 300)])
         await self.assert_quiescent(list(self.adapter.calls))
+
+    async def test_managed_timeout_keeps_real_core_running_without_zero(self):
+        await self.start_healthy()
+        self.response_delay = 5.
+        request_restart = AsyncMock()
+        with patch.object(self.bridge_module, 'MANAGED_PREFLIGHT_TIMEOUT_SECONDS', .35):
+            with self.assertRaises(self.bridge_module.BridgeRefused):
+                await self.controller.async_restart_with_charging(request_restart)
+        request_restart.assert_not_awaited()
+        self.assertIs(self.hass.state, self.CoreState.running)
+        self.assertFalse(self.controller._stopped)
+        self.assertIsNone(await self.marker())
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+
+    async def test_hard_load_during_marker_commit_withdraws_before_adapter_closes(self):
+        await self.start_healthy()
+        bridge = self.controller._restart_bridge
+        write_marker = bridge._write_verified
+        close_adapter = self.adapter.async_close
+        stop = None
+        commands_at_close = []
+
+        async def request_restart():
+            nonlocal stop
+            stop = asyncio.create_task(self.core_stop())
+            # Core owns shutdown once it receives the request. Cancellation
+            # of the action waiting for a handoff must not undo Core's stop.
+            await asyncio.shield(stop)
+
+        async def inject_high_load(snapshot, grant_guard):
+            if snapshot['state'] == 'acknowledged':
+                # The first Core shutdown stage runs before CoreState.stopping.
+                self.assertIsNotNone(stop)
+                self.assertFalse(stop.done())
+                self.assertEqual(self.adapter.calls[-1].ttl_seconds, 300)
+                self.packet_stop.set()
+                self.raw = 39.
+                self.grid_wall = datetime.now(timezone.utc).timestamp()
+                self.controller._handle_source_change(None)
+            return await write_marker(snapshot, grant_guard)
+
+        async def record_close():
+            commands_at_close.extend((d.current_p1, d.ttl_seconds) for d in self.adapter.calls)
+            await close_adapter()
+
+        with (
+            patch.object(bridge, '_write_verified', inject_high_load),
+            patch.object(self.adapter, 'async_close', record_close),
+        ):
+            try:
+                with self.assertRaises(self.bridge_module.BridgeRefused):
+                    await self.controller.async_restart_with_charging(request_restart)
+            finally:
+                if stop is not None:
+                    await asyncio.wait_for(stop, 24)
+
+        self.assertIsNotNone(stop)
+        self.assertEqual(commands_at_close, [(7, 60), (7, 300), (0, 60)])
+        self.assertEqual((await self.marker())['state'], 'aborted')
+        self.assertFalse(bridge.armed)
+        await self.assert_quiescent(list(self.adapter.calls))
+
+    async def test_unmanaged_core_stop_does_not_replace_healthy_charging_lease(self):
+        await self.start_healthy()
+        await self.core_stop()
+        self.assertEqual(self.adapter.calls, [])
+        self.assertIsNone(await self.marker())
+        await self.assert_quiescent([])
 
     async def test_refused_early_job_still_quiesces_before_core_finishes(self):
         from homeassistant.const import EVENT_HOMEASSISTANT_STOP
@@ -404,7 +498,6 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_quiescent([])
 
     async def test_disabled_bridge_still_quiesces_real_core_lifecycle(self):
-        from dataclasses import replace
         from homeassistant.const import EVENT_HOMEASSISTANT_STOP
         from homeassistant.core import callback
         await self.start_healthy()
