@@ -109,6 +109,21 @@ class SettingsTests(unittest.TestCase):
         self.assertIsInstance(options["buffer_amps"], float)
         self.assertIsInstance(options["max_charge_amps"], int)
 
+    def test_managed_restart_accepts_one_or_two_amps_of_normal_buffer(self):
+        profile = {
+            "meter_envelope_control": True,
+            "nominal_import_only_fallback": True,
+            "graceful_restart_bridge": True,
+        }
+        for buffer in (1, 2):
+            with self.subTest(buffer=buffer):
+                options = const.validate_options({**profile, "buffer_amps": buffer})
+                self.assertEqual(options["buffer_amps"], buffer)
+                self.assertTrue(options["graceful_restart_bridge"])
+        for buffer in (0, 0.5, 1.5, 2.5):
+            with self.subTest(buffer=buffer), self.assertRaisesRegex(ValueError, "1 A or 2 A"):
+                const.validate_options({**profile, "buffer_amps": buffer})
+
     def test_experimental_overload_requires_an_explicit_boolean_opt_in(self):
         self.assertFalse(const.validate_options({})["overload_enabled"])
         enabled = const.validate_options({"overload_enabled": True})

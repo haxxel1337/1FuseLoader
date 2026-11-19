@@ -238,6 +238,31 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.async_start()
         return before, marker
 
+    async def boot_with_delayed_claim_readback(self, *, downtime=177.):
+        await self.healthy_session()
+        await self.stage_managed_shutdown()
+        _, original_marker = self.persisted_bridge()
+        self.new_boot(downtime=downtime)
+        release_readback = asyncio.Event()
+        original_load = fixtures.FakeStore.async_load
+
+        async def delay_claim_readback(store):
+            payload = await original_load(store)
+            if 'restart' in store.key and payload and payload['state'] == 'claimed':
+                await release_readback.wait()
+                return await original_load(store)
+            return payload
+
+        bridge = self.controller._restart_bridge
+        with (patch.object(fixtures.FakeStore, 'async_load', delay_claim_readback),
+              patch.dict(bridge.async_restore.__func__.__globals__, {'STORE_TIMEOUT_SECONDS': .05})):
+            try:
+                await self.controller.async_start()
+            except BaseException:
+                release_readback.set()
+                raise
+        return original_marker, release_readback, bridge._gate.pending
+
     async def late_quiet_boot(self, raw=14.1):
         _, marker = await self.prepared_restart(downtime=185., native_wait=True)
         deadline = self.controller.last_decision.normal_continuity_deadline_ts
@@ -615,6 +640,110 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
         self.assertEqual(self.controller.regulator.last_target[0], 0)
         self.assertNotEqual(self.persisted_bridge()[1]['state'], 'claimed')
+
+    async def test_written_claim_can_finish_readback_after_startup_without_zero_or_renewal(self):
+        original, release, task = await self.boot_with_delayed_claim_readback()
+        try:
+            _, claimed = self.persisted_bridge()
+            self.assertEqual(claimed['state'], 'claimed')
+            self.assertEqual(claimed['nonce'], original['nonce'])
+            self.assertEqual(claimed['expires_wall'], original['expires_wall'])
+            self.assertIsNone(self.controller.regulator.last_target)
+            self.assertEqual(self.controller.last_decision.mode, 'restart_bridge_claim_verify_hold')
+            self.assertEqual(self.adapter.calls, [])
+            self.now = 17.5
+            self.grid(14.3)
+            await self.controller.async_tick()
+            self.assertEqual(self.adapter.calls, [])
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+        await self.controller.async_tick()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        self.assertEqual(self.controller._restart_bridge.diagnostics()['restart_bridge_state'],
+                         'ordinary_takeover_complete')
+
+    async def test_real_grid_fault_stops_immediately_while_claim_readback_is_pending(self):
+        _, release, task = await self.boot_with_delayed_claim_readback()
+        try:
+            self.assertEqual(self.adapter.calls, [])
+            self.now = 1.
+            self.grid(39.)
+            await self.controller.async_tick()
+            self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+            self.assertEqual(self.controller.last_decision.meter_zero_cause, 'hard_limit')
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+        await self.controller.async_tick()
+        self.assertFalse(any(d.current_p1 > 0 for d in self.adapter.calls))
+
+    async def test_claim_readback_hold_has_own_fixed_short_deadline(self):
+        _, release, task = await self.boot_with_delayed_claim_readback()
+        try:
+            deadline = self.controller.last_decision.normal_continuity_deadline_ts
+            self.assertEqual(deadline, 30.)
+            self.assertTrue(any(abs(timer.due-deadline) < 1e-6 for timer in self.active_timers()))
+            self.now = deadline - .1
+            self.grid(14.)
+            await self.controller.async_tick()
+            self.assertEqual(self.controller.last_decision.normal_continuity_deadline_ts, deadline)
+            self.assertEqual(self.adapter.calls, [])
+            self.now = deadline
+            await self.controller.async_tick()
+            self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+            self.assertEqual(self.controller.last_decision.meter_zero_cause, 'persistence')
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+        self.assertEqual(self.controller._restart_bridge.diagnostics()['restart_bridge_last_error'],
+                         'bridge_claim_verification_timeout')
+
+    async def test_claim_readback_hold_expires_at_original_charger_deadline_if_sooner(self):
+        original, release, task = await self.boot_with_delayed_claim_readback(downtime=295.)
+        try:
+            deadline = self.controller.last_decision.normal_continuity_deadline_ts
+            self.assertLess(deadline, 30.)
+            self.assertAlmostEqual(self.wall(deadline).timestamp(), original['expires_wall'])
+            self.now = deadline
+            await self.controller.async_tick()
+            self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+            self.assertEqual(self.controller.last_decision.meter_zero_cause, 'lease_expired')
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+
+    async def test_pending_claim_rejects_a_different_revision_for_same_marker(self):
+        _, release, task = await self.boot_with_delayed_claim_readback()
+        try:
+            key, claimed = self.persisted_bridge()
+            self.hass._test_store_disk[key] = {**claimed, 'revision': 'f' * 32}
+        finally:
+            release.set()
+            with self.assertRaisesRegex(self.bridge_refused, 'bridge_checkpoint_not_verified'):
+                await asyncio.wait_for(asyncio.shield(task), 1.)
+        self.now = 17.5
+        self.grid(14.3)
+        await self.controller.async_tick()
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+        self.assertEqual(self.controller.last_decision.meter_zero_cause, 'persistence')
+        bridge = self.controller._restart_bridge
+        self.assertEqual(bridge.diagnostics()['restart_bridge_last_error'], 'bridge_checkpoint_not_verified')
+        await asyncio.wait_for(asyncio.shield(bridge._background_save), 1.)
+        self.assertEqual(self.persisted_bridge()[1]['revision'], 'f' * 32)
+
+    async def test_restart_takeover_keeps_two_amp_reserve_with_one_amp_normal_buffer(self):
+        self.configure(buffer_amps=1.)
+        await self.prepared_restart()
+        self.now = 1.
+        self.grid(17.)
+        await self.controller.async_tick()
+        # With no post-claim EV sample, grid plus the full 7 A would be 24 A.
+        self.assertEqual(self.adapter.calls, [])
+        self.now = 2.
+        self.grid(16.)
+        await self.controller.async_tick()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
 
     async def test_local_pre_sdk_refusal_does_not_send_an_unnecessary_zero(self):
         await self.healthy_session()

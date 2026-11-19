@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0b54
+
+- Reconcile a delayed durable restart claim within the original finite
+  7 A allowance. Take over only after the same claim is verified and preserve
+  the existing load and source protection throughout.
+- Support either 1 A or 2 A of normal buffer with the 25 A managed restart
+  profile. Restart qualification and the handoff keep the 23 A ceiling.
+
 ## 0.4.0b53
 
 - Keep the verified 7 A handoff through post-start Easee reporting

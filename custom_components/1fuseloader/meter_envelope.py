@@ -1043,7 +1043,7 @@ class MeterEnvelopePolicy:
             house = max(0., raw - min(7., ev.current))
             basis = "eligible_mapped_l1_then_meter"
             reason = "Fresh mapped Easee current and a later grid sample leave room for the existing 7 A."
-        if house + 7. > s.main_fuse_amps - s.buffer_amps:
+        if house + 7. > s.main_fuse_amps - max(2., s.buffer_amps):
             return self.decision(r, inp, "meter_wait", 0)
         return replace(self.decision(r, inp, "meter_normal", 7, command="set_limit",
             house=house, basis=basis, reason=reason),

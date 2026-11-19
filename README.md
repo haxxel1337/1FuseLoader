@@ -50,6 +50,18 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Restart claim verification and normal buffer (b54)
+
+If saving and reading back the new runtime's one-use claim takes longer than
+the initial storage wait, the already accepted 7 A offer can remain during a
+bounded check of that exact claim. The original offer expiry and source and
+load protection still apply. The controller needs a verified claim and fresh
+load evidence before it can issue an ordinary offer.
+
+The managed restart works with a normal buffer of 1 A or 2 A on the 25 A
+profile. With 1 A selected, ordinary verified load can reach 24 A, while
+restart qualification and the handoff to ordinary control use 23 A.
+
 ### Restart takeover and rolling recovery (b53)
 
 The claimed 7 A handoff keeps its original deadline while Home Assistant
@@ -155,8 +167,8 @@ These are software operating limits, not a fuse thermal model.
 ### Finite continuation during graceful shutdown (b48, explicit opt-in)
 
 `graceful_restart_bridge` is off by default. With the selected meter-led,
-verified import-only 25 A fuse / 2 A buffer profile, it can prepare at most
-7 A on L1 for at most five minutes before an orderly Home Assistant shutdown.
+verified import-only 25 A profile, it can prepare at most 7 A on L1 for
+at most five minutes before an orderly Home Assistant shutdown.
 It also runs for a graceful power-off: HA's early shutdown hook cannot reliably
 distinguish those intentions. Ordinary integration reloads and unexpected
 crashes do not prepare a bridge.
