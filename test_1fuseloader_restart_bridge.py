@@ -54,6 +54,7 @@ class RestartBridgeStoreTests(unittest.IsolatedAsyncioTestCase):
             _configured_control_identity=lambda:'source-A', _electrical_selection=lambda:('L1','sensor.raw'),
             _l1_source_config=None, _l1_source=None, _l1_source_error=None,
             _protective_zero_pending=False, _budget_error=None,
+            _budget_restored_from_disk=True, _budget_restore_task=None,
             _budget_store=SimpleNamespace(verification_pending=False),
             regulator=logic.OneFuseRegulator(self.settings),
             _read_input=lambda:self.input)

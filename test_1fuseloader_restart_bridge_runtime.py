@@ -235,8 +235,18 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.stage_managed_shutdown()
         _, marker = self.persisted_bridge()
         self.new_boot(downtime=downtime, native_wait=native_wait)
-        await self.controller.async_start()
+        await self.start_boot_with_readable_exposure()
         return before, marker
+
+    async def start_boot_with_readable_exposure(self):
+        await self.controller.async_start()
+        # Unlike HA's periodic loop, a synthetic clock can run hundreds of
+        # ticks without yielding to the in-memory Store task. Cases using a
+        # normal readable ledger let that exact task finish before moving it.
+        restore = self.controller._budget_restore_task
+        if restore is not None:
+            await asyncio.wait_for(asyncio.shield(restore), 1.)
+            await self.controller.async_tick()
 
     async def boot_with_delayed_claim_readback(self, *, downtime=177.):
         await self.healthy_session()
