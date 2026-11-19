@@ -1,6 +1,7 @@
 """Automatic operational cycles using synthetic clocks, never thermal ratings."""
 from copy import deepcopy
 from dataclasses import replace
+import json
 import unittest
 
 import test_1fuseloader_trial_epochs as fixtures
@@ -76,9 +77,9 @@ class AutomaticCycleTests(unittest.TestCase):
         self.cool(r, 45, 60)
         for now in (65., 70., 75.):
             self.observe(r, now, 22., 0., gt=60., status="disconnected")
-        self.assertLess(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 1800.)
+        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 15.)
 
-    def test_short_source_fault_breaks_qualification_and_cooling(self):
+    def test_short_source_fault_breaks_current_span_but_preserves_prior_cooling(self):
         r = self.ready()
         self.high_run(r, 10, 25)
         self.observe(r, 30., data_valid=False, data_error="synthetic_fault")
@@ -87,7 +88,7 @@ class AutomaticCycleTests(unittest.TestCase):
         self.cool(r, 40, 60)
         self.observe(r, 65., 22., 0., status="disconnected", data_valid=False)
         self.observe(r, 70., 22., 0., status="disconnected")
-        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 0.)
+        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 20.)
 
     def test_grid_gap_and_rebind_cannot_count_as_continuity(self):
         r = self.ready()
@@ -99,16 +100,17 @@ class AutomaticCycleTests(unittest.TestCase):
         self.assertEqual(r.automatic_cycle_diagnostics()["automatic_qualification_seconds"], 0.)
         self.assertFalse(r.automatic_cycle_requires_checkpoint)
 
-    def test_strict_twenty_three_boundary_and_full_thirty_minutes_rearms_only_own_budget(self):
+    def test_strict_twenty_three_boundary_and_fifteen_rolling_minutes_rearm_only_own_budget(self):
         r = self.ready()
         self.high_run(r)
-        self.cool(r, 45, 940)
-        self.observe(r, 945., 23., 0., status="disconnected")
-        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 0.)
+        self.cool(r, 45, 640)
+        self.observe(r, 645., 23., 0., status="disconnected")
+        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 595.)
         before = r.export_overload_state()
-        self.cool(r, 950, 2745)
+        self.cool(r, 650, 950)
+        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 895.)
         self.assertGreater(r.effective_overload_used_seconds, 0.)
-        self.observe(r, 2750., 22.9, 0., status="disconnected")
+        self.observe(r, 955., 22.9, 0., status="disconnected")
         after = r.export_overload_state()
         self.assertEqual(r.effective_overload_used_seconds, 0.)
         self.assertEqual(after["automatic_cycle"]["state"], "ready")
@@ -125,7 +127,7 @@ class AutomaticCycleTests(unittest.TestCase):
             self.observe(r, float(at), 27., 0., status="disconnected")
         self.assertGreaterEqual(r.effective_overload_used_seconds, 1800.)
         self.assertEqual(r.effective_overload_failure_reason, "cumulative_budget_exhausted")
-        self.cool(r, 1820, 3620)
+        self.cool(r, 1820, 2720)
         self.assertEqual(r.effective_overload_used_seconds, 0.)
         self.assertEqual(r.effective_overload_failure_reason, "automatic_cycle_not_admitted")
 
@@ -140,6 +142,72 @@ class AutomaticCycleTests(unittest.TestCase):
         self.assertEqual(restored.effective_overload_failure_reason, "interrupted_automatic_cycle")
         self.assertEqual(restored.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 0.)
         self.assertEqual(restored.automatic_cycle_diagnostics()["automatic_qualification_seconds"], 0.)
+
+    def test_persisted_window_survives_reload_without_crediting_unobserved_time(self):
+        r = self.ready()
+        self.high_run(r)
+        self.cool(r, 45, 645)
+        state = json.loads(json.dumps(r.export_overload_state()))
+        restored = self.helper.regulator(peak_only_response=True, automatic_overload_cycles=True)
+        self.assertTrue(restored.import_overload_state(state, elapsed_seconds=20.))
+        self.assertEqual(restored.effective_overload_used_seconds, state["automatic_cycle"]["used_seconds"])
+        self.assertEqual(self.cool(restored, 665, 665)["automatic_cooling_seconds"], 600.)
+        self.assertEqual(self.cool(restored, 670, 960)["automatic_cooling_seconds"], 895.)
+        self.assertGreater(restored.effective_overload_used_seconds, 0.)
+        self.cool(restored, 965, 965)
+        after = restored.export_overload_state()
+        self.assertEqual(after["automatic_cycle"]["cycle_id"], state["automatic_cycle"]["cycle_id"]+1)
+        self.assertEqual(after["automatic_cycle"]["used_seconds"], 0.)
+        self.assertEqual(after["used_seconds"], state["used_seconds"])
+        self.assertEqual(after["failure_reason"], state["failure_reason"])
+
+    def test_window_expires_partial_intervals_while_load_is_warm(self):
+        r = self.ready()
+        self.high_run(r)
+        self.assertEqual(self.cool(r, 45, 495)["automatic_cooling_seconds"], 450.)
+        self.observe(r, 500., 23., 0., status="disconnected")
+        # The window clips the old interval [45, 495] at 170.
+        self.assertEqual(self.observe(r, 2870., 23., 0., status="disconnected")
+            ["automatic_cooling_seconds"], 325.)
+        self.assertEqual(self.cool(r, 3195, 3200)["automatic_cooling_seconds"], 5.)
+        self.assertGreater(r.effective_overload_used_seconds, 0.)
+
+    def test_cannot_prebank_cooling_before_any_budget_has_been_used(self):
+        r = self.ready()
+        self.assertEqual(self.cool(r, 5, 905)["automatic_cooling_seconds"], 0.)
+        self.high_run(r, 910, 940)
+        self.assertEqual(self.cool(r, 945, 950)["automatic_cooling_seconds"], 5.)
+        self.assertGreater(r.effective_overload_used_seconds, 0.)
+
+    def test_future_or_malformed_proof_never_refunds_persisted_budget(self):
+        r = self.ready()
+        self.high_run(r)
+        self.cool(r, 45, 95)
+        state = r.export_overload_state()
+        for reject in ("future", "malformed", "another_cycle"):
+            with self.subTest(reject=reject):
+                snapshot = deepcopy(state)
+                proof = snapshot["automatic_cycle"]["recovery_window"]
+                if reject == "future":
+                    proof["intervals"] = [[fixtures.EPOCH+500., fixtures.EPOCH+550.]]
+                if reject == "malformed":
+                    proof["intervals"] = [[True, 10.]]
+                if reject == "another_cycle":
+                    proof["cycle_id"] += 1
+                restored = self.helper.regulator(
+                    peak_only_response=True, automatic_overload_cycles=True)
+                self.assertTrue(restored.import_overload_state(snapshot))
+                self.assertEqual(self.cool(restored, 100, 100)["automatic_cooling_seconds"], 0.)
+                self.assertEqual(restored.effective_overload_used_seconds, state["automatic_cycle"]["used_seconds"])
+
+    def test_wall_clock_correction_cannot_move_old_cooling_into_a_new_window(self):
+        r = self.ready()
+        self.high_run(r)
+        self.assertEqual(self.cool(r, 45, 95)["automatic_cooling_seconds"], 50.)
+        diag = self.observe(r, 100., 22.9, 0., status="disconnected",
+            wall_now_ts=fixtures.EPOCH+80., grid_report_ts=fixtures.EPOCH+80.)
+        self.assertEqual(diag["automatic_cooling_seconds"], 0.)
+        self.assertGreater(r.effective_overload_used_seconds, 0.)
 
     def test_reset_and_settings_toggle_never_refund_or_keep_continuity(self):
         r = self.ready()
@@ -235,10 +303,10 @@ class AutomaticCycleTests(unittest.TestCase):
         self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cycle_state"], "active")
         self.assertEqual(r.effective_overload_used_seconds, 30.)
         self.observe(r, 65., 22., 0., gt=55., status="disconnected")
-        self.cool(r, 70, 1855)
+        self.cool(r, 70, 955)
         self.assertGreater(r.effective_overload_used_seconds, 0.)
-        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 1790.)
-        self.cool(r, 1860, 1865)
+        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 890.)
+        self.cool(r, 960, 965)
         self.assertEqual(r.effective_overload_used_seconds, 0.)
 
     def test_idle_cold_restart_can_cool_same_persisted_source_without_charging_authority(self):
@@ -249,7 +317,7 @@ class AutomaticCycleTests(unittest.TestCase):
         self.assertTrue(restored.import_overload_state(state))
         self.assertIsNone(restored.last_target)
         self.assertIsNone(restored._accepted_control_source_id)
-        self.cool(restored, 100, 1900)
+        self.cool(restored, 100, 1000)
         self.assertEqual(restored.effective_overload_used_seconds, 0.)
         self.assertEqual(restored.effective_overload_failure_reason, "automatic_cycle_not_admitted")
         self.assertIsNone(restored.last_target)

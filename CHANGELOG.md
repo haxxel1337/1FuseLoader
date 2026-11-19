@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0b53
+
+- Keep the verified 7 A handoff through post-start Easee reporting
+  delays for the original finite lifetime. The ordinary controller can
+  take over at 7 A once fresh evidence supports the full offer within
+  the normal buffer. Source faults, hard grid limits and expiry keep
+  their protective behavior.
+- Re-arm the automatic overload budget after 900 seconds proved below
+  23 A in a rolling 2,700-second window. Higher readings and unobserved
+  time earn no credit. Preserve verified recent spans and existing usage
+  and fault history in storage. Publish the time and goal for dashboards.
+
 ## 0.4.0b52
 
 - Add the administrator action `1fuseloader.restart_with_charging`. It

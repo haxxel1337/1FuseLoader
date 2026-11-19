@@ -16,7 +16,7 @@ from math import isfinite
 import re
 from uuid import uuid4
 
-from .logic import ElectricalStopCause, RegulatorDecision
+from .logic import ElectricalStopCause, RegulatorDecision, RestartBridgeContext
 from .easee_adapter import CommandNotSent
 
 BRIDGE_CAP_AMPS = 7
@@ -402,6 +402,16 @@ class GracefulRestartBridge:
             and sample.receipt_ts is None and sample.sample_ts is None
             and inp.grid_l1 is None and inp.grid_report_ts is None)
 
+    def _bridge_readback_changed(self, mono):
+        # Cached startup values are not fresh evidence for or against the
+        # pre-restart limit. A new native observation which disagrees is.
+        limits = getattr(self.c._adapter, "reported_limits", None)
+        receipts = getattr(self.c._adapter, "reported_limit_receipts", None)
+        if not isinstance(limits, tuple) or not isinstance(receipts, tuple):
+            return False
+        return any(observed != expected and (at := _number(receipt)) is not None and 0 <= at <= mono
+                   for observed, receipt, expected in zip(limits, receipts, (BRIDGE_CAP_AMPS, 0, 0)))
+
     def _decision(self, inp, *, mode, cap=7, command=None, ttl=300):
         raw = _grid_number(inp.grid_l1)
         return RegulatorDecision(mode=mode, reason=(
@@ -419,6 +429,8 @@ class GracefulRestartBridge:
     def _withdraw(self, reason):
         self._active = False
         self._error, self._phase = reason, "withdrawn"
+        if self._planner is not None:
+            self._planner._get_meter_envelope_policy().restart_bridge_context = None
         if self._marker is not None and self._marker["state"] == "claimed":
             try:
                 wall, _ = self._clocks()
@@ -473,6 +485,9 @@ class GracefulRestartBridge:
         if problem:
             self._withdraw("bridge_source_or_control_invalid")
             return self.c.regulator.meter_envelope_fault(inp, problem)
+        if self._bridge_readback_changed(mono):
+            self._withdraw("bridge_limit_readback_changed")
+            return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.UNKNOWN_DELIVERY)
         if self._missing_first_sample(inp) or self._native_initial_wait(inp):
             self._phase = "bootstrap_wait"
             return self._decision(inp, mode="restart_bridge_bootstrap_hold")
@@ -487,6 +502,8 @@ class GracefulRestartBridge:
             p.cold_upper_until = None
             p.upper = 7.
             p.possible_positive[("restart_bridge", self._marker["nonce"])] = (7, self._expires_mono)
+            p.restart_bridge_context = RestartBridgeContext(inp.control_source_id, self._marker["claimed_wall"],
+                self._marker["expires_wall"], self._expires_mono)
         decision = self._planner.evaluate(inp)
         if decision.meter_zero_cause is not None:
             self._withdraw("bridge_normal_protection")
@@ -509,6 +526,7 @@ class GracefulRestartBridge:
             wall, _ = self._clocks()
             self._active = False
             self._phase = "ordinary_takeover_complete"
+            self.c.regulator._get_meter_envelope_policy().restart_bridge_context = None
             self._queue_save({**self._marker, "state": "completed", "ended_wall": wall,
                 "unobserved_seconds": min(316., max(0., wall-self._marker["dispatch_wall"]))})
         elif not accepted:

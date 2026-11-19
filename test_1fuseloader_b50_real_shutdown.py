@@ -49,7 +49,9 @@ class SyntheticShutdownAdapter:
     control_block_reason = None
     telemetry_block_reason = None
     transport_block_reason = None
+    offline_fallback_block_reason = None
     overload_block_reason = None
+    product_data_quiet = False
     offline_limits_verified_zero = True
     async_read_current_snapshot = None
     reported_limits = None
@@ -172,7 +174,8 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         # Synthetic device acquisition only. The production Store, controller
         # lifecycle, public policy, shutdown job, dispatch and marker are real.
         controller._read_input = lambda: replace(self.input(hass),
-            restart_preflight=controller._restart_bridge.managed_preflight)
+            restart_preflight=controller._restart_bridge.managed_preflight,
+            meter_product_data_quiet=adapter.product_data_quiet)
         self.controllers.append(controller)
         return controller
 
@@ -329,6 +332,7 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         next_hass.set_state(self.CoreState.running)
         self.extra_hass.append(next_hass)
         next_adapter = SyntheticShutdownAdapter(self)
+        next_adapter.product_data_quiet = True
         next_controller = self.make_controller(next_hass, next_adapter)
         await next_controller.async_start()
         claimed = await self.marker(next_hass)
@@ -341,20 +345,20 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(replay.diagnostics()['restart_bridge_state'], 'not_reusable')
         self.assertFalse(replay._active)
         await replay.async_close()
-        # Use a valid 15s test setting, not a forged policy clock. All Core,
-        # Store and asyncio timers below are real; fresh independent samples
-        # continue until an ordinary request actually reaches the SDK boundary.
-        until = next_hass.loop.time()+18.
-        while not next_adapter.calls and next_hass.loop.time() < until:
-            self.sequence += 1
-            self.current_wall = datetime.now(timezone.utc).timestamp()
-            self.grid_wall = datetime.now(timezone.utc).timestamp()
-            await next_controller.async_tick()
-            await asyncio.sleep(.1)
-        self.assertTrue(next_adapter.calls, next_controller._restart_bridge.diagnostics())
-        self.assertTrue(all(0 < d.current_p1 <= 16 and d.ttl_seconds == 60
-                            for d in next_adapter.calls))
-        offered = next_adapter.calls[-1].current_p1
+        self.raw = 14.1
+        self.grid_wall = datetime.now(timezone.utc).timestamp()
+        await next_controller.async_tick()
+        self.assertEqual(next_adapter.calls, [])
+        self.assertEqual(next_controller.last_decision.current_p1, 7)
+        self.assertIsNone(next_controller.regulator.last_target)
+        self.assertEqual((await self.marker(next_hass))['expires_wall'], marker['expires_wall'])
+        # A fresh product heartbeat can arrive without a changing EV value.
+        # Grid headroom for all 7 A proves ordinary takeover without that event.
+        self.assertLess(self.current_wall, claimed['claimed_wall'])
+        next_adapter.product_data_quiet = False
+        await next_controller.async_tick()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in next_adapter.calls], [(7, 60)])
+        offered = 7
         self.current = offered+.1
         self.sequence += 1
         self.current_wall = datetime.now(timezone.utc).timestamp()
