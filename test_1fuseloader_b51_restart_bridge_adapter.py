@@ -8,7 +8,7 @@ import asyncio
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import test_1fuseloader_b44_quiet_safety as fixture
 import test_1fuseloader_runtime as runtime_fixture
@@ -29,8 +29,10 @@ class RestartBridgeAdapterTests(unittest.IsolatedAsyncioTestCase):
         # The historical controller and adapter fixtures load the underlying
         # modules with different names. Keep typed admission refusal identical
         # to the single production import at the bridge boundary.
+        self.bridge_globals = self.bridge.async_restart_with_charging.__func__.__globals__
+        self.refusal = self.bridge_globals['BridgeRefused']
         self.command_not_sent = patch.dict(
-            self.bridge.async_prepare_shutdown.__func__.__globals__,
+            self.bridge_globals,
             {'CommandNotSent': self.p.adapter_module.CommandNotSent},
         )
         self.command_not_sent.start()
@@ -105,7 +107,6 @@ class RestartBridgeAdapterTests(unittest.IsolatedAsyncioTestCase):
         p = self.p
         # A successful API ACK or its native limit readback alone cannot arm
         # the handoff. Actual current and a later grid sample are separate.
-        await asyncio.sleep(.02)
         self.assertFalse(self.bridge.armed)
         at = p.now + 1.
         await p.packet(at, {182: 7.08, 183: 7.08, 114: 7.}, drain=False)
@@ -113,27 +114,47 @@ class RestartBridgeAdapterTests(unittest.IsolatedAsyncioTestCase):
         p.now = at + 1.
         p.grid(16.5, p.now)
 
-    async def schedule_response(self, row):
-        if row['cap'] == 7 and row['ttl'] == 300:
-            self.packet_tasks.append(asyncio.create_task(self.publish_response()))
+    async def wait_for_phase(self, phase):
+        async with asyncio.timeout(2):
+            while self.bridge.diagnostics()['restart_bridge_prepare_phase'] != phase:
+                await asyncio.sleep(.01)
+
+    async def begin_managed(self, restart):
+        p = self.p
+        request = asyncio.create_task(p.controller.async_restart_with_charging(restart))
+        self.packet_tasks.append(request)
+        await self.wait_for_phase('wait_normal_minimum')
+        await p.pump()
+        return request
+
+    async def commit_shutdown(self):
+        self.assertTrue(await self.p.controller._async_prepare_shutdown_bridge(), self.bridge.diagnostics())
+
+    async def verify_real_minimum(self):
+        p = self.p
+        self.assertEqual([(row['phases'], row['ttl']) for row in p.sdk_calls], [((7, 0, 0), 60)])
+        await self.publish_response()
 
     async def test_recent_14_to_13_can_bridge_at_ordinary_rate_capacity(self):
         r = await self.prepare_recent_normal_decrease()
         p = self.p
         prior = r._get_meter_envelope_policy().possible_positive.copy()
-        self.saturate(p.adapter_module.NONZERO_ADMISSION_LIMIT)
-        p.sdk_hook = self.schedule_response
-
-        self.assertTrue(await self.bridge.async_prepare_shutdown(), self.bridge.diagnostics())
-        await asyncio.gather(*self.packet_tasks)
-
-        self.assertEqual([(row['phases'], row['ttl']) for row in p.sdk_calls], [((7, 0, 0), 300)])
+        self.saturate(p.adapter_module.NONZERO_ADMISSION_LIMIT - 2)
+        restart = AsyncMock(side_effect=self.commit_shutdown)
+        request = await self.begin_managed(restart)
+        await self.verify_real_minimum()
+        await asyncio.wait_for(request, 3)
+        restart.assert_awaited_once()
+        self.assertEqual([(row['phases'], row['ttl']) for row in p.sdk_calls],
+                         [((7, 0, 0), 60), ((7, 0, 0), 300)])
+        self.assertEqual(len(p.adapter._request_starts), p.adapter_module.NONZERO_ADMISSION_LIMIT)
         marker = self.bridge._marker
         self.assertEqual(marker['state'], 'acknowledged')
         self.assertEqual(marker['expires_wall'], marker['dispatch_wall'] + 300)
-        self.assertGreater(marker['physical_response_wall'], marker['dispatch_wall'])
         self.assertGreater(marker['grid_response_wall'], marker['physical_response_wall'])
-        self.assertEqual(r._get_meter_envelope_policy().possible_positive, prior)
+        self.assertLessEqual(marker['grid_response_wall'], marker['dispatch_wall'])
+        outstanding = r._get_meter_envelope_policy().possible_positive
+        self.assertTrue(all(outstanding.get(key) == value for key, value in prior.items()))
         self.assertFalse(p.physical_interruptions)
         p.sdk_charger.pause.assert_not_awaited()
         p.sdk_charger.resume.assert_not_awaited()
@@ -143,41 +164,62 @@ class RestartBridgeAdapterTests(unittest.IsolatedAsyncioTestCase):
         p = self.p
         self.saturate(p.adapter_module.PROTECTIVE_NONZERO_ADMISSION_LIMIT)
 
-        self.assertFalse(await self.bridge.async_prepare_shutdown())
+        restart = AsyncMock()
+        with patch.dict(self.bridge_globals, {'MANAGED_PREFLIGHT_TIMEOUT_SECONDS': .35}):
+            request = await self.begin_managed(restart)
+            with self.assertRaisesRegex(self.refusal, 'bridge_prepare_timeout_wait_normal_minimum'):
+                await asyncio.wait_for(request, 3)
 
         self.assertEqual(p.sdk_calls, [])
         self.assertEqual(len(p.adapter._request_starts), p.adapter_module.PROTECTIVE_NONZERO_ADMISSION_LIMIT)
-        self.assertEqual(self.bridge.diagnostics()['restart_bridge_last_error'],
-                         'bridge_command_not_sent_positive_rate_capacity_exhausted')
+        self.assertTrue(any(event['kind'] == 'known_not_sent'
+                            and event['code'] == 'positive_rate_capacity_exhausted'
+                            and event['target_p1'] == 7 for event in p.controller._transport_events))
+        restart.assert_not_awaited()
+        self.assertFalse(p.controller._stopped)
+        self.assertFalse(self.bridge.armed)
+
+    async def test_same_cap_handoff_cannot_use_reserve_that_allowed_real_reduction(self):
+        await self.prepare_recent_normal_decrease()
+        p = self.p
+        self.saturate(p.adapter_module.NONZERO_ADMISSION_LIMIT)
+        restart = AsyncMock()
+        request = await self.begin_managed(restart)
+        await self.verify_real_minimum()
+        with self.assertRaises(self.refusal) as caught:
+            await asyncio.wait_for(request, 3)
+        self.assertEqual(caught.exception.__cause__.code, 'positive_rate_capacity_exhausted')
+        self.assertEqual([(row['cap'], row['ttl']) for row in p.sdk_calls], [(7, 60)])
+        self.assertEqual(len(p.adapter._request_starts), p.adapter_module.NONZERO_ADMISSION_LIMIT + 1)
+        restart.assert_not_awaited()
+        self.assertFalse(p.controller._stopped)
         self.assertFalse(self.bridge.armed)
 
     async def test_queued_bridge_refuses_grid_change_before_sdk(self):
         await self.prepare_recent_normal_decrease()
         p = self.p
-        self.saturate(p.adapter_module.NONZERO_ADMISSION_LIMIT)
+        self.saturate(p.adapter_module.NONZERO_ADMISSION_LIMIT - 2)
+        restart = AsyncMock()
+        request = await self.begin_managed(restart)
         async with p.adapter._request_lock:
-            task = asyncio.create_task(self.bridge.async_prepare_shutdown())
-            self.packet_tasks.append(task)
-            for _ in range(100):
-                if self.bridge.diagnostics()['restart_bridge_prepare_phase'] == 'dispatch_minimum':
-                    break
-                await asyncio.sleep(0)
-            self.assertEqual(self.bridge.diagnostics()['restart_bridge_prepare_phase'], 'dispatch_minimum')
+            await self.verify_real_minimum()
+            await self.wait_for_phase('dispatch_verified_minimum')
             await asyncio.sleep(0)
             p.now += 1.
             p.grid(23.1, p.now)
 
-        self.assertFalse(await task)
-        self.assertEqual(p.sdk_calls, [])
-        self.assertEqual(len(p.adapter._request_starts), p.adapter_module.NONZERO_ADMISSION_LIMIT)
-        self.assertEqual(self.bridge.diagnostics()['restart_bridge_last_error'],
-                         'bridge_qualification_grid_ceiling')
+        with self.assertRaisesRegex(self.refusal, 'bridge_(qualification_grid_ceiling|preflight_proof_lost)'):
+            await asyncio.wait_for(request, 3)
+        self.assertEqual([(row['cap'], row['ttl']) for row in p.sdk_calls], [(7, 60)])
+        self.assertEqual(len(p.adapter._request_starts), p.adapter_module.NONZERO_ADMISSION_LIMIT - 1)
+        restart.assert_not_awaited()
+        self.assertFalse(p.controller._stopped)
         self.assertFalse(self.bridge.armed)
 
     async def test_cached_seven_is_not_native_readback_after_dispatch(self):
         await self.prepare_recent_normal_decrease()
         p = self.p
-        p.sdk_hook = self.schedule_response
+        restart = AsyncMock()
 
         async def cached_only(p1, p2, p3, minutes):
             # The SDK cache can show 7 after an HTTP ACK without an observed
@@ -189,17 +231,22 @@ class RestartBridgeAdapterTests(unittest.IsolatedAsyncioTestCase):
             return response
 
         p.sdk_circuit.set_dynamic_current.side_effect = cached_only
-        module = self.bridge.async_prepare_shutdown.__func__.__globals__
-        with patch.dict(module, {'PREPARE_TIMEOUT_SECONDS': .35}):
-            self.assertFalse(await self.bridge.async_prepare_shutdown())
-        await asyncio.gather(*self.packet_tasks)
+        with patch.dict(self.bridge_globals, {'MANAGED_PREFLIGHT_TIMEOUT_SECONDS': .35}):
+            request = await self.begin_managed(restart)
+            await self.verify_real_minimum()
+            self.assertEqual(p.product.state['dynamicCircuitCurrentP1'], 7)
+            self.assertIsNone(p.adapter.reported_limit_receipts[0])
+            inp = p.controller._read_input()
+            physical = p.controller.regulator._controlled_l1_projection(inp)
+            self.assertAlmostEqual(physical.current, 7.08)
+            self.assertGreater(inp.grid_report_ts, physical.received_at_ts)
+            with self.assertRaisesRegex(self.refusal, 'bridge_prepare_timeout_wait_normal_minimum'):
+                await asyncio.wait_for(request, 3)
 
-        diagnostics = self.bridge.diagnostics()
-        self.assertEqual(diagnostics['restart_bridge_failed_phase'], 'wait_readback')
-        self.assertIsNotNone(diagnostics['restart_bridge_physical_response_at_utc'])
-        self.assertIsNotNone(diagnostics['restart_bridge_grid_response_at_utc'])
-        self.assertEqual([row['cap'] for row in p.sdk_calls], [7, 0])
-        self.assertEqual(self.bridge._marker['state'], 'aborted')
+        self.assertEqual([(row['cap'], row['ttl']) for row in p.sdk_calls], [(7, 60)])
+        restart.assert_not_awaited()
+        self.assertFalse(self.bridge.armed)
+        self.assertFalse(p.controller._stopped)
 
 
 if __name__ == '__main__':

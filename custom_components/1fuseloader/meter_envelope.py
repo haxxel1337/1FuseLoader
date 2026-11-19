@@ -608,6 +608,8 @@ class MeterEnvelopePolicy:
             hold_until=self.lease.expires
             return OperatingPermission('hold',cap,cap,raw,budget,self.lease.expires,
                 inp.control_source_id,hold_until)
+        if inp.restart_preflight and (inp.status or '').strip().lower()=='charging' and raw<=23 and cap>7:
+            return OperatingPermission('decrease',7,cap,raw,budget,self.lease.expires,inp.control_source_id)
         if raw<=budget:
             return OperatingPermission('retain',cap,cap,raw,budget,self.lease.expires,inp.control_source_id)
         lower=max(r.startup_current,cap-int(ceil(raw-budget)))
@@ -681,7 +683,8 @@ class MeterEnvelopePolicy:
                 recovery.operating_dispatch_wall=number(dispatch.get('wall'))
                 recovery.operating_cap=d.current_p1
                 recovery.operating_binding=dispatch.get('source_id')
-        if getattr(d,'meter_feedback_curtailment',False):
+        if (d.meter_feedback_curtailment or dispatch.get('restart_preflight')
+                and d.current_p1==7 and old>7 and self.lease.normal_admitted):
             # Capture only known actually ACKed own normal ancestors. A queued,
             # unknown, imported or differently bound higher command stays a veto.
             self.lease.feedback_parents={key:value for key,value in self.possible_positive.items()
@@ -1046,11 +1049,16 @@ class MeterEnvelopePolicy:
             return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,
                 no_write_deadline=permission.hold_until,
                 reason='Retaining the actual lower finite cap until advancing post-SDK meter evidence or original own higher authority retirement; no write or renewal.')
+        managed_reduction=bool(inp.restart_preflight and status=='charging' and raw<=23
+            and permission is not None and permission.kind=='decrease' and permission.cap==7)
         if (permission is not None and permission.kind=='decrease'
-                and not self.ev_estimate(r,inp)):
+                and (managed_reduction or not self.ev_estimate(r,inp))):
             return replace(self.decision(r,inp,'meter_normal_decrease',permission.cap,
                 command='set_limit',house=raw,basis='measured_feedback_provisional',ordinary_decrease=True,
-                reason='Fresh measured total requests a strictly lower actual normal cap without subtracting stale EV data; this is provisional feedback curtailment, not overload or physical-response proof.'),
+                reason=('Managed restart prepares with a normal 60-second reduction while protection stays active.'
+                        if managed_reduction else
+                        'Fresh measured total requests a strictly lower actual normal cap without subtracting stale EV data; this is provisional feedback curtailment, not overload or physical-response proof.')),
+                meter_restart_preflight_reduction=managed_reduction,
                 meter_feedback_curtailment=True,meter_feedback_budget_amps=permission.normal_budget,
                 meter_feedback_ceiling_amps=self.steady_ceiling(r))
         if self.episode is None or not self.episode.unresolved:
@@ -1314,6 +1322,8 @@ class MeterEnvelopePolicy:
             if now-self.start_since<s.restart_stable_seconds:
                 return self.decision(r,inp,'meter_wait',0,reason='Cold/critical restart waits for the existing continuous normal startup interval.')
             desired=min(desired,self.start_cap)
+        if inp.restart_preflight and live:
+            desired=min(desired,7)
         return self.decision(r,inp,'meter_normal',desired,command='set_limit',house=basis,
             basis=basis_label,
             reason='Normal meter-envelope control; ordinary EV convergence is diagnostic and cannot request a stop.')

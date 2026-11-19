@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0b52
+
+- Add the administrator action `1fuseloader.restart_with_charging`. It
+  verifies a normal 7 A limit with live charger and grid feedback before
+  asking Home Assistant to restart. Missing proof leaves Core running with
+  its ordinary electrical protection.
+- Extend only a verified continuous 7 A limit, with a single finite
+  five-minute request and a second source check at shutdown. Direct Core
+  restarts issue no new bridge request in the shutdown job.
+- Test delayed native feedback, a rejected restart, critical meter
+  changes, and shutdown and takeover with real Core and atomic Store.
+
 ## 0.4.0b51
 
 - Prepare the orderly restart handoff after a recent ordinary decrease when

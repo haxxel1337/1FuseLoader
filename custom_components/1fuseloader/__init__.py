@@ -1113,7 +1113,7 @@ class OneFuseLoaderController:
             async with asyncio.timeout(18):
                 try:
                     if self.settings.graceful_restart_bridge:
-                        armed = await self._restart_bridge.async_prepare_shutdown()
+                        armed = await self._restart_bridge.async_commit_managed_shutdown()
                 finally:
                     # HA's Core stop does not unload every config entry. A
                     # refused/disabled bridge must also cease ordinary work
@@ -1122,6 +1122,9 @@ class OneFuseLoaderController:
         except Exception as err:
             _LOGGER.warning("1FuseLoader shutdown preparation or cleanup failed (%s)", type(err).__name__)
         return armed
+
+    async def async_restart_with_charging(self, request_restart) -> None:
+        await self._restart_bridge.async_restart_with_charging(request_restart)
 
     async def async_stop(self) -> None:
         if self._stop_cleanup_task is not None:
@@ -2069,6 +2072,7 @@ class OneFuseLoaderController:
             controlled_l1=controlled_l1,
             meter_zero_limit_confirmed=(self.settings.meter_envelope_control
                 and product_data_quiet and self._quiet_zero_limit_confirmed(source_id)),
+            restart_preflight=self._restart_bridge.managed_preflight,
         )
 
     def _configured_control_identity(self) -> str | None:
@@ -2635,7 +2639,7 @@ class OneFuseLoaderController:
                 inp.charger_observation_report_times,
                 inp.charger_observation_sequences, inp.charger_observation_evidence_credit,
                 inp.meter_grid_health, inp.meter_actuator_health, inp.meter_ev_health,
-                inp.meter_product_data_quiet,
+                inp.meter_product_data_quiet, inp.restart_preflight,
                 inp.controlled_l1 if self.settings.meter_envelope_control else None,
                 age_class(inp.grid_report_ts), age_class(inp.charger_report_ts))
 
@@ -3545,6 +3549,9 @@ class OneFuseLoaderController:
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    from .restart_service import async_setup_restart_service
+
+    async_setup_restart_service(hass)
     return True
 
 

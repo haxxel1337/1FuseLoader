@@ -25,33 +25,25 @@ class RecentDecreaseRestartBridgeTests(handoff.B50ShutdownHandoffTests):
         self.adapter.calls.clear()
         return policy
 
-    async def physical_and_grid(self):
-        self.native_only(189., 7.1)
-        await asyncio.sleep(.06)
-        self.independent_grid(190., 16.6, 189.5)
-        await asyncio.sleep(.06)
-
     async def test_recent_normal_decrease_can_arm_after_new_readback(self):
         policy = await self.recent_decrease()
         original_horizons = deepcopy(policy.possible_positive)
         bridge = self.controller._restart_bridge
-        task = await self.begin_without_auto_response()
-        self.assertEqual(self.adapter.calls[0].committed_current_p1, 13)
-        self.assertEqual(self.adapter.calls[0].command_urgency, 'protective_reduction')
+        task = await self.begin_managed_restart()
         try:
-            await self.physical_and_grid()
-            self.assertEqual(bridge.diagnostics()['restart_bridge_prepare_phase'], 'wait_readback')
+            self.report_managed_minimum(native_readback=False)
+            await asyncio.sleep(.12)
+            self.assertEqual(bridge.diagnostics()['restart_bridge_prepare_phase'], 'wait_normal_minimum')
             self.assertFalse(bridge.armed)
-            self.now = 190.2
             self.adapter.reported_limits = (7, 0, 0)
             self.adapter.reported_limit_receipts = (self.now, None, None)
-            self.assertTrue(await self.finish_or_cancel(task))
+            await self.finish_or_cancel(task)
         finally:
             if not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 300)])
-        self.assertEqual(policy.possible_positive, original_horizons)
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60), (7, 300)])
+        self.assertTrue(original_horizons.items() <= policy.possible_positive.items())
         marker = self.persisted_bridge()[1]
         self.assertEqual(marker['state'], 'acknowledged')
         self.assertEqual(marker['expires_wall'] - marker['dispatch_wall'], 300.)
@@ -59,25 +51,24 @@ class RecentDecreaseRestartBridgeTests(handoff.B50ShutdownHandoffTests):
     async def test_cached_matching_readback_cannot_arm_with_older_higher_offer(self):
         await self.recent_decrease()
         self.adapter.reported_limits = (7, 0, 0)
-        with self.short_prepare_timeout(.35):
-            task = await self.begin_without_auto_response()
+        with self.managed_preflight_timeout(.35):
+            task = await self.begin_managed_restart()
             # The SDK receipt is synthetic. Replace the fixture's auto-readback
             # receipt with this scenario's unchanged, earlier native 7 A.
             self.adapter.reported_limit_receipts = (187., None, None)
-            await self.physical_and_grid()
-            self.assertFalse(await self.finish_or_cancel(task))
-        self.assert_failure_phase('wait_readback')
-        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 300), (0, 60)])
-        self.assertEqual(self.persisted_bridge()[1]['state'], 'aborted')
+            self.report_managed_minimum()
+            with self.assertRaises(self.bridge_refused):
+                await self.finish_or_cancel(task)
+        self.assert_failure_phase('wait_normal_minimum')
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        self.assertFalse(any('restart' in key for key in self.hass._test_store_disk))
 
     async def test_other_source_cannot_borrow_a_known_predecessors_ack(self):
         policy = await self.recent_decrease()
         previous_key = next(key for key, value in policy.possible_positive.items() if value == (14, 232.))
         policy.lease.normal_commands[previous_key]['source_id'] = 'other-source'
-        self.assertFalse(await self.controller._async_prepare_shutdown_bridge())
-        self.assert_failure_phase('qualify')
-        diagnostics = self.controller._restart_bridge.diagnostics()
-        self.assertEqual(diagnostics['restart_bridge_last_error'], 'bridge_qualification_previous_authority_unknown')
+        with self.assertRaisesRegex(self.bridge_refused, 'bridge_qualification_previous_authority_unknown'):
+            await self.controller.async_restart_with_charging(self.stage_one_shutdown)
         self.assertEqual(self.adapter.calls, [])
         self.assertFalse(any('restart' in key for key in self.hass._test_store_disk))
 
@@ -88,16 +79,19 @@ class RecentDecreaseRestartBridgeTests(handoff.B50ShutdownHandoffTests):
         async def with_unknown_predecessor(decision, callback):
             # The protective bridge decision has been built and queued. Its
             # callback must requalify before the adapter sends the request.
-            policy.possible_positive['unacknowledged-plan'] = (15, 240.)
+            if decision.ttl_seconds == 300:
+                policy.possible_positive['unacknowledged-plan'] = (15, 240.)
             return await original(decision, callback)
 
         self.adapter.async_execute_with_dispatch = with_unknown_predecessor
-        self.assertFalse(await self.controller._async_prepare_shutdown_bridge())
-        self.assert_failure_phase('dispatch_minimum')
+        with self.assertRaises(self.bridge_refused):
+            await self.stage_managed_shutdown()
+        self.assert_failure_phase('dispatch_verified_minimum')
         diagnostics = self.controller._restart_bridge.diagnostics()
         self.assertEqual(diagnostics['restart_bridge_last_error'], 'bridge_qualification_previous_authority_unknown')
-        self.assertEqual(self.adapter.calls, [])
-        self.assertEqual(self.persisted_bridge()[1]['state'], 'aborted')
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        await self.controller._restart_bridge._background_save
+        self.assertEqual(self.persisted_bridge()[1]['state'], 'not_sent')
 
     async def test_valid_entity_grid_text_retains_all_qualification_limits(self):
         await self.recent_decrease()
@@ -117,18 +111,20 @@ class RecentDecreaseRestartBridgeTests(handoff.B50ShutdownHandoffTests):
 
         async def reject_before_http_acceptance(decision, callback):
             reply = await original(decision, callback)
-            if decision.current_p1 == 7:
+            if decision.current_p1 == 7 and decision.ttl_seconds == 300:
                 self.controller._handle_delivery(SimpleNamespace(command_type=22, ticks='222',
                     was_accepted=False))
                 return SimpleNamespace(http_status=200, correlation_ids=((22, '222'),))
             return reply
 
         self.adapter.async_execute_with_dispatch = reject_before_http_acceptance
-        self.assertFalse(await self.controller._async_prepare_shutdown_bridge())
-        self.assert_failure_phase('dispatch_minimum')
+        with self.assertRaises(self.bridge_refused):
+            await self.stage_managed_shutdown()
+        self.assert_failure_phase('dispatch_verified_minimum')
         diagnostic = self.controller._restart_bridge.diagnostics()
         self.assertEqual(diagnostic['restart_bridge_last_error'], 'bridge_vendor_rejected')
-        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 300), (0, 60)])
+        await self.controller.async_tick()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60), (7, 300), (0, 60)])
 
 
 def load_tests(loader, tests, pattern):

@@ -135,6 +135,47 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         target = getattr(active[0].job, 'target', active[0].job)
         await target(*active[0].args)
 
+    @property
+    def bridge_refused(self):
+        return self.controller._restart_bridge.async_restart_with_charging.__func__.__globals__['BridgeRefused']
+
+    def managed_preflight_timeout(self, seconds):
+        implementation = self.controller._restart_bridge.async_restart_with_charging.__func__
+        return patch.dict(implementation.__globals__, {'MANAGED_PREFLIGHT_TIMEOUT_SECONDS': seconds})
+
+    async def begin_managed_restart(self):
+        self.bridge_reply = False
+        task = asyncio.create_task(self.controller.async_restart_with_charging(self.stage_one_shutdown))
+        try:
+            await asyncio.sleep(0)
+            if not task.done():
+                # The common fixture mocks the coalesced source callback.
+                # Deliver the next real ordinary controller tick explicitly.
+                self.now += 1.
+                self.grid(float(self.states['sensor.grid'].state))
+                await self.tick()
+            return task
+        except BaseException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    def report_managed_minimum(self, *, native_readback=True):
+        if native_readback:
+            self.adapter.reported_limits = (7, 0, 0)
+        at = self.now + 1.
+        self.report(at, 'charging', 11., 7., at-.2)
+
+    async def stage_managed_shutdown(self):
+        task = await self.begin_managed_restart()
+        self.report_managed_minimum()
+        try:
+            await asyncio.wait_for(task, 2.)
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     async def healthy_session(self):
         regulator = await self.settled_sixteen()
         # Let the original cold-start possible-authority horizon retire; a
@@ -190,7 +231,7 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def prepared_restart(self, *, downtime=20., native_wait=False):
         regulator = await self.healthy_session()
         before = deepcopy(regulator.export_overload_state())
-        await self.stage_one_shutdown()
+        await self.stage_managed_shutdown()
         _, marker = self.persisted_bridge()
         self.new_boot(downtime=downtime, native_wait=native_wait)
         await self.controller.async_start()
@@ -202,13 +243,14 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(values), 1, values)
         return values[0]
 
-    async def test_stage_one_prepares_verified_seven_amp_finite_handoff(self):
+    async def test_managed_restart_prepares_verified_seven_amp_finite_handoff(self):
         regulator = await self.healthy_session()
         before = deepcopy(regulator.export_overload_state())
-        await self.stage_one_shutdown()
+        await self.stage_managed_shutdown()
         self.assertTrue(self.controller._stopped, self.controller._restart_bridge.diagnostics())
         self.assertEqual([(d.command, d.current_p1, d.current_p2, d.current_p3, d.ttl_seconds)
-                          for d in self.adapter.calls], [('set_limit', 7, 0, 0, 300)])
+                          for d in self.adapter.calls], [('set_limit', 7, 0, 0, 60),
+                                                       ('set_limit', 7, 0, 0, 300)])
         _, marker = self.persisted_bridge()
         self.assertIn('acknowledged', str(marker))
         after = regulator.export_overload_state()
@@ -229,12 +271,12 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(regulator._controlled_l1_boundary(self.controller._read_input()))
         self.assertEqual(regulator._get_meter_envelope_policy().state.value, 'NORMAL')
         self.adapter.calls.clear()
-        await self.stage_one_shutdown()
+        await self.stage_managed_shutdown()
         self.assertTrue(self.controller._stopped, self.controller._restart_bridge.diagnostics())
-        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 300)])
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60), (7, 300)])
         marker = self.persisted_bridge()[1]
         self.assertEqual(marker['state'], 'acknowledged')
-        self.assertGreater(marker['physical_response_wall'], marker['dispatch_wall'])
+        self.assertLess(marker['physical_response_wall'], marker['dispatch_wall'])
 
     async def test_generic_entry_unload_does_not_create_restart_permission(self):
         await self.healthy_session()
@@ -302,18 +344,21 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.healthy_session()
         self.now += 1.
         self.grid(35.)
-        await self.controller._async_prepare_shutdown_bridge()
+        with self.assertRaises(self.bridge_refused):
+            await self.controller.async_restart_with_charging(self.stage_one_shutdown)
+        self.assertFalse(self.controller._stopped)
         self.assertFalse(any(d.current_p1 > 0 for d in self.adapter.calls))
         self.assertFalse(any('acknowledged' in str(value)
                              for key, value in self.hass._test_store_disk.items() if 'restart' in key))
 
-    async def test_preexisting_hard_limit_is_protected_before_shutdown_continues(self):
+    async def test_preexisting_hard_limit_is_protected_without_starting_shutdown(self):
         await self.healthy_session()
         self.now += 1.
         self.grid(39.)
-        # No callback is needed: the early shutdown job itself observes the
-        # critical condition before any bridge packet could be submitted.
-        await self.controller._async_prepare_shutdown_bridge()
+        with self.assertRaises(self.bridge_refused):
+            await self.controller.async_restart_with_charging(self.stage_one_shutdown)
+        await self.controller.async_tick()
+        self.assertFalse(self.controller._stopped)
         self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
         self.assertIsNotNone(self.controller.regulator._get_meter_envelope_policy().operational_fault)
 
@@ -321,7 +366,10 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.healthy_session()
         self.adapter.telemetry_block_reason = 'easee_stream_disconnected'
         self.adapter.transport_block_reason = 'easee_stream_disconnected'
-        await self.controller._async_prepare_shutdown_bridge()
+        with self.assertRaises(self.bridge_refused):
+            await self.controller.async_restart_with_charging(self.stage_one_shutdown)
+        await self.controller.async_tick()
+        self.assertFalse(self.controller._stopped)
         self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
         self.assertIsNotNone(self.controller.regulator._get_meter_envelope_policy().operational_fault)
 
@@ -333,18 +381,19 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 raise OSError('offline synthetic checkpoint unavailable')
             return await original(store, payload)
         with patch.object(fixtures.FakeStore, 'async_save', fail_bridge):
-            await self.controller._async_prepare_shutdown_bridge()
-        self.assertEqual(self.adapter.calls, [])
+            with self.assertRaises(self.bridge_refused):
+                await self.stage_managed_shutdown()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        self.assertFalse(self.controller._stopped)
 
     async def test_http_acceptance_without_native_response_is_not_armed(self):
         await self.healthy_session()
-        self.bridge_reply = False
-        # Missing response must fail under a fixed local deadline, never wait
-        # for an entire process shutdown in this deterministic offline test.
-        task = asyncio.create_task(self.controller._async_prepare_shutdown_bridge())
-        await asyncio.sleep(.05)
-        self.now += 20.
-        await asyncio.wait_for(task, 1.)
+        with self.managed_preflight_timeout(.2):
+            task = await self.begin_managed_restart()
+            with self.assertRaises(self.bridge_refused):
+                await asyncio.wait_for(task, 1.)
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        self.assertFalse(self.controller._stopped)
         self.assertFalse(any('acknowledged' in str(value)
                              for key, value in self.hass._test_store_disk.items() if 'restart' in key))
 
@@ -445,7 +494,7 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_claim_readback_mismatch_does_not_suppress_startup_protection(self):
         await self.healthy_session()
-        await self.stage_one_shutdown()
+        await self.stage_managed_shutdown()
         self.new_boot()
         original = fixtures.FakeStore.async_save
         async def swallowed_claim(store, payload):
@@ -460,11 +509,16 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_local_pre_sdk_refusal_does_not_send_an_unnecessary_zero(self):
         await self.healthy_session()
+        original = self.adapter.async_execute_with_dispatch
         async def locally_refused(decision, on_dispatch):
-            raise fixtures.runtime.CommandNotSent('positive_rate_capacity_exhausted')
+            if decision.ttl_seconds == 300:
+                raise fixtures.runtime.CommandNotSent('positive_rate_capacity_exhausted')
+            return await original(decision, on_dispatch)
         self.adapter.async_execute_with_dispatch = locally_refused
-        await self.controller._async_prepare_shutdown_bridge()
-        self.assertEqual(self.adapter.calls, [])
+        with self.assertRaises(self.bridge_refused):
+            await self.stage_managed_shutdown()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        self.assertFalse(self.controller._stopped)
         self.assertFalse(self.controller._protective_zero_pending)
 
     async def test_ack_checkpoint_failure_withdraws_an_actually_sent_bridge(self):
@@ -475,8 +529,9 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 raise OSError('synthetic acknowledgement checkpoint unavailable')
             return await original(store, payload)
         with patch.object(fixtures.FakeStore, 'async_save', fail_ack):
-            await self.controller._async_prepare_shutdown_bridge()
-        self.assertEqual([d.current_p1 for d in self.adapter.calls], [7, 0])
+            with self.assertRaises(self.bridge_refused):
+                await self.stage_managed_shutdown()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60), (7, 300)])
         self.assertFalse(self.controller._restart_bridge.armed)
         self.assertNotEqual(self.persisted_bridge()[1]['state'], 'acknowledged')
 
@@ -500,9 +555,9 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         shutdown = None
         try:
             await asyncio.wait_for(entered.wait(), 1.)
-            shutdown = asyncio.create_task(self.controller._async_prepare_shutdown_bridge())
+            shutdown = asyncio.create_task(self.controller.async_restart_with_charging(self.stage_one_shutdown))
             await asyncio.sleep(0)
-            self.assertTrue(self.controller._restart_bridge.preparing)
+            self.assertTrue(self.controller._restart_bridge.managed_preflight)
             self.now += .2
             self.grid(39.)
             fixtures.runtime.OneFuseLoaderController._handle_source_change(self.controller, None)
@@ -580,8 +635,9 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
             if 'restart' in store.key and payload.get('state') == 'prepared':
                 self.controller._configured_control_identity.return_value = 'different-meter-unique-id'
         with patch.object(fixtures.FakeStore, 'async_save', rebound):
-            await self.controller._async_prepare_shutdown_bridge()
-        self.assertEqual(self.adapter.calls, [])
+            with self.assertRaises(self.bridge_refused):
+                await self.stage_managed_shutdown()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
         self.assertFalse(self.controller._restart_bridge.armed)
 
     async def test_same_entity_rebound_to_new_meter_rejects_active_handoff(self):
@@ -646,17 +702,21 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 await release.wait()
             return receipt
         self.adapter.async_execute_with_dispatch = held_sdk
-        task = asyncio.create_task(self.controller._async_prepare_shutdown_bridge())
+        task = await self.begin_managed_restart()
+        self.report_managed_minimum()
         try:
             await asyncio.wait_for(entered.wait(), 1.)
             self.now += .2
             self.grid(39.)
             fixtures.runtime.OneFuseLoaderController._handle_source_change(self.controller, None)
-            await asyncio.wait_for(asyncio.shield(task), 1.)
+            with self.assertRaises(self.bridge_refused):
+                await asyncio.wait_for(asyncio.shield(task), 1.)
         finally:
             release.set()
             await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual([d.current_p1 for d in self.adapter.calls], [7, 0])
+        await self.controller.async_tick()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls],
+                         [(7, 60), (7, 300), (0, 60)])
         self.assertFalse(self.controller._restart_bridge.armed)
         self.assertIsNotNone(self.controller.regulator._get_meter_envelope_policy().operational_fault,
             'A real critical event must survive shutdown in the normal fault ledger')
