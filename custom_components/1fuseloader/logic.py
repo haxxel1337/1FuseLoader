@@ -29,7 +29,9 @@ START_ALLOWED_STATUSES = {
 START_RESPONSE_DIAGNOSTIC_SECONDS = 300
 PEAK_RESPONSE_TRIGGER_AMPS = 28.0
 AUTOMATIC_QUALIFY_SECONDS = 30.0
-AUTOMATIC_COOLING_SECONDS = 1800.0
+AUTOMATIC_COOLING_SECONDS = 900.0
+AUTOMATIC_COOLING_WINDOW_SECONDS = 2700.0
+AUTOMATIC_COOLING_MAX_INTERVALS = 4096
 AUTOMATIC_COOLING_AMPS = 23.0
 AUTOMATIC_MAX_GRID_GAP_SECONDS = 15.0
 
@@ -204,6 +206,16 @@ class RegulatorInput:
     meter_zero_limit_confirmed: bool = False
     # Optional runtime-only bound on an otherwise normal positive offer.
     restart_preflight: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RestartBridgeContext:
+    """A consumed marker's original deadline and post-claim evidence floor."""
+
+    source_id: str | tuple
+    claimed_wall: float
+    expires_wall: float
+    expires_mono: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -461,6 +473,7 @@ class RegulatorDecision:
     meter_ordinary_decrease: bool = False
     meter_feedback_curtailment: bool = False
     meter_restart_preflight_reduction: bool = False
+    meter_restart_bridge_takeover: bool = False
     meter_feedback_budget_amps: Optional[float] = None
     meter_feedback_ceiling_amps: Optional[float] = None
     meter_basis_grid_ts: Optional[float] = None
@@ -541,6 +554,8 @@ class OneFuseRegulator:
         self._automatic_qualification_since: Optional[float] = None
         self._automatic_cooling_gt: Optional[float] = None
         self._automatic_cooling_since: Optional[float] = None
+        self._automatic_cooling_wall: Optional[float] = None
+        self._automatic_recovery_clock: Optional[tuple[float, float]] = None
         self._automatic_last_gt: Optional[float] = None
         self._automatic_last_now: Optional[float] = None
         self._automatic_observed_source = None
@@ -1483,12 +1498,112 @@ class OneFuseRegulator:
         return self._automatic_cycle
 
     def _break_automatic_continuity(self) -> None:
-        self._automatic_qualification_gt = self._automatic_cooling_gt = None
-        self._automatic_qualification_since = self._automatic_cooling_since = None
+        self._automatic_qualification_gt = self._automatic_qualification_since = None
+        self._break_automatic_cooling_span()
         self._automatic_last_gt = self._automatic_last_now = None
         self._automatic_observed_source = None
         if self._automatic_cycle is not None and self._automatic_cycle["state"] == "qualifying":
             self._automatic_cycle["state"] = "ready"
+
+    def _break_automatic_cooling_span(self) -> None:
+        self._automatic_cooling_gt = self._automatic_cooling_since = self._automatic_cooling_wall = None
+
+    @staticmethod
+    def _automatic_cooling_credit(cycle: Optional[dict], wall: Optional[float]) -> float:
+        if cycle is None or wall is None:
+            return 0.
+        cooling = cycle.get("recovery_window")
+        if cooling is None:
+            return 0.
+        floor = wall - AUTOMATIC_COOLING_WINDOW_SECONDS
+        return sum(max(0., min(end, wall) - max(start, floor)) for start, end in cooling["intervals"])
+
+    def _age_automatic_cooling(self, cycle: dict, now: Optional[float], wall: Optional[float]) -> bool:
+        """Age proved intervals independently of the next meter report."""
+        if now is None or wall is None or now < 0 or wall < 0:
+            self._break_automatic_cooling_span()
+            return False
+        previous = self._automatic_recovery_clock
+        self._automatic_recovery_clock = (now, wall)
+        if previous is not None:
+            dt, dw = now - previous[0], wall - previous[1]
+            if dt < 0 or dw < 0 or abs(dt - dw) > 5.:
+                # A discontinuity cannot make an old interval recent or earn
+                # cooling over a clock correction.
+                cycle.pop("recovery_window", None)
+                self._break_automatic_cooling_span()
+                return False
+        cooling = cycle.get("recovery_window")
+        if cooling is not None:
+            intervals = cooling["intervals"]
+            if intervals[-1][1] > wall:
+                cycle.pop("recovery_window", None)
+                self._break_automatic_cooling_span()
+                return False
+            floor = wall - AUTOMATIC_COOLING_WINDOW_SECONDS
+            if intervals[0][1] <= floor:
+                cooling["intervals"] = [span for span in intervals if span[1] > floor]
+                if not cooling["intervals"]:
+                    cycle.pop("recovery_window")
+        return True
+
+    def _observe_automatic_cooling(self, cycle: dict, now: float, wall: float,
+                                   grid_ts: float, gap: float) -> None:
+        """Credit only intervals witnessed below the limit at both endpoints."""
+        old_gt, old_now, old_wall = (self._automatic_cooling_gt,
+            self._automatic_cooling_since, self._automatic_cooling_wall)
+        self._automatic_cooling_gt, self._automatic_cooling_since, self._automatic_cooling_wall = grid_ts, now, wall
+        if cycle["used_seconds"] <= 0 and cycle["state"] != "blocked":
+            # Low load before exposure must not be available for the first
+            # immediate refill or become the first endpoint after a fault.
+            self._automatic_cooling_wall = None
+            cycle.pop("recovery_window", None)
+            return
+        if old_gt is None or old_now is None or old_wall is None:
+            return
+        spans = (grid_ts - old_gt, now - old_now, wall - old_wall)
+        if any(not 0. < span <= gap for span in spans):
+            return
+        cooling = cycle.setdefault("recovery_window",
+            {"version": 1, "cycle_id": cycle["cycle_id"], "intervals": []})
+        intervals = cooling["intervals"]
+        start = grid_ts - min(spans)
+        if intervals and intervals[-1][1] >= start:
+            if grid_ts > intervals[-1][1]:
+                intervals[-1][1] = grid_ts
+        else:
+            intervals.append([start, grid_ts])
+        del intervals[:-AUTOMATIC_COOLING_MAX_INTERVALS]
+        if self._automatic_cooling_credit(cycle, wall) >= AUTOMATIC_COOLING_SECONDS:
+            # This is only the operational budget. Other electrical owners,
+            # faults, and lifetime usage are never cleared by cooling.
+            cycle.update(cycle_id=cycle["cycle_id"]+1, state="ready",
+                         used_seconds=0., failure_reason=None)
+            cycle.pop("recovery_window")
+            self._break_automatic_cooling_span()
+
+    @staticmethod
+    def _valid_automatic_cooling(cycle: dict) -> bool:
+        cooling = cycle.get("recovery_window")
+        if type(cooling) is not dict or set(cooling) != {"version", "cycle_id", "intervals"}:
+            return False
+        intervals = cooling["intervals"]
+        if (type(cooling["version"]) is not int or cooling["version"] != 1
+                or type(cooling["cycle_id"]) is not int or cooling["cycle_id"] != cycle["cycle_id"]
+                or cycle["source_id"] is None or type(intervals) is not list
+                or not 0 < len(intervals) <= AUTOMATIC_COOLING_MAX_INTERVALS
+                or cycle["used_seconds"] <= 0 and cycle["state"] != "blocked"):
+            return False
+        edge = 0.
+        for span in intervals:
+            if type(span) is not list or len(span) != 2 or any(
+                    type(t) not in (int, float) or _valid_number(t) is None for t in span):
+                return False
+            start, end = span
+            if not edge <= start < end or end - start > AUTOMATIC_COOLING_WINDOW_SECONDS:
+                return False
+            edge = end
+        return True
 
     @property
     def automatic_cycle_requires_checkpoint(self) -> bool:
@@ -1502,15 +1617,17 @@ class OneFuseRegulator:
         return dict(automatic_overload_cycles=self.settings.meter_envelope_control or self.settings.automatic_overload_cycles,
             automatic_cycle_state=cycle["state"] if cycle else "disabled",
             automatic_cycle_id=cycle["cycle_id"] if cycle else None,
+            automatic_cycle_budget_seconds=self.settings.overload_budget_seconds,
             automatic_cycle_used_seconds=used,
             automatic_cycle_remaining_seconds=max(0., self.settings.overload_budget_seconds-used),
             automatic_cycle_failure_reason=cycle["failure_reason"] if cycle else None,
             automatic_qualification_seconds=max(0., min(gt-self._automatic_qualification_gt,
                 now-self._automatic_qualification_since))
                 if gt is not None and self._automatic_qualification_gt is not None else 0.,
-            automatic_cooling_seconds=max(0., min(gt-self._automatic_cooling_gt,
-                now-self._automatic_cooling_since))
-                if gt is not None and self._automatic_cooling_gt is not None else 0.,
+            automatic_cooling_seconds=self._automatic_cooling_credit(
+                cycle, self._automatic_recovery_clock[1] if self._automatic_recovery_clock else None),
+            automatic_cooling_goal_seconds=AUTOMATIC_COOLING_SECONDS,
+            automatic_cooling_window_seconds=AUTOMATIC_COOLING_WINDOW_SECONDS,
             automatic_cooling_threshold_amps=AUTOMATIC_COOLING_AMPS)
 
     def observe_automatic_cycle(self, inp: RegulatorInput, *, source_valid: bool = True) -> None:
@@ -1526,6 +1643,7 @@ class OneFuseRegulator:
         cycle = self._ensure_automatic_cycle()
         now, wall, gt, grid, current = (None if isinstance(v, bool) else _valid_number(v)
             for v in (inp.now_ts, inp.wall_now_ts, inp.grid_report_ts, inp.grid_l1, inp.charger_current))
+        cooling_clock_valid = self._age_automatic_cooling(cycle, now, wall)
         identity = self._trial_identity(inp.control_source_id)
         bound = self._trial_identity(self._accepted_control_source_id)
         cooling_binding = bool(grid is not None and grid < AUTOMATIC_COOLING_AMPS
@@ -1545,6 +1663,7 @@ class OneFuseRegulator:
             return
         if cycle["source_id"] is not None and self._trial_identity(cycle["source_id"]) != identity:
             self._break_automatic_continuity()
+            cycle.pop("recovery_window", None)
             cycle["state"], cycle["failure_reason"] = "blocked", "source_binding_changed"
             cycle["source_id"] = identity
             return
@@ -1554,9 +1673,12 @@ class OneFuseRegulator:
             previous_gt = None
         if previous_gt is not None and gt < previous_gt:
             self._break_automatic_continuity()
+            cycle.pop("recovery_window", None)
             cycle["state"], cycle["failure_reason"] = "blocked", "grid_clock_regressed"
             return
         if previous_gt is not None and gt == previous_gt:
+            if grid >= AUTOMATIC_COOLING_AMPS:
+                self._break_automatic_cooling_span()
             return
         if previous_gt is not None and gt-previous_gt > min(
                 AUTOMATIC_MAX_GRID_GAP_SECONDS, self.settings.max_sensor_age_seconds):
@@ -1579,22 +1701,13 @@ class OneFuseRegulator:
         if grid < AUTOMATIC_COOLING_AMPS:
             self._automatic_qualification_gt = None
             self._automatic_qualification_since = None
-            if self._automatic_cooling_gt is None:
-                self._automatic_cooling_gt = gt
-                self._automatic_cooling_since = now
-            if (gt-self._automatic_cooling_gt >= AUTOMATIC_COOLING_SECONDS
-                    and now-self._automatic_cooling_since >= AUTOMATIC_COOLING_SECONDS):
-                # A full observed cooling run replenishes ONLY this software
-                # cycle. Electrical owners, recovery and lifetime history stay.
-                if cycle["used_seconds"] > 0 or cycle["state"] != "ready" or cycle["failure_reason"]:
-                    cycle.update(cycle_id=cycle["cycle_id"]+1, state="ready",
-                        used_seconds=0.0, failure_reason=None)
-                self._automatic_cooling_gt = gt
-                self._automatic_cooling_since = now
-            elif cycle["state"] == "qualifying":
+            if cooling_clock_valid:
+                self._observe_automatic_cooling(cycle, now, wall, gt,
+                    min(AUTOMATIC_MAX_GRID_GAP_SECONDS, self.settings.max_sensor_age_seconds))
+            if cycle["state"] == "qualifying":
                 cycle["state"] = "ready"
             return
-        self._automatic_cooling_gt = self._automatic_cooling_since = None
+        self._break_automatic_cooling_span()
         if cycle["used_seconds"] >= self.settings.overload_budget_seconds:
             cycle["state"] = "exhausted"
             self._automatic_qualification_gt = None
@@ -1634,6 +1747,7 @@ class OneFuseRegulator:
         value = state.get("automatic_cycle") if isinstance(state, dict) else None
         previous = self._automatic_cycle
         self._break_automatic_continuity()
+        self._automatic_recovery_clock = None
         if value is None:
             if self.settings.automatic_overload_cycles:
                 self._ensure_automatic_cycle()
@@ -1651,6 +1765,11 @@ class OneFuseRegulator:
                 failure_reason="invalid_persisted_automatic_cycle")
             return False
         restored = deepcopy(value)
+        if ("recovery_window" in restored and (not self._valid_automatic_cooling(restored)
+                or previous is not None and previous["cycle_id"] != restored["cycle_id"])):
+            # Optional credit can be thrown away without refunding exposure
+            # or changing an existing operational fault.
+            restored.pop("recovery_window")
         restored["used_seconds"] = float(value["used_seconds"])+(gap if exposure else 0.)
         if previous is not None:
             restored["used_seconds"] = max(restored["used_seconds"], previous["used_seconds"])
@@ -4619,7 +4738,7 @@ class OneFuseRegulator:
         must not treat an explicit reset as confirmation of a cold fuse.
         """
         if getattr(self, "_automatic_cycle", None) is not None:
-            # Only a complete observed automatic cooling run replenishes it.
+            # Only proved time in the automatic cooling window replenishes it.
             return
         if getattr(self, "_trial_epoch", None) is not None:
             self._terminate_trial("interrupted", "budget_reset_attempt")
@@ -6402,6 +6521,10 @@ class OneFuseRegulator:
             # An admitted SDK request is already remote. Benign EV movement
             # can change the NEXT optimum, not turn its delivery into unknown.
             return decision.command == "set_limit" and decision.current_p1 > 0
+        if decision.meter_restart_bridge_takeover:
+            return bool(fresh.meter_restart_bridge_takeover and fresh.command == decision.command == "set_limit"
+                and fresh.current_p1 == decision.current_p1 == 7 and decision.current_p2 == decision.current_p3 == 0
+                and fresh.ttl_seconds == decision.ttl_seconds == self.settings.normal_ttl_seconds)
         if decision.command != "set_limit" or decision.current_p1 <= 0:
             return decision.current_p1 == 0 and decision.meter_zero_cause is not None
         if fresh.command!='set_limit' or fresh.current_p1<=0:

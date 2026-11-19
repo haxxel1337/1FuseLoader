@@ -380,18 +380,18 @@ class B42StandaloneControllerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state['automatic_cycle']['cycle_id'],9)
         self.assertGreaterEqual(state['automatic_cycle']['used_seconds'],1800.)
 
-    async def test_spent_cycle_requires_full_strict_cooling_before_automatic_rearm(self):
+    async def test_spent_cycle_requires_full_fifteen_minutes_before_automatic_rearm(self):
         r,saved=await self.recover_normal(used=1800.,state='exhausted',reason='overload_budget')
         # The first qualified low RAW is at100. New meter observations remain
         # strictly below23 and continuous; elapsed wall time alone is not the
         # oracle. Every interval is covered by a new report and native pulse.
-        for at in range(195,1896,5):
+        for at in range(195,996,5):
             await self.tick(float(at),19.1)
-        await self.tick(1899.,22.9)
+        await self.tick(999.,22.9)
         before=self.assert_history_preserved(saved)
         self.assertEqual(before['automatic_cycle']['cycle_id'],9)
         self.assertGreaterEqual(before['automatic_cycle']['used_seconds'],1800.)
-        await self.tick(1900.,22.9)
+        await self.tick(1000.,22.9)
         after=r.export_overload_state()
         self.assertEqual(after['automatic_cycle']['cycle_id'],10)
         self.assertEqual(after['automatic_cycle']['used_seconds'],0.)
@@ -401,16 +401,17 @@ class B42StandaloneControllerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_exact_twenty_three_breaks_cooling_and_does_not_refill_spent_cycle(self):
         r,saved=await self.recover_normal(used=1800.,state='exhausted',reason='overload_budget')
-        for at in range(195,1896,5):
+        for at in range(195,996,5):
             await self.tick(float(at),19.1)
-        await self.tick(1899.,23.)
-        # A new low streak starts after this boundary; another minute cannot
-        # stand in for the missing continuous1800 seconds.
-        for at in range(1900,1961,5):
-            await self.tick(float(at),19.1)
+        await self.tick(1000.,23.)
+        await self.tick(1005.,19.1)
+        # Warm endpoints cannot add either adjacent five-second interval.
+        self.assertEqual(r.automatic_cycle_diagnostics()['automatic_cooling_seconds'],895.)
         state=self.assert_history_preserved(saved)
         self.assertEqual(state['automatic_cycle']['cycle_id'],9)
         self.assertGreaterEqual(state['automatic_cycle']['used_seconds'],1800.)
+        await self.tick(1010.,19.1)
+        self.assertEqual(r.export_overload_state()['automatic_cycle']['used_seconds'],0.)
 
     async def test_fresh_source_fault_is_not_optional_ev_estimate_uncertainty(self):
         await self.boot()

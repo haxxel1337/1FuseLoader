@@ -238,6 +238,35 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.async_start()
         return before, marker
 
+    async def late_quiet_boot(self, raw=14.1):
+        _, marker = await self.prepared_restart(downtime=185., native_wait=True)
+        deadline = self.controller.last_decision.normal_continuity_deadline_ts
+        self.now = deadline - 31.
+        self.adapter._product_data.state.update(isOnline=True, signalRConnected=True,
+                                               latestPulse=self.wall(self.now - 130.))
+        self.adapter.transport_block_reason = None
+        self.adapter.telemetry_block_reason = 'easee_heartbeat_stale'
+        self.adapter.product_data_quiet = True
+        self.adapter.offline_fallback_block_reason = None
+        self.adapter.reported_limits = (7., 0., 0.)
+        self.grid(raw)
+        await self.controller.async_tick()
+        inp = self.controller._read_input()
+        self.assertTrue(inp.meter_grid_health.valid)
+        self.assertTrue(inp.meter_actuator_health.valid)
+        self.assertTrue(inp.meter_product_data_quiet)
+        self.assertEqual(self.adapter.calls, [])
+        self.assertIsNone(self.controller.regulator.last_target)
+        self.assertEqual(self.controller.last_decision.current_p1, 7)
+        self.assertEqual(self.controller.last_decision.normal_continuity_deadline_ts, deadline)
+        self.assertEqual(self.persisted_bridge()[1]['expires_wall'], marker['expires_wall'])
+        return deadline
+
+    def fresh_product(self):
+        self.adapter._product_data.state['latestPulse'] = self.wall()
+        self.adapter.telemetry_block_reason = None
+        self.adapter.product_data_quiet = False
+
     def persisted_bridge(self):
         values = [(key, deepcopy(value)) for key, value in self.hass._test_store_disk.items()
                   if 'restart' in key]
@@ -442,6 +471,85 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after['used_seconds'], before['used_seconds'])
         self.assertEqual(after['failure_reason'], before['failure_reason'])
 
+    async def test_late_quiet_carryover_then_whole_meter_takeover_without_ev_update(self):
+        deadline = await self.late_quiet_boot()
+        self.now += 1.
+        self.grid(14.1)
+        await self.controller.async_tick()
+        self.assertEqual(self.adapter.calls, [])
+        self.assertEqual(self.controller.last_decision.normal_continuity_deadline_ts, deadline)
+        # Product connectivity comes back without a conductor event. With all
+        # 7 A added on top of measured load, 21.1 A fits the 23 A budget.
+        self.now += 1.
+        self.fresh_product()
+        self.assertIsNone(self.native.received_at)
+        await self.controller.async_tick()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        self.assertLess(self.dispatches[0]['at'], deadline)
+        self.assertEqual(self.controller.regulator.last_target, (7, 0, 0, 60))
+        self.assertEqual(self.controller._restart_bridge.diagnostics()['restart_bridge_state'],
+                         'ordinary_takeover_complete')
+
+    async def test_late_boot_at_higher_load_waits_for_native_before_next_grid_sample(self):
+        deadline = await self.late_quiet_boot(raw=20.)
+        self.now += 1.
+        self.fresh_product()
+        self.grid(20.)
+        await self.controller.async_tick()
+        self.assertEqual(self.adapter.calls, [])
+        # A fresh vehicle receipt arriving after this grid sample cannot be
+        # subtracted until the next grid packet.
+        self.now += 1.
+        self.sequence += 1
+        self.native_vector(7., (182, 183), {182: self.now, 183: self.now},
+                           {182: self.sequence, 183: self.sequence}, self.now)
+        await self.controller.async_tick()
+        self.assertEqual(self.adapter.calls, [])
+        self.now += 1.
+        self.grid(20.)
+        await self.controller.async_tick()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        self.assertLess(self.dispatches[0]['at'], deadline)
+
+    async def test_late_boot_with_native_before_grid_can_take_over_on_fresh_product(self):
+        deadline = await self.late_quiet_boot(raw=20.)
+        at = self.now + 1.
+        self.report(at, 'charging', 20., 7., at - .2)
+        await self.controller.async_tick()
+        self.assertEqual(self.adapter.calls, [])
+        self.now += 1.
+        self.fresh_product()
+        await self.controller.async_tick()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        self.assertLess(self.dispatches[0]['at'], deadline)
+
+    async def test_advisory_quiet_cannot_extend_original_bridge_at_expiry(self):
+        deadline = await self.late_quiet_boot()
+        self.now = deadline
+        self.grid(14.1)
+        await self.controller.async_tick()
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+        self.assertEqual(self.controller.last_decision.meter_zero_cause, 'lease_expired')
+
+    async def test_real_new_cap_readback_overrides_advisory_quiet_hold(self):
+        await self.late_quiet_boot()
+        self.now += 1.
+        self.adapter.reported_limits = (8., 0., 0.)
+        await self.controller.async_tick()
+        self.assertEqual(self.adapter.calls, [])
+        self.adapter.reported_limit_receipts = (self.now, None, None)
+        await self.controller.async_tick()
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+        self.assertEqual(self.controller.last_decision.meter_zero_cause, 'unknown_delivery')
+
+    async def test_quiet_after_bridge_first_ready_does_not_disable_real_load_protection(self):
+        await self.late_quiet_boot()
+        self.now += 1.
+        self.grid(39.)
+        await self.controller.async_tick()
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+        self.assertEqual(self.controller.last_decision.meter_zero_cause, 'hard_limit')
+
     async def test_new_real_grid_peak_preempts_bootstrap_hold(self):
         await self.prepared_restart()
         self.now = 1.
@@ -618,7 +726,8 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.adapter._product_data.state.update(isOnline=True, signalRConnected=True,
                                                latestPulse=self.wall())
         self.adapter.telemetry_block_reason = self.adapter.transport_block_reason = None
-        self.report(1., 'charging', 11., 7., .8)
+        # Healthy control channels without a fresh EV or whole-offer proof.
+        self.report(1., 'charging', 20., 7., None)
         await self.controller.async_tick()
         self.assertEqual(self.adapter.calls, [])
         self.now = 2.

@@ -47,6 +47,7 @@ class MeterEnvelopePolicy:
         self.peak_complete_grid=None
         self.raw_excursion=None
         self.minimum_certificate=None
+        self.restart_bridge_context=None
 
     def limit_due(self,r,now,cap):
         return (r.last_target!=(cap,0,0,60) or r.last_set_limit_ts is None
@@ -231,31 +232,34 @@ class MeterEnvelopePolicy:
 
     def observe_ledger(self,r,inp,good):
         s=r.settings;c=r._ensure_automatic_cycle();now,wall,gt,raw=map(number,(inp.now_ts,inp.wall_now_ts,inp.grid_report_ts,inp.grid_l1))
-        if now is None or r._overload_last_eval_ts is not None and now<r._overload_last_eval_ts: return self.causes.CLOCK_INVALID
+        cooling_clock_valid=r._age_automatic_cooling(c,now,wall)
+        if now is None or r._overload_last_eval_ts is not None and now<r._overload_last_eval_ts:
+            r._break_automatic_continuity();return self.causes.CLOCK_INVALID
         if r._overload_last_eval_ts is not None and r._overload_exposure_active:
             delta=now-r._overload_last_eval_ts;r._overload_used_seconds+=delta;c['used_seconds']+=delta
         r._overload_last_eval_ts=now
         if good: r._overload_exposure_active=raw>s.main_fuse_amps
-        if not good or not 0<=wall-gt<=min(15.,s.max_sensor_age_seconds): r._break_automatic_continuity();return None
+        gap=min(15.,s.max_sensor_age_seconds)
+        if not good or not 0<=wall-gt<=gap: r._break_automatic_continuity();return None
         source=r._trial_identity(inp.control_source_id)
         if c['source_id'] is not None and r._trial_identity(c['source_id'])!=source:
-            r._break_automatic_continuity();return self.causes.CONTROL_SOURCE_CHANGED
+            r._break_automatic_continuity();c.pop('recovery_window',None);return self.causes.CONTROL_SOURCE_CHANGED
         previous=r._automatic_last_gt
         if r._automatic_observed_source!=source: r._break_automatic_continuity();previous=None
-        if previous is not None and gt<previous: return self.causes.GRID_INVALID
-        if previous is not None and gt==previous: return None
-        if previous is not None and gt-previous>min(15.,s.max_sensor_age_seconds): r._break_automatic_continuity()
+        if previous is not None and gt<previous:
+            r._break_automatic_continuity();c.pop('recovery_window',None);return self.causes.GRID_INVALID
+        if previous is not None and gt==previous:
+            if raw>=23.: r._break_automatic_cooling_span()
+            return None
+        if previous is not None and gt-previous>gap: r._break_automatic_continuity()
         r._automatic_last_gt,r._automatic_last_now,r._automatic_observed_source=gt,now,source
         if c['source_id'] is None: c['source_id']=source
         if raw<23.:
             r._automatic_qualification_gt=r._automatic_qualification_since=None
-            if r._automatic_cooling_gt is None: r._automatic_cooling_gt,r._automatic_cooling_since=gt,now
-            if gt-r._automatic_cooling_gt>=1800. and now-r._automatic_cooling_since>=1800.:
-                if c['used_seconds']>0 or c['state']!='ready': c.update(cycle_id=c['cycle_id']+1,state='ready',used_seconds=0.,failure_reason=None)
-                r._automatic_cooling_gt,r._automatic_cooling_since=gt,now
-            elif c['state']=='qualifying': c['state']='ready'
+            if cooling_clock_valid: r._observe_automatic_cooling(c,now,wall,gt,gap)
+            if c['state']=='qualifying': c['state']='ready'
             return None
-        r._automatic_cooling_gt=r._automatic_cooling_since=None
+        r._break_automatic_cooling_span()
         if c['used_seconds']>=s.overload_budget_seconds:
             c['state']='exhausted';r._automatic_qualification_gt=r._automatic_qualification_since=None;return None
         if raw<=s.main_fuse_amps:
@@ -1010,6 +1014,41 @@ class MeterEnvelopePolicy:
             meter_raw_excursion_deadline_ts=d.meter_raw_excursion_deadline_ts if episode_hold else None)
 
 
+    def restart_bridge_takeover(self, r, inp, now, raw, wall, gt, status):
+        """Replace the restart allowance with separate ordinary 7 A authority."""
+        bridge = self.restart_bridge_context
+        if now >= bridge.expires_mono or wall >= bridge.expires_wall:
+            return self.supervisor.zero(self, r, inp, self.causes.LEASE_EXPIRED)
+        if inp.control_source_id != bridge.source_id:
+            return self.supervisor.zero(self, r, inp, self.causes.CONTROL_SOURCE_CHANGED)
+        s = r.settings
+        if raw > s.main_fuse_amps:
+            return self.supervisor.zero(self, r, inp, self.causes.GRID_CEILING)
+        # The original allowance is held without an SDK call while fresh
+        # product data or a post-claim meter packet is still missing.
+        max_age = min(15., s.max_sensor_age_seconds)
+        if (inp.meter_product_data_quiet or inp.charger_publication_pending or status != "charging"
+                or not bridge.claimed_wall < gt <= wall or wall - gt > max_age):
+            return self.decision(r, inp, "meter_wait", 0)
+        ev = self.l1
+        # Unchanged current may never send another product observation. In
+        # that case the whole 7 A must still fit on top of measured site load.
+        house = raw
+        basis = "verified_restart_whole_meter"
+        reason = "Fresh grid evidence leaves room for the full existing 7 A without subtracting vehicle current."
+        if (ev is not None and getattr(inp.meter_ev_health, "valid", False) is True
+                and bridge.claimed_wall < ev.received_at_ts < gt
+                and (ev.source_ts is None or ev.source_ts >= bridge.claimed_wall)
+                and wall - ev.received_at_ts <= max_age and 1. <= ev.current <= min(7.5, raw + 1.)):
+            house = max(0., raw - min(7., ev.current))
+            basis = "eligible_mapped_l1_then_meter"
+            reason = "Fresh mapped Easee current and a later grid sample leave room for the existing 7 A."
+        if house + 7. > s.main_fuse_amps - s.buffer_amps:
+            return self.decision(r, inp, "meter_wait", 0)
+        return replace(self.decision(r, inp, "meter_normal", 7, command="set_limit",
+            house=house, basis=basis, reason=reason),
+            meter_restart_bridge_takeover=True)
+
     def evaluate(self, r, inp):
         s,C=r.settings,self.causes
         if not r._meter_settings_valid(s):
@@ -1044,6 +1083,8 @@ class MeterEnvelopePolicy:
         if status in manual:
             return self.decision(r,inp,'meter_wait',cap,
                 reason='Charger/user pause, authorization or schedule owns the session; no positive write or resume.')
+        if self.restart_bridge_context is not None and not live:
+            return self.restart_bridge_takeover(r, inp, now, raw, wall, gt, status)
         permission=self.operating_permission(r,inp)
         if permission is not None and permission.kind=='hold':
             return self.decision(r,inp,'meter_normal_hold',cap,normal_retention=True,

@@ -278,31 +278,34 @@ class AutomaticCyclesRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # missing interval was below the threshold, even on the same source.
         self.publish(270., 22.9, 7.1)
         await self.controller.async_tick()
-        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 0)
+        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 10)
         self.assertGreater(r.effective_overload_used_seconds, 0)
         self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cycle_id"], 1)
         self.assert_history(r)
 
-    async def test_cooling_is_strictly_below_twenty_three_for_complete_fresh_interval(self):
+    async def test_cooling_is_strictly_below_twenty_three_and_accumulates_across_warm_samples(self):
         r = await self.active()
         cycle_id = r.automatic_cycle_diagnostics()["automatic_cycle_id"]
         self.publish(240., 22.9, 7.1)
         await self.controller.async_tick()
-        for at in range(250, 2031, 10):
+        for at in range(250, 831, 10):
             self.publish(float(at), 22.9, 7.1)
             await self.controller.async_tick()
             self.assertGreater(self.controller.last_decision.current_p1, 0)
         before = self.assert_history(r, minimum=3641.)
         self.assertEqual(before["automatic_cycle"]["cycle_id"], cycle_id)
         self.assertGreater(before["automatic_cycle"]["used_seconds"], 0)
-        self.publish(2040., 23., 7.1)
+        self.publish(840., 23., 7.1)
         await self.controller.async_tick()
-        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 0)
-        self.publish(2050., 22.9, 7.1)
+        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 590.)
+        self.publish(850., 22.9, 7.1)
         await self.controller.async_tick()
-        for at in range(2060, 3851, 10):
+        for at in range(860, 1151, 10):
             self.publish(float(at), 22.9, 7.1)
             await self.controller.async_tick()
+        self.assertEqual(r.automatic_cycle_diagnostics()["automatic_cooling_seconds"], 890.)
+        self.publish(1160., 22.9, 7.1)
+        await self.controller.async_tick()
         after = self.assert_history(r, minimum=before["used_seconds"])
         self.assertEqual(after["automatic_cycle"]["cycle_id"], cycle_id+1)
         self.assertEqual(after["automatic_cycle"]["state"], "ready")

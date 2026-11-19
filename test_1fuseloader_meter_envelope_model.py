@@ -277,12 +277,12 @@ class MeterEnvelopePlantTests(unittest.IsolatedAsyncioTestCase):
                     typed=[row for row in result['meter_zero_events'] if row['at']>=190.2]
                     self.assertEqual(typed[0]['cause'],'peak_response_timeout')
 
-    async def test_rearm_requires_continuous_strictly_below_23_for_1800_seconds(self):
-        # After expiry the car draws zero. Exactly23 A interrupts cooling;
-        # only the later22.9 A segment may create a new automatic period.
+    async def test_rearm_expires_old_cooling_after_45_minutes_and_requires_900_seconds(self):
+        # After expiry the car draws zero. A 23 A stretch longer than the
+        # rolling window expires the first low segment.
         result=await MeterEnvelopePlant(ready=True,direct_full=True,ev_delay=8.,
-            http_delay=.2,apply_delay=.2,house_steps=((200.,22.),(2050.,23.),(3850.,22.9)),
-            budget=1800,horizon=5660.2).run()
+            http_delay=.2,apply_delay=.2,house_steps=((200.,22.),(2050.,23.),(5000.,22.9)),
+            budget=1800,horizon=5910.2).run()
         self.assertFalse(result['background_errors'],result['background_errors'][:1])
         self.assertIsNotNone(result['first_zero'])
         self.assertEqual(result['final_exposure']['automatic_cycle']['state'],'ready')
@@ -292,8 +292,8 @@ class MeterEnvelopePlantTests(unittest.IsolatedAsyncioTestCase):
         ready=[row for row in result['automatic_cycle_transitions']
                if row['at']>2000. and row['state']=='ready']
         self.assertTrue(ready,result['automatic_cycle_transitions'])
-        self.assertGreaterEqual(ready[0]['at'],5650.)
-        self.assertLessEqual(ready[0]['at'],5655.2)
+        self.assertGreaterEqual(ready[0]['at'],5900.)
+        self.assertLessEqual(ready[0]['at'],5905.2)
         # No positive session starts from a22.9 A house with no whole-RAW
         # headroom, even though its electrical period has rearmed.
         late=[row for row in result['trace'] if row['event']=='HTTP_BEGIN' and row['at']>=2000.]

@@ -50,6 +50,23 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Restart takeover and rolling recovery (b53)
+
+The claimed 7 A handoff keeps its original deadline while Home Assistant
+waits for fresh Easee reporting. With fresh sources, the ordinary controller
+can take over at 7 A when the entire offer fits the normal buffer using
+the raw meter, or when fresh mapped charging current followed by the
+meter verifies that the present 7 A fits. The handoff grants no new time
+while reporting is quiet.
+
+Automatic overload recovery now requires a cumulative 15 minutes strictly
+below 23 A within the most recent 45 minutes. The controller counts time
+between successive verified low readings from the same source. Warmer
+periods and measurement gaps contribute no time. A restart preserves only
+recent recovery already recorded on disk. A new cycle consumes the
+recovery credit and retains lifetime exposure and electrical fault history.
+These are experimental software settings for overload recovery.
+
 ### Planned restart while charging (b52)
 
 Enable the existing 7 A restart option and run the administrator action
@@ -670,15 +687,14 @@ trial transaction or charger action.
 | --- | --- |
 | Qualification | Fresh, advancing raw L1 observations must remain above 25 A for 30 seconds. Extra overload permission is already restricted to an EV offer of at most 7 A and sustained L1 of at most 29 A. Independently proven normal offers remain allowed. |
 | Active cycle | At most 1800 cumulative observed seconds above 25 A are available, including qualification and peak-response time. This is not a fresh 30 minutes after qualification. |
-| Re-arm observation | Fresh, advancing raw L1 must remain strictly below 23 A for 1800 continuous seconds. A completed observation can re-arm an exhausted or partially used cycle without a manual trial button. |
+| Re-arm observation | From b53, 900 observed seconds strictly below 23 A in a rolling 2700-second window can re-arm an exhausted or partially used cycle automatically. Earlier versions required 1800 continuous seconds. |
 
 A reading at or below 25 A clears unfinished qualification without refunding
-consumed time. During an active cycle, short dips pause exposure accounting;
-they do not create a new allowance. Re-arm requires the complete below-23 A
-observation: 23 A itself, a data gap, invalid or stale measurements, source
-rebinding and HA restart break that observation. Cached high or low frames
-cannot establish either continuous interval. Toggling options or restarting
-does not manufacture a fresh budget.
+consumed time. During an active cycle, dips pause exposure accounting. A
+reading of 23 A or higher, stale data, a measurement gap and HA restart all
+break the current low-current span. Previously proved spans can still count
+within the rolling window. A source rebind discards that source's recovery
+credit. The next cycle begins with an empty recovery window.
 
 For example, a fresh 26.6 A reading while the EV still reports 16.1 A may
 permit an independently verified reduction to 12 A inside the normal 23 A
