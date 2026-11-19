@@ -75,8 +75,7 @@ class ManagedRestartServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_core_restart_service_rechecks_config_at_its_own_stop_boundary(self):
         from homeassistant import config
-        from homeassistant.components.homeassistant import async_set_stop_handler
-        from homeassistant.components.homeassistant.services import async_setup_services
+        from homeassistant.components import homeassistant as core_integration
 
         async def check_config(hass):
             self.assertIs(hass, self.hass)
@@ -87,8 +86,8 @@ class ManagedRestartServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(restart)
             self.trace.append(("stop_handler", None))
 
-        async_setup_services(self.hass)
-        async_set_stop_handler(self.hass, stop)
+        self.assertTrue(await core_integration.async_setup(self.hass, {}))
+        core_integration.async_set_stop_handler(self.hass, stop)
         with patch.object(config, "async_check_ha_config_file", side_effect=check_config):
             await self._call(context=self.admin)
         self.assertEqual(self.trace, [
