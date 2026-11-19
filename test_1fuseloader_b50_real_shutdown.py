@@ -455,6 +455,69 @@ class RealCoreRestartBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed['expires_wall'], original['expires_wall'])
         self.assertEqual(next_controller.regulator.last_target, (7, 0, 0, 60))
 
+    async def test_managed_cold_boot_reconciles_delayed_exact_exposure_read(self):
+        from homeassistant.core import HomeAssistant
+
+        await self.start_healthy()
+        await self.managed_stop()
+        original = await self.marker()
+        self.assertEqual(original['state'], 'acknowledged')
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls],
+                         [(7, 60), (7, 300)])
+
+        next_hass = HomeAssistant(self.temp.name)
+        next_hass.set_state(self.CoreState.running)
+        self.extra_hass.append(next_hass)
+        next_adapter = SyntheticShutdownAdapter(self)
+        next_controller = self.make_controller(next_hass, next_adapter)
+        store = next_controller._budget_store
+        real_readback = store._read_back
+        allow_readback = asyncio.Event()
+        read_in_progress = asyncio.Event()
+
+        async def delayed_readback():
+            read_in_progress.set()
+            await allow_readback.wait()
+            return await real_readback()
+
+        self.raw = 14.3
+        self.grid_wall = datetime.now(timezone.utc).timestamp()
+        with (patch.object(store, '_read_back', delayed_readback),
+              patch.object(self.component, 'INITIAL_EXPOSURE_LOAD_TIMEOUT_SECONDS', .1)):
+            try:
+                await next_controller.async_start()
+                await asyncio.wait_for(read_in_progress.wait(), 1.)
+                await asyncio.sleep(.15)  # B54 would already abandon this exact read.
+                exact_read = next_controller._budget_restore_task
+                self.assertIsNotNone(exact_read)
+                self.assertFalse(exact_read.done())
+                self.assertFalse(next_controller._budget_loaded)
+                self.assertTrue(next_adapter.callbacks)
+                self.assertEqual(next_controller._budget_error, 'overload_budget_restore_pending')
+                self.assertEqual(next_controller.last_decision.mode, 'restart_bridge_budget_read_hold')
+                self.assertEqual(next_controller.last_decision.current_p1, 7)
+                self.assertFalse(next_controller.last_decision.should_call_service)
+                self.assertEqual(next_adapter.calls, [])
+                claimed = await self.marker(next_hass)
+                self.assertEqual(claimed['state'], 'claimed')
+                self.assertEqual(claimed['expires_wall'], original['expires_wall'])
+                self.grid_wall = datetime.now(timezone.utc).timestamp()
+                self.assertGreater(self.grid_wall, claimed['claimed_wall'])
+                await next_controller.async_tick()
+                self.assertEqual(next_adapter.calls, [])
+            finally:
+                allow_readback.set()
+            await next_hass.async_block_till_done()
+
+        self.assertTrue(next_controller._budget_restored_from_disk)
+        self.assertIsNone(next_controller._budget_error)
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in next_adapter.calls], [(7, 60)],
+                         (next_controller.last_decision, next_controller.last_service_result,
+                          next_controller._restart_bridge.diagnostics()))
+        completed = await self.marker(next_hass)
+        self.assertEqual(completed['state'], 'completed')
+        self.assertEqual(completed['expires_wall'], original['expires_wall'])
+
     async def test_repeated_new_minimum_frames_do_not_move_grid_confirmation_floor(self):
         await self.start_healthy()
         self.repeated_current = True

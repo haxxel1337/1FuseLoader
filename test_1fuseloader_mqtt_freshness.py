@@ -413,7 +413,7 @@ class ControllerSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller._adapter.calls, [])
         self.assertEqual((self.message_unsubscribed, self.connection_unsubscribed), (1, 1))
 
-    async def test_full_start_stop_during_budget_load_cannot_add_listeners(self):
+    async def test_full_start_stop_during_budget_load_cleans_passive_listeners(self):
         entered, gate = asyncio.Event(), asyncio.Event()
 
         async def load():
@@ -421,11 +421,14 @@ class ControllerSourceTests(unittest.IsolatedAsyncioTestCase):
             await gate.wait()
 
         self.controller._budget_store.async_load = load
+        state_unsubscribe = Mock()
         with patch.object(self.runtime, "async_track_time_interval") as timer, \
-                patch.object(self.runtime, "async_track_state_change_event") as states:
+                patch.object(self.runtime, "async_track_state_change_event", return_value=state_unsubscribe) as states:
             await self.stop_while_startup_is_waiting(entered, gate)
             timer.assert_not_called()
-            states.assert_not_called()
+            states.assert_called_once()
+            state_unsubscribe.assert_called_once_with()
+        self.assertEqual((self.message_unsubscribed, self.connection_unsubscribed), (1, 1))
         self.assertEqual(self.controller._adapter.calls, [])
 
     async def test_full_start_stop_during_adapter_initialize_cannot_tick_or_register_timer(self):

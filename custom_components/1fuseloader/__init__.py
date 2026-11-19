@@ -466,6 +466,9 @@ class OneFuseLoaderController:
             ledger_exists=budget_ledger_exists,
         )
         self._budget_loaded = False
+        self._budget_restored_from_disk = False
+        self._budget_restore_task: asyncio.Task | None = None
+        self._budget_restore_protection: ElectricalStopCause | None = None
         self._normal_control_checkpoint_pending = False
         self._budget_error: str | None = None
         self._budget_error_type: str | None = None
@@ -703,6 +706,65 @@ class OneFuseLoaderController:
             self._handle_source_change(None)
             self.notify()
 
+    def _begin_budget_restore_locked(self) -> None:
+        if self._budget_loaded or self._budget_restore_task is not None:
+            return
+        self._budget_error = "overload_budget_restore_pending"
+        self._budget_error_type = None
+        self._budget_restore_task = self.hass.async_create_task(self._budget_store.async_load())
+
+    def _watch_budget_restore_locked(self) -> None:
+        task = self._budget_restore_task
+        if task is None:
+            return
+
+        def finished(completed: asyncio.Task) -> None:
+            if not completed.cancelled():
+                completed.exception()
+            # Only the same controller/lifetime may consume this read, and
+            # only through a fresh tick holding the controller lock.
+            if self._budget_restore_task is completed and not self._stopped:
+                self._handle_source_change(None)
+
+        task.add_done_callback(finished)
+
+    def _finish_budget_restore_locked(self, inp: RegulatorInput | None = None) -> None:
+        task = self._budget_restore_task
+        if task is None or not task.done() or self._stopped:
+            return
+        self._budget_restore_task = None
+        restore_rejected = False
+        try:
+            saved = task.result()
+            if saved is not None:
+                self._normal_control_checkpoint_pending = bool(
+                    not self.settings.meter_envelope_control and saved.get("normal_control"))
+                if not self.regulator.import_overload_state(saved):
+                    restore_rejected = True
+                    raise ValueError("Invalid restored exposure")
+                self._budget_restored_from_disk = True
+                if not self.settings.meter_envelope_control and saved.get("minimum_held"):
+                    self._overload_restore_receipt_floor = datetime.now(timezone.utc).timestamp()
+        except (Exception, asyncio.CancelledError) as err:
+            self._budget_error = "overload_budget_restore_failed"
+            self._budget_error_type = type(err).__name__
+            # A known restore failure must block writes to the older ledger.
+            # An invalid additive checkpoint may have imported older history.
+            if not restore_rejected:
+                self.regulator.import_overload_state(None)
+            _LOGGER.warning("1FuseLoader exposure restore failed (%s)",
+                            self._budget_error_type, exc_info=True)
+        else:
+            self._budget_error = self._budget_error_type = None
+            if self._budget_restore_protection is not None and self.settings.meter_envelope_control:
+                # A late pre-start checkpoint cannot erase a later cold-boot
+                # stop. Preserve it without resubmitting or granting a lease.
+                policy = self.regulator._get_meter_envelope_policy()
+                policy.stop(self.regulator, inp if inp is not None else self._read_input(),
+                            self._budget_restore_protection)
+        self._budget_restore_protection = None
+        self._budget_loaded = True
+
     async def async_start(self) -> None:
         if self._stop_cleanup_task is not None:
             await asyncio.shield(self._stop_cleanup_task)
@@ -710,31 +772,7 @@ class OneFuseLoaderController:
         async with self._lock:
             self._stopped = False
             self._reload_settings_locked()
-            if not self._budget_loaded:
-                restore_rejected = False
-                try:
-                    saved = await asyncio.wait_for(self._budget_store.async_load(), INITIAL_EXPOSURE_LOAD_TIMEOUT_SECONDS)
-                    if saved is not None:
-                        self._normal_control_checkpoint_pending = bool(
-                            not self.settings.meter_envelope_control and saved.get("normal_control"))
-                        if not self.regulator.import_overload_state(saved):
-                            restore_rejected = True
-                            raise ValueError("Invalid restored exposure")
-                        if not self.settings.meter_envelope_control and saved.get("minimum_held"):
-                            self._overload_restore_receipt_floor = datetime.now(timezone.utc).timestamp()
-                except Exception as err:
-                    self._budget_error = "overload_budget_restore_failed"
-                    self._budget_error_type = type(err).__name__
-                    # An unknown older ledger must never be overwritten by a
-                    # newly initialized zero allowance after a failed load.
-                    # A rejected additive recovery checkpoint may already
-                    # have preserved valid older exposure and failure fields.
-                    # Do not replace those with a new synthetic allowance.
-                    if not restore_rejected:
-                        self.regulator.import_overload_state(None)
-                    _LOGGER.warning("1FuseLoader exposure restore failed (%s)",
-                                    self._budget_error_type, exc_info=True)
-                self._budget_loaded = True
+            self._begin_budget_restore_locked()
             if self._stopped:
                 return
             self._subscribe_source_entities()
@@ -771,7 +809,14 @@ class OneFuseLoaderController:
                 self._telemetry_unsub = subscribe_telemetry(self._handle_passive_telemetry)
             self._applied_control_binding = self._configured_control_identity()
             self._applied_control_selection = self._electrical_selection()
+            self._finish_budget_restore_locked()
             await self._restart_bridge.async_restore()
+            if self._budget_restore_task is not None and not self._restart_bridge.holding_boot_allowance:
+                # Retain the ordinary startup wait without canceling the read
+                # at its soft deadline. Passive receivers are already active.
+                # An authenticated bridge evaluates protection now instead.
+                await asyncio.wait({self._budget_restore_task},
+                                   timeout=INITIAL_EXPOSURE_LOAD_TIMEOUT_SECONDS)
             if self._stopped:
                 return
             self._register_shutdown_bridge_job()
@@ -781,6 +826,7 @@ class OneFuseLoaderController:
             # never install a new watchdog after that cleanup has run.
             if self._stopped:
                 return
+            self._watch_budget_restore_locked()
             interval = int((self.entry.options or DEFAULT_OPTIONS).get("poll_interval_seconds", 5))
 
             async def interval_tick(_now: datetime) -> None:
@@ -1140,6 +1186,14 @@ class OneFuseLoaderController:
         # coalesce instead of queuing; none can submit after this method returns.
         self._stopped = True
         self._budget_pending_token = None
+        budget_restore, self._budget_restore_task = self._budget_restore_task, None
+        if budget_restore is not None and not budget_restore.cancelled():
+            # Detach this consumer; the underlying shared Store transaction
+            # remains protected by OverloadBudgetStore's shield/gate.
+            if budget_restore.done():
+                budget_restore.exception()
+            else:
+                budget_restore.cancel()
         self._generation += 1
         self._cancel_positive_dispatch()
         if self._shutdown_job_unsub is not None:
@@ -2604,6 +2658,8 @@ class OneFuseLoaderController:
         if not self.regulator.reject_unsubmitted(decision, self.hass.loop.time()):
             return
         self._normal_control_checkpoint_pending = True
+        if self._budget_error in {"overload_budget_restore_pending", "overload_budget_restore_failed"}:
+            return
         try:
             await asyncio.wait_for(self._budget_store.async_save(
                 self.regulator.export_overload_state()), EXPOSURE_STORE_TIMEOUT_SECONDS)
@@ -2667,6 +2723,8 @@ class OneFuseLoaderController:
             self.bmw_context = {}
         self._sync_command_identity()
         inp = self._read_input()
+        self._finish_budget_restore_locked(inp)
+        budget_loading = self._budget_restore_task is not None
         try:
             same_settings = _settings_from_entry(self.entry) == self.settings
         except (TypeError, ValueError):
@@ -2687,7 +2745,8 @@ class OneFuseLoaderController:
             self._budget_retry_at = self.hass.loop.time() + EXPOSURE_STORE_RETRY_SECONDS
         if self.settings.overload_enabled or self.settings.meter_envelope_control:
             offline_problem = self._runtime_offline_problem(inp)
-            budget_fault = self._budget_error if self._budget_error != "overload_budget_save_pending" else None
+            budget_fault = self._budget_error if self._budget_error not in {
+                "overload_budget_save_pending", "overload_budget_restore_pending"} else None
             if offline_problem or budget_fault:
                 inp = self._critical_runtime_input(inp, budget_fault or offline_problem)
         # A protective evaluation may clear the owner that explains its cause.
@@ -2725,6 +2784,21 @@ class OneFuseLoaderController:
             }
         decision = (await self._restart_bridge.async_tick_override(inp)
                     if shutdown_protection is None else None)
+        if budget_loading and (decision is None or decision.should_call_service and decision.current_p1 > 0):
+            # Without the exact ledger no ordinary, resumed or renewed
+            # positive request is allowed. An authenticated bridge may have
+            # returned a no-write retention, or a real independent fault zero.
+            if self.settings.meter_envelope_control:
+                policy = self.regulator._get_meter_envelope_policy()
+                cause = policy.critical_error(self.regulator, inp)
+                raw = _finite_current_number(inp.grid_l1)
+                if cause is None and raw is not None and raw > self.settings.main_fuse_amps:
+                    cause = (ElectricalStopCause.HARD_LIMIT
+                             if raw > self.settings.overload_transition_limit_amps
+                             else ElectricalStopCause.GRID_CEILING)
+                decision = self.regulator.meter_envelope_fault(inp, cause or ElectricalStopCause.PERSISTENCE)
+            else:
+                inp = self._critical_runtime_input(inp, "overload_budget_restore_pending")
         if decision is not None and not decision.should_call_service:
             # This separately bounded owner retains only the previous runtime's
             # verified bridge. It supplies no new SDK lease or source evidence.
@@ -2782,6 +2856,13 @@ class OneFuseLoaderController:
                 decision = replace(decision, command="set_limit", current_p1=0, current_p2=0, current_p3=0,
                                    should_call_service=True, mode="command_protection",
                                    reason="A previous SDK request was superseded or has unverified delivery; confirming 0 A before a new offer.")
+        if budget_loading and decision.meter_zero_cause is not None:
+            self._budget_restore_protection = ElectricalStopCause(decision.meter_zero_cause)
+        if budget_loading and (decision.current_p1 > 0 or decision.command == "resume"):
+            self.regulator.reject_unsubmitted(decision, self.hass.loop.time())
+            decision = replace(decision, mode="waiting_for_exposure_restore",
+                reason="Waiting for the exact exposure checkpoint before any positive command.",
+                current_p1=0, command=None, service=None, should_call_service=False)
         if decision.current_refresh_required:
             self._request_current_snapshot()
         exposure = self.regulator.export_overload_state()
@@ -2794,7 +2875,7 @@ class OneFuseLoaderController:
                              or normal_control.get("response_failure")))
         if normal_active:
             self._normal_control_checkpoint_pending = True
-        if (self._budget_error != "overload_budget_restore_failed"
+        if (self._budget_error not in {"overload_budget_restore_pending", "overload_budget_restore_failed"}
                 and (self.settings.overload_enabled or exposure["used_seconds"] or exposure["failure_reason"]
                      or exposure.get("trial_epoch") is not None
                      or exposure.get("automatic_cycle") is not None

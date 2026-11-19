@@ -107,7 +107,7 @@ class ManagedRestartTests(handoff.B50ShutdownHandoffTests):
         self.assertGreater(marker["grid_response_wall"], marker["physical_response_wall"])
 
         self.new_boot(downtime=25.)
-        await self.controller.async_start()
+        await self.start_boot_with_readable_exposure()
         claimed = self.persisted_bridge()[1]
         self.assertEqual(claimed["state"], "claimed")
         self.assertEqual(claimed["expires_wall"], marker["expires_wall"])

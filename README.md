@@ -50,6 +50,19 @@ The Easee `device_id` is **not** hard-coded because it is specific to each Home 
 
 ## Logic
 
+### Exposure verification during restart (b55)
+
+The exposure ledger's startup read continues if Home Assistant is slow.
+The controller starts its source listeners while the read is in progress.
+It imports the completed, verified ledger before any new positive offer or
+ledger write. A confirmed read or validation error blocks regular control.
+
+A valid managed restart can retain the prior 7 A allocation while both the
+ledger and the one-use claim are verified. Fresh faults, incompatible
+configuration and the original expiry can end the hold. After verification,
+the controller also checks the restored protection state and fresh operating
+measurements before an ordinary 7 A takeover.
+
 ### Restart claim verification and normal buffer (b54)
 
 If saving and reading back the new runtime's one-use claim takes longer than

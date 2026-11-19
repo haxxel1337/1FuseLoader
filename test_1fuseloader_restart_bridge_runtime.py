@@ -235,8 +235,18 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await self.stage_managed_shutdown()
         _, marker = self.persisted_bridge()
         self.new_boot(downtime=downtime, native_wait=native_wait)
-        await self.controller.async_start()
+        await self.start_boot_with_readable_exposure()
         return before, marker
+
+    async def start_boot_with_readable_exposure(self):
+        await self.controller.async_start()
+        # Unlike HA's periodic loop, a synthetic clock can run hundreds of
+        # ticks without yielding to the in-memory Store task. Cases using a
+        # normal readable ledger let that exact task finish before moving it.
+        restore = self.controller._budget_restore_task
+        if restore is not None:
+            await asyncio.wait_for(asyncio.shield(restore), 1.)
+            await self.controller.async_tick()
 
     async def boot_with_delayed_claim_readback(self, *, downtime=177.):
         await self.healthy_session()
@@ -262,6 +272,30 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 release_readback.set()
                 raise
         return original_marker, release_readback, bridge._gate.pending
+
+    async def boot_with_delayed_exposure_restore(self, *, downtime=177., mutate_ledger=None):
+        await self.healthy_session()
+        await self.stage_managed_shutdown()
+        _, original_marker = self.persisted_bridge()
+        self.new_boot(downtime=downtime)
+        controller = self.controller
+        release_readback = asyncio.Event()
+        original_readback = controller._budget_store._read_back
+
+        async def delayed_exposure_readback():
+            await release_readback.wait()
+            payload = await original_readback()
+            return mutate_ledger(payload) if mutate_ledger is not None else payload
+
+        controller._budget_store._read_back = delayed_exposure_readback
+        with patch.dict(controller.async_start.__func__.__globals__,
+                        {'INITIAL_EXPOSURE_LOAD_TIMEOUT_SECONDS': .05}):
+            try:
+                await asyncio.wait_for(controller.async_start(), 1.)
+            except BaseException:
+                release_readback.set()
+                raise
+        return original_marker, release_readback, controller._budget_restore_task
 
     async def late_quiet_boot(self, raw=14.1):
         _, marker = await self.prepared_restart(downtime=185., native_wait=True)
@@ -759,6 +793,160 @@ class RestartBridgeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.grid(16.)
         await self.controller.async_tick()
         self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+
+    async def test_prior_restart_allowance_waits_for_exposure_read_without_any_new_grant(self):
+        original, release, task = await self.boot_with_delayed_exposure_restore()
+        try:
+            _, claimed = self.persisted_bridge()
+            self.assertEqual(claimed['state'], 'claimed')
+            self.assertEqual(claimed['nonce'], original['nonce'])
+            self.assertEqual(claimed['expires_wall'], original['expires_wall'])
+            self.assertEqual(self.controller.last_decision.mode, 'restart_bridge_budget_read_hold')
+            self.assertTrue(self.controller._restart_bridge.holding_boot_allowance)
+            self.assertEqual(self.adapter.calls, [])
+            self.now = 17.5
+            self.grid(14.3)
+            await self.controller.async_tick()
+            self.assertEqual(self.controller.last_decision.mode, 'restart_bridge_budget_read_hold')
+            self.assertEqual(self.adapter.calls, [])
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+        await self.controller.async_tick()
+        self.assertTrue(self.controller._budget_restored_from_disk)
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+        self.assertEqual(self.controller._restart_bridge.diagnostics()['restart_bridge_state'],
+                         'ordinary_takeover_complete')
+
+    async def test_delayed_claim_and_delayed_exposure_each_require_independent_completion(self):
+        release_claim = asyncio.Event()
+        original_load = fixtures.FakeStore.async_load
+
+        async def delay_claim_readback(store):
+            payload = await original_load(store)
+            if 'restart' in store.key and payload and payload['state'] == 'claimed':
+                await release_claim.wait()
+                return await original_load(store)
+            return payload
+
+        implementation = fixtures.runtime.GracefulRestartBridge.async_restore.__globals__
+        with (patch.object(fixtures.FakeStore, 'async_load', delay_claim_readback),
+              patch.dict(implementation, {'STORE_TIMEOUT_SECONDS': .05})):
+            try:
+                original, release_budget, budget_task = await self.boot_with_delayed_exposure_restore()
+            except BaseException:
+                release_claim.set()
+                raise
+        claim_task = self.controller._restart_bridge._gate.pending
+        try:
+            self.assertEqual(self.controller.last_decision.mode, 'restart_bridge_claim_verify_hold')
+            self.assertEqual(self.controller.last_decision.normal_continuity_deadline_ts, 30.)
+            self.now = 17.5
+            self.grid(14.3)
+            release_claim.set()
+            await asyncio.wait_for(asyncio.shield(claim_task), 1.)
+            await self.controller.async_tick()
+            self.assertEqual(self.controller.last_decision.mode, 'restart_bridge_budget_read_hold')
+            self.assertAlmostEqual(self.wall(self.controller.last_decision.normal_continuity_deadline_ts).timestamp(),
+                                   original['expires_wall'])
+            self.assertEqual(self.adapter.calls, [])
+        finally:
+            release_claim.set()
+            release_budget.set()
+            await asyncio.wait_for(asyncio.shield(budget_task), 1.)
+        await self.controller.async_tick()
+        self.assertEqual([(d.current_p1, d.ttl_seconds) for d in self.adapter.calls], [(7, 60)])
+
+    async def test_exposure_read_cannot_extend_restart_allowance_expiry(self):
+        original, release, task = await self.boot_with_delayed_exposure_restore(downtime=295.)
+        try:
+            deadline = self.controller.last_decision.normal_continuity_deadline_ts
+            self.assertAlmostEqual(self.wall(deadline).timestamp(), original['expires_wall'])
+            self.now = deadline
+            await self.controller.async_tick()
+            self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+            self.assertEqual(self.controller.last_decision.meter_zero_cause, 'lease_expired')
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+        await self.controller.async_tick()
+        self.assertFalse(self.controller._restart_bridge.holding_boot_allowance)
+        self.assertFalse(any(d.current_p1 > 0 for d in self.adapter.calls))
+
+    async def test_later_mqtt_reconnect_is_not_first_sample_wait_during_exposure_restore(self):
+        _, release, task = await self.boot_with_delayed_exposure_restore()
+        try:
+            self.now = 1.
+            self.grid(14.3)
+            await self.controller.async_tick()
+            self.assertEqual(self.adapter.calls, [])
+            self.now = 2.
+            source = self.controller._l1_source
+            source.connection_changed(False)
+            source.connection_changed(True)
+            await self.controller.async_tick()
+            self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+            self.assertEqual(self.controller.last_decision.meter_zero_cause, 'grid_invalid')
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+        await self.controller.async_tick()
+        self.assertFalse(self.controller._restart_bridge.holding_boot_allowance)
+        self.assertFalse(any(d.current_p1 > 0 for d in self.adapter.calls))
+
+    async def test_acknowledged_restart_requires_prior_exposure_even_if_store_returns_none(self):
+        _, release, task = await self.boot_with_delayed_exposure_restore(mutate_ledger=lambda _: None)
+        ledger_key = self.controller._budget_store.store.key
+        before = deepcopy(self.hass._test_store_disk[ledger_key])
+        try:
+            self.now = 17.5
+            self.grid(14.3)
+            await self.controller.async_tick()
+            self.assertEqual(self.adapter.calls, [])
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+        await self.controller.async_tick()
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+        self.assertEqual(self.controller._budget_error, 'overload_budget_restore_failed')
+        self.assertEqual(self.controller._budget_error_type, 'MissingExposureForVerifiedBridge')
+        self.assertEqual(self.controller._restart_bridge.diagnostics()['restart_bridge_last_error'],
+                         'bridge_missing_exposure')
+        self.assertEqual(self.hass._test_store_disk[ledger_key], before)
+        await self.controller.async_stop()
+        self.assertEqual(self.persisted_bridge()[1]['state'], 'aborted')
+        self.new_boot(downtime=150.)
+
+        async def still_missing():
+            return None
+
+        self.controller._budget_store._read_back = still_missing
+        await self.controller.async_start()
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+        self.assertEqual(self.controller._budget_error_type, 'MissingExposureForVerifiedBridge')
+        self.assertEqual(self.hass._test_store_disk[ledger_key], before)
+
+    async def test_late_restored_operational_fault_blocks_restart_takeover(self):
+        def unresolved(payload):
+            state = deepcopy(payload)
+            state['regulator']['meter_control'].update(state='STOP_RECOVERY',
+                operational_fault='grid_invalid', recovery_required=True)
+            return state
+
+        _, release, task = await self.boot_with_delayed_exposure_restore(mutate_ledger=unresolved)
+        try:
+            self.now = 17.5
+            self.grid(14.3)
+            await self.controller.async_tick()
+            self.assertEqual(self.adapter.calls, [])
+        finally:
+            release.set()
+            await asyncio.wait_for(asyncio.shield(task), 1.)
+        await self.controller.async_tick()
+        self.assertTrue(self.controller._budget_restored_from_disk)
+        self.assertEqual([d.current_p1 for d in self.adapter.calls], [0])
+        self.assertEqual(self.controller._restart_bridge.diagnostics()['restart_bridge_last_error'],
+                         'bridge_restored_operational_fault')
 
     async def test_local_pre_sdk_refusal_does_not_send_an_unnecessary_zero(self):
         await self.healthy_session()

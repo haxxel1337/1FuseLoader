@@ -85,6 +85,7 @@ class GracefulRestartBridge:
         self._read_back = read_back
         self._marker = None
         self._pending_claim = None
+        self._boot_marker_requires_ledger = False
         self._active = False
         self._preparing = False
         self._armed = False
@@ -127,6 +128,11 @@ class GracefulRestartBridge:
     @property
     def armed(self):
         return self._armed
+
+    @property
+    def holding_boot_allowance(self):
+        """A qualified prior marker is being claimed or retained during this boot."""
+        return self._active
 
     @property
     def managed_preflight(self):
@@ -300,18 +306,37 @@ class GracefulRestartBridge:
                 return False
         return True
 
+    def _startup_budget_pending(self):
+        return (self.c._budget_error == "overload_budget_restore_pending"
+                and self.c._budget_restore_task is not None)
+
+    def _restored_policy_blocks_bridge(self):
+        policy = self.c.regulator._get_meter_envelope_policy()
+        return (policy.operational_fault is not None or policy.recovery.required
+                or policy.episode is not None and policy.episode.unresolved)
+
+    def _reject_missing_budget(self):
+        # The producer can only acknowledge a restart with durable exposure.
+        # A matching acknowledged marker rules out a normal first-install load.
+        self.c._budget_error = "overload_budget_restore_failed"
+        self.c._budget_error_type = "MissingExposureForVerifiedBridge"
+        self.c._protective_zero_pending = True
+
+    def _known_budget_missing(self):
+        return (self._boot_marker_requires_ledger and self.c._budget_error is None
+                and not self.c._budget_restored_from_disk)
+
     async def async_restore(self):
         self._closed = False
         if self._restored or not self._enabled():
             return
         self._restored = True
+        self._boot_marker_requires_ledger = False
         try:
             wall, mono = self._clocks()
-            policy = self.c.regulator._get_meter_envelope_policy()
-            if (self.c._budget_error or self.c._budget_store.verification_pending
-                    or self.c._protective_zero_pending
-                    or policy.operational_fault is not None or policy.recovery.required
-                    or policy.episode is not None and policy.episode.unresolved):
+            budget_pending = self._startup_budget_pending()
+            if (not budget_pending and (self.c._budget_error or self.c._budget_store.verification_pending)
+                    or self.c._protective_zero_pending or self._restored_policy_blocks_bridge()):
                 self._phase, self._error = "rejected", "bridge_restored_operational_fault"
                 self.c._protective_zero_pending = True
                 return
@@ -326,6 +351,14 @@ class GracefulRestartBridge:
                     self._error, self._phase = "bridge_marker_invalid", "rejected"
                     return
                 self._marker = deepcopy(marker)
+                self._boot_marker_requires_ledger = (
+                    marker["state"] in {"acknowledged", "claimed", "completed"}
+                    or marker["state"] == "aborted" and marker["physical_response_wall"] is not None
+                    and marker["grid_response_wall"] is not None)
+                if self._known_budget_missing():
+                    self._reject_missing_budget()
+                    self._error, self._phase = "bridge_missing_exposure", "rejected"
+                    return
                 if marker["state"] != "acknowledged" or marker["expires_wall"] <= wall:
                     self._phase = "expired" if marker["expires_wall"] <= wall else "not_reusable"
                     if marker["state"] in {"prepared", "aborted"} and marker["possible_until_wall"] > wall:
@@ -360,10 +393,10 @@ class GracefulRestartBridge:
         if self._pending_claim is not None and self._pending_claim.task is task and not self._closed:
             self.c._handle_source_change(None)
 
-    def _source_problem(self, inp, *, allow_missing=False):
+    def _source_problem(self, inp, *, allow_missing=False, budget_pending=False):
         if not self._enabled():
             return ElectricalStopCause.CONFIGURATION
-        if self.c._budget_error or self.c._budget_store.verification_pending:
+        if not budget_pending and (self.c._budget_error or self.c._budget_store.verification_pending):
             return ElectricalStopCause.PERSISTENCE
         if self.c._protective_zero_pending:
             return ElectricalStopCause.UNKNOWN_DELIVERY
@@ -492,6 +525,10 @@ class GracefulRestartBridge:
                 self._abort = True
             # The producer owns protective cancellation while its lock is held.
             return self._decision(inp, mode="restart_bridge_preparing_hold")
+        if self._known_budget_missing():
+            self._reject_missing_budget()
+            self._withdraw("bridge_missing_exposure")
+            return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.PERSISTENCE)
         if not self._active and self._unknown_until is None:
             return None
         try:
@@ -519,12 +556,16 @@ class GracefulRestartBridge:
         if binding != self._marker["binding"]:
             self._withdraw("bridge_binding_changed")
             return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.CONTROL_SOURCE_CHANGED)
-        problem = self._source_problem(inp, allow_missing=True)
+        budget_pending = self._startup_budget_pending()
+        problem = self._source_problem(inp, allow_missing=True, budget_pending=budget_pending)
         if problem:
             self._withdraw("bridge_source_or_control_invalid")
             return self.c.regulator.meter_envelope_fault(inp, problem)
         if self._bridge_readback_changed(mono):
             self._withdraw("bridge_limit_readback_changed")
+            return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.UNKNOWN_DELIVERY)
+        if self._restored_policy_blocks_bridge():
+            self._withdraw("bridge_restored_operational_fault")
             return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.UNKNOWN_DELIVERY)
         missing_grid = self._missing_first_sample(inp)
         if self._pending_claim is not None:
@@ -547,6 +588,11 @@ class GracefulRestartBridge:
                 self._withdraw(str(err) if isinstance(err, BridgeRefused) else "bridge_claim_verification_failed")
                 return self.c.regulator.meter_envelope_fault(inp, ElectricalStopCause.PERSISTENCE)
             self._pending_claim = None
+        if budget_pending:
+            if not missing_grid:
+                self._first_fresh = True
+            self._phase = "budget_restore_wait"
+            return self._decision(inp, mode="restart_bridge_budget_read_hold")
         if missing_grid or self._native_initial_wait(inp):
             self._phase = "bootstrap_wait"
             return self._decision(inp, mode="restart_bridge_bootstrap_hold")
